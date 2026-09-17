@@ -82,6 +82,9 @@ STATE: dict = {
     'src_undist': None, # 去畸变图，四点拖拽在它上面进行
 }
 
+# 当前 HTTP 服务实例，供"退出"接口调用 shutdown()（见 api_shutdown）
+HTTPD = None
+
 
 # ---------------------------------------------------------------- 工具
 
@@ -107,6 +110,24 @@ def safe_rel(path: Path) -> str:
         return str(path.relative_to(core.SCRIPT_DIR))
     except ValueError:
         return str(path)
+
+
+def api_shutdown() -> dict:
+    """让服务主动退出。
+
+    Windows 控制台里按 Ctrl+C，信号会同时打到 python 和等着它的 cmd.exe，
+    后者会追问一句 "Terminate batch job (Y/N)?" —— 双击 start_webui.bat 的
+    用户经常被这句卡住。给浏览器留个体面的退出按钮，就不必再碰 Ctrl+C 了。
+    """
+    global HTTPD
+
+    def stop() -> None:
+        # 必须等响应发完再关，否则前端收不到回包，看起来像崩了
+        if HTTPD is not None:
+            HTTPD.shutdown()
+
+    threading.Timer(0.5, stop).start()
+    return {'message': '服务即将退出'}
 
 
 def ensure_calibration() -> None:
@@ -737,6 +758,7 @@ class Handler(BaseHTTPRequestHandler):
             '/api/batch': lambda b: api_batch(),
             '/api/backup_clear': lambda b: api_backup_clear(b),
             '/api/clear_all': lambda b: api_clear_all(b),
+            '/api/shutdown': lambda b: api_shutdown(),
         }
         handler = routes.get(parsed.path)
         if handler is None:
@@ -817,6 +839,8 @@ def ensure_data_folders() -> None:
 
 def main() -> None:
     """解析参数并启动服务。"""
+    global HTTPD
+
     ap = argparse.ArgumentParser(description='NEUQ 视觉标定工具 Web 控制台')
     ap.add_argument('--port', type=int, default=8770, help='监听端口，默认 8770')
     ap.add_argument('--host', default='127.0.0.1', help='监听地址，默认仅本机')
@@ -828,12 +852,13 @@ def main() -> None:
     ensure_data_folders()
 
     httpd, port = bind_server(args.host, args.port)
+    HTTPD = httpd
     url = f'http://{args.host}:{port}/'
     print('=' * 56)
     print('  NEUQ 视觉标定控制台已启动')
     print(f'  请在浏览器打开:  {url}')
     print(f'  工程根目录:      {core.SCRIPT_DIR}')
-    print('  按 Ctrl+C 退出')
+    print('  退出: 点页面右上角「退出」按钮；或按 Ctrl+C；或直接关窗口')
     print('=' * 56)
 
     if not args.no_browser:
@@ -842,8 +867,12 @@ def main() -> None:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print('\n已停止。')
+    else:
+        # 走的 /api/shutdown：属于正常退出，不该当成异常
+        print('\n已按退出请求停止，可以关掉这个窗口了。')
     finally:
         httpd.server_close()
+        HTTPD = None
 
 
 if __name__ == '__main__':

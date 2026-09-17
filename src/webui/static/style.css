@@ -375,6 +375,20 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   .gallery-viewer { height: 64%; }
 }
 
+/* 退出后整页替换成的收尾提示 */
+.quit-screen {
+  margin: auto;
+  padding: 40px 48px;
+  text-align: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--text);
+}
+
+.quit-screen h2 { margin: 0 0 10px; font-size: 20px; }
+.quit-screen p { margin: 0; color: var(--muted); }
+
 @media (max-width: 1280px) {
   main { grid-template-columns: 250px minmax(0, 1fr) 290px; gap: 10px; padding: 10px; }
 }

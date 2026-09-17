@@ -67,9 +67,10 @@ echo.
 echo   Python : %PY%
 echo   Project: %~dp0
 echo.
-echo   Tip: to stop the server press Ctrl+C, then answer Y to the
-echo        "Terminate batch job" prompt.  (The packaged exe in
-echo        dist\NEUQ-VisionCalib\ does not ask - it just exits.)
+echo   Tip: click "退出" at the top-right of the page to stop cleanly,
+echo        or simply close this window. Ctrl+C works too, but cmd.exe
+echo        will then ask "Terminate batch job (Y/N)?" - answer Y.
+echo        (The packaged exe in dist\NEUQ-VisionCalib\ never asks.)
 echo.
 "%PY%" src\webui\server.py %*
 

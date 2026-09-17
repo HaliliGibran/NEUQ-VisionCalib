@@ -1082,6 +1082,20 @@ function bindActions() {
     try { await refreshStatus(); } catch (e) { log('扫描失败: ' + e.message, 'err'); }
   });
 
+  // 退出：走服务端的 /api/shutdown，用户就不必去命令行按 Ctrl+C
+  //（Windows 下 cmd.exe 还会追问一句 "Terminate batch job (Y/N)?"）
+  $('btn-quit').onclick = async () => {
+    if (!confirm('确定退出本地控制台吗？未保存的交互标定不会丢失，但页面需要重新启动程序才能再用。')) return;
+    try {
+      await api('/api/shutdown', {});
+      document.body.innerHTML =
+        '<div class="quit-screen"><h2>控制台已退出</h2>' +
+        '<p>可以关掉这个标签页和黑色命令行窗口了。</p></div>';
+    } catch (e) {
+      log('退出失败: ' + e.message, 'err');
+    }
+  };
+
   $('btn-import').onclick = () => withBusy($('btn-import'), async () => {
     try {
       const mode = document.querySelector('input[name="import-mode"]:checked').value;
