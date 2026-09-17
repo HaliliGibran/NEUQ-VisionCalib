@@ -1,0 +1,6 @@
+# NEUQ-VisionCalib 运行时依赖
+# 安装: python -m pip install -r requirements.txt
+
+# 需要 Python 3.10 及以上（代码使用了现代类型注解语法）
+opencv-python>=4.8.0
+numpy>=1.24.0

@@ -1,0 +1,16 @@
+# 统一换行：仓库内保存 LF，检出时按平台转换
+* text=auto eol=lf
+
+# Windows 批处理必须用 CRLF，否则 goto / 标签解析会出错
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 明确声明为二进制，避免被当作文本做换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.bmp binary
+*.pdf binary
+*.docx binary
+*.zip binary
+*.ico binary

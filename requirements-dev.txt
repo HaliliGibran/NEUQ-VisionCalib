@@ -1,0 +1,7 @@
+# 开发 / 打包依赖（运行程序本身不需要）
+# 安装: python -m pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# 打包成 Windows 可执行文件，见 build_exe.py
+pyinstaller>=6.0.0

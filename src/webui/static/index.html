@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEUQ 视觉标定控制台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>NEUQ 视觉标定控制台</h1>
+  </div>
+  <div class="head-right">
+    <span id="chip-calib" class="chip">标定未载入</span>
+    <span id="chip-tables" class="chip">查找表未生成</span>
+    <button id="btn-refresh" class="ghost">重新扫描</button>
+  </div>
+</header>
+
+<main>
+  <section class="col col-steps">
+    <h2>流程</h2>
+
+    <article class="card" id="step-import">
+      <div class="card-head"><span class="num">1</span><h3>导入素材</h3></div>
+      <p class="hint">把棋盘照和地面照混在一起的目录丢进来，按"能否检出棋盘"自动分拣。</p>
+      <label>素材目录
+        <input id="in-import-dir" type="text" placeholder="例如 WIN_20260903_17_22_10_Pro 或 D:\素材\9月">
+      </label>
+      <div class="row file-row">
+        <button id="btn-browse" class="ghost sm" type="button">选择文件夹…</button>
+        <input id="in-import-browse" type="file" webkitdirectory multiple style="display:none">
+        <span class="hint inline">支持相对路径（相对工程根）或绝对路径。</span>
+      </div>
+      <div class="row mode-row">
+        <label><input type="radio" name="import-mode" value="add" checked> 增量添加（按文件名去重）</label>
+        <label><input type="radio" name="import-mode" value="replace"> 覆盖整个素材库</label>
+      </div>
+      <label class="row"><input id="in-import-move" type="checkbox"> 移动而非复制</label>
+      <button id="btn-import" class="primary">开始导入</button>
+
+      <div class="danger-zone">
+        <div class="card-head"><h3>备份并清空</h3></div>
+        <p class="hint">把输入/输出产物打包进 <code>backups/</code>，然后清空各目录，等待新素材导入。</p>
+        <label>备份名（留空则用打包时间命名）
+          <input id="in-backup-name" type="text" placeholder="例如 2026-09-17_第一次采集">
+        </label>
+        <button id="btn-backup-clear" class="danger">备份并清空</button>
+        <button id="btn-clear-all" class="danger-outline">仅清空（不备份）</button>
+        <div id="backup-info" class="hint mono"></div>
+      </div>
+    </article>
+
+    <article class="card" id="step-calib">
+      <div class="card-head"><span class="num">2</span><h3>相机标定</h3></div>
+      <div id="calib-info" class="kv"></div>
+      <div id="calib-count" class="hint mono"></div>
+      <div class="chart-wrap">
+        <canvas id="c-reproj" width="560" height="180"></canvas>
+      </div>
+      <label>剔除重投影误差超过（px，留空不剔除）
+        <input id="in-reproj" type="number" step="0.1" min="0" placeholder="例如 1.5">
+      </label>
+      <label class="row"><input id="in-force" type="checkbox"> 强制重新标定</label>
+      <button id="btn-calib" class="primary">运行标定</button>
+      <button id="btn-gallery" class="ghost">查看去畸变成果图 <span id="gallery-badge">—</span></button>
+    </article>
+
+    <article class="card" id="step-source">
+      <div class="card-head"><span class="num">3</span><h3>选择地面标定原图</h3></div>
+      <p class="hint">从 <code>ipm_input/</code> 里挑一张白纸摆位最正、边缘最清楚的。</p>
+      <div id="candidates" class="thumbs"></div>
+      <div id="source-info" class="kv"></div>
+    </article>
+
+    <article class="card" id="step-export">
+      <div class="card-head"><span class="num">4</span><h3>导出</h3></div>
+      <p class="hint">落盘六矩阵、两套查找表（正/反向），并跑一遍批量测试。</p>
+      <div class="pair">
+        <label>表格式
+          <select id="in-table-format">
+            <option value="txt">txt 文本</option>
+            <option value="bin">bin 定点二进制</option>
+            <option value="c">c 头文件</option>
+          </select>
+        </label>
+        <label>定点位 <input id="in-table-fp" type="number" min="0" max="15" value="4"></label>
+      </div>
+      <div class="pair">
+        <label>降采样宽 <input id="in-table-w" type="number" min="8" placeholder="留空=原尺寸"></label>
+        <label>降采样高 <input id="in-table-h" type="number" min="8" placeholder="留空=原尺寸"></label>
+      </div>
+      <p class="hint">全尺寸文本表在 720p 下约 56 MB，单片机放不下。
+        <code>bin</code> + <code>320×240</code> 约 1.2 MB，是能上车的量级。</p>
+      <button id="btn-commit" class="primary">导出矩阵与查找表</button>
+      <button id="btn-batch" class="ghost">只重跑批量测试</button>
+    </article>
+  </section>
+
+  <section class="col col-canvas">
+    <div class="canvas-head">
+      <h2>源图 · 拖动四个角点</h2>
+      <div class="canvas-tools">
+        <div class="mode-toggle" role="tablist">
+          <button id="btn-mode-corner" class="active" type="button">四角点</button>
+          <button id="btn-mode-line" type="button">交点</button>
+        </div>
+        <span id="cursor-pos" class="mono">—</span>
+        <button id="btn-zoom-fit" class="ghost sm">适应窗口</button>
+        <button id="btn-zoom-100" class="ghost sm">1:1</button>
+        <button id="btn-reset-quad" class="ghost sm">复位四点</button>
+        <button id="btn-guess-quad" class="ghost sm">载入上次结果</button>
+      </div>
+    </div>
+    <div class="canvas-wrap" id="canvas-wrap">
+      <canvas id="c-source"></canvas>
+      <canvas id="c-loupe" aria-hidden="true"></canvas>
+      <div id="canvas-empty" class="canvas-empty">先在第 3 步选一张原图</div>
+    </div>
+    <p class="hint pad">
+      滚轮缩放 · 空白处拖动平移 · 方向键微调选中点（<kbd>Shift</kbd> 加速 10 倍）·
+      拖动时鼠标旁会出现 5x 放大镜 · 「交点」模式下拖的是四条线本身，角点由交点实时算出来
+    </p>
+  </section>
+
+  <section class="col col-right">
+    <div class="canvas-head">
+      <h2>BirdView 预览</h2>
+      <span id="preview-state" class="chip sm">待预览</span>
+    </div>
+    <div class="canvas-wrap small" id="preview-wrap">
+      <canvas id="c-preview"></canvas>
+    </div>
+
+    <article class="card compact">
+      <div class="card-head"><h3>标定矩形物理尺寸</h3></div>
+      <div class="pair">
+        <label>宽 cm <input id="in-phys-w" type="number" step="0.5" min="0.1" value="200"></label>
+        <label>高 cm <input id="in-phys-h" type="number" step="0.5" min="0.1" value="150"></label>
+      </div>
+      <p class="hint">必须实测。这一项直接决定 px/cm 与车上距离测量的正确性。</p>
+    </article>
+
+    <article class="card compact">
+      <div class="card-head"><h3>三个自由度</h3></div>
+      <label class="slider">anchor x <output id="out-ax">0.500</output>
+        <input id="in-ax" type="range" min="0" max="1" step="0.001" value="0.5"></label>
+      <label class="slider">anchor y <output id="out-ay">0.708</output>
+        <input id="in-ay" type="range" min="0" max="1" step="0.001" value="0.708"></label>
+      <label class="slider">heading ° <output id="out-hd">0.0</output>
+        <input id="in-hd" type="range" min="-180" max="180" step="0.1" value="0"></label>
+      <label class="slider">scale px/cm <output id="out-sc">自动</output>
+        <input id="in-sc" type="range" min="0.05" max="20" step="0.01" value="1"></label>
+      <label class="row"><input id="in-sc-auto" type="checkbox" checked> scale 自动吸附到不裁切上限</label>
+      <div id="scale-info" class="kv"></div>
+    </article>
+  </section>
+</main>
+
+<section class="logbar">
+  <div class="logbar-head">
+    <h2>运行日志</h2>
+    <button id="btn-clear-log" class="ghost sm">清空</button>
+  </div>
+  <pre id="log">就绪。</pre>
+</section>
+
+<div id="gallery" class="gallery" hidden>
+  <div class="gallery-panel">
+    <header class="gallery-head">
+      <h2>标定去畸变成果 · <span id="gallery-count">0</span> 张</h2>
+      <div class="gallery-tools">
+        <label class="row"><input id="gallery-compare" type="checkbox" checked> 并排显示原图</label>
+        <button id="gallery-close" class="ghost sm" type="button">关闭（Esc）</button>
+      </div>
+    </header>
+    <div class="gallery-body">
+      <div id="gallery-grid" class="gallery-grid"></div>
+      <div id="gallery-viewer" class="gallery-viewer" hidden>
+        <div class="viewer-stage">
+          <figure class="viewer-pane" id="pane-source">
+            <img id="viewer-source" alt="原图">
+            <figcaption>原图（带畸变）</figcaption>
+          </figure>
+          <figure class="viewer-pane">
+            <img id="viewer-preview" alt="去畸变后">
+            <figcaption>去畸变后</figcaption>
+          </figure>
+        </div>
+        <div class="viewer-bar">
+          <button id="viewer-prev" class="ghost sm" type="button">← 上一张</button>
+          <span id="viewer-name" class="mono"></span>
+          <button id="viewer-next" class="ghost sm" type="button">下一张 →</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

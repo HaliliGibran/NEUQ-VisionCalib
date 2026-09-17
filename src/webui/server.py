@@ -1,0 +1,850 @@
+"""NEUQ 视觉标定工具的本地 Web 控制台。
+
+把 neuq_vision_calib.py 的全部能力搬到浏览器里：素材导入、相机标定、逆透视四点拖拽、
+实时 BirdView 预览、矩阵与查找表导出、批量测试。服务端不重复实现任何几何逻辑，
+所有计算都直接调用主脚本的函数，保证网页上看到的结果和命令行跑出来的完全一致。
+
+启动（在工程根目录下执行）:
+    python src/webui/server.py            # 默认 http://127.0.0.1:8770
+    python src/webui/server.py --port 9000 --no-browser
+
+也可以直接双击工程根目录下的 start_webui.bat，或运行 python app.py。
+用户数据统一读写 <工程根>/data/ 下的各个子目录。
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import json
+import sys
+import threading
+import time
+import traceback
+import webbrowser
+import zipfile
+from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+FROZEN = getattr(sys, 'frozen', False)
+
+# 让 server.py 能直接以脚本方式运行，同时找到上一级目录里的主脚本。
+# 打包后主脚本已经作为模块并进 exe，这个 sys.path 补丁既没必要也可能指错地方。
+if not FROZEN:
+    # 本文件位于 <工程根>/src/webui/，把 src/ 挂上去才能 import 到主脚本。
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# 依赖检查放在最前面，且给出可操作的指引。用错 Python 解释器是这套工具最常见的
+# 启动失败原因，默认的 ImportError traceback 对新用户毫无帮助。
+try:
+    import cv2
+    import numpy as np
+    import neuq_vision_calib as core
+except ImportError as exc:  # noqa: E402
+    raise SystemExit(
+        f'\n启动失败: 缺少依赖 ({exc})\n'
+        f'当前解释器: {sys.executable}\n\n'
+        '这通常意味着用了一个没装 opencv-python 的 Python。两种解决办法：\n\n'
+        '  1) 换成已装好依赖的解释器运行：\n'
+        '     <装了依赖的 python> src\\webui\\server.py\n\n'
+        '  2) 或者给当前解释器装上依赖：\n'
+        f'     "{sys.executable}" -m pip install -r requirements.txt\n\n'
+        '也可以直接双击工程根目录下的 start_webui.bat，它会自动挑解释器并补依赖。\n')
+
+
+def static_dir() -> Path:
+    """前端静态文件所在目录。
+
+    打包后这些文件被 PyInstaller 解包到 sys._MEIPASS 下，和 exe 不在一起，
+    所以资源目录和用户数据目录（core.SCRIPT_DIR）必须分开取。
+    """
+    bundle = getattr(sys, '_MEIPASS', None)
+    if bundle:
+        return Path(bundle) / 'webui' / 'static'
+    return Path(__file__).resolve().parent / 'static'
+
+
+STATIC_DIR = static_dir()
+
+# 服务端只有一份全局状态：本地单人使用，用锁串行化所有计算请求即可，
+# 不值得为并发去拆分会话。
+LOCK = threading.Lock()
+STATE: dict = {
+    'K': None,          # 相机内参
+    'D': None,          # 畸变系数
+    'Knew': None,       # 去畸变输出相机矩阵
+    'img_size': None,   # (W, H)
+    'src_path': None,   # 当前逆透视标定原图
+    'src_raw': None,    # 原始畸变图
+    'src_undist': None, # 去畸变图，四点拖拽在它上面进行
+}
+
+
+# ---------------------------------------------------------------- 工具
+
+def encode_jpeg(img: np.ndarray, quality: int = 88) -> str:
+    """把 BGR 图像编码成 data URL，供前端直接塞进 <img>/canvas。"""
+    ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        raise RuntimeError('JPEG 编码失败')
+    return 'data:image/jpeg;base64,' + base64.b64encode(buf.tobytes()).decode('ascii')
+
+
+def capture(func, *args, **kwargs):
+    """执行主脚本的函数并捕获它打印的日志，返回 (结果, 日志文本)。"""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        result = func(*args, **kwargs)
+    return result, buf.getvalue()
+
+
+def safe_rel(path: Path) -> str:
+    """把绝对路径转成相对工程根目录的字符串，便于前端展示。"""
+    try:
+        return str(path.relative_to(core.SCRIPT_DIR))
+    except ValueError:
+        return str(path)
+
+
+def ensure_calibration() -> None:
+    """确保内存里有 K/D/Knew，没有就从 calib.json 载入或现场标定。"""
+    if STATE['K'] is not None:
+        return
+    K, D, Knew, img_size = core.load_or_run_calibration()
+    STATE.update(K=K, D=D, Knew=Knew, img_size=img_size)
+
+
+def make_calibrator(quad, phys_w, phys_h, anchor_x, anchor_y, heading, scale=None):
+    """按给定参数构造标定器并算好 H 与 BirdView。
+
+    直接复用主脚本的 IpmCalibrator，四条线由四点反推，因此网页上拖出来的结果与
+    交互窗口里拖出来的走的是同一套 build_corners / compute_homography。
+    """
+    tl, tr, bl, br = (np.asarray(p, dtype=np.float64) for p in quad)
+    cal = core.IpmCalibrator(STATE['src_undist'], phys_w, phys_h)
+    cal.line_points = np.array([[tl, tr], [bl, br], [tl, bl], [tr, br]], dtype=np.float64)
+    cal.line_default = cal.line_points.copy()
+    # __init__ 会从模块级常量取初值，这里按请求覆盖掉
+    cal.anchor_x = float(anchor_x)
+    cal.anchor_y = float(anchor_y)
+    cal.heading = float(heading)
+    if scale is not None:
+        cal.scale = max(core.MIN_SCALE, float(scale))
+        cal.scale_initialized = True
+    cal.recompute()
+    return cal
+
+
+def guess_quad(img: np.ndarray) -> list:
+    """给四点拖拽一个起点：取画面里最亮连通域（地面标定纸）的凸包四角。
+
+    现场照片是"深色地板上铺浅色标定纸"，Otsu 一亮一暗就分开了。这只作起点，
+    精度无所谓——真正的位置由用户在画布上拖。
+    """
+    w, h = img.shape[1], img.shape[0]
+    fallback = [[w * 0.12, h * 0.35], [w * 0.88, h * 0.32],
+                [w * 0.02, h * 0.97], [w * 0.98, h * 0.97]]
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _t, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel = np.ones((25, 25), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        contours, _h = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return fallback
+        hull = cv2.convexHull(max(contours, key=cv2.contourArea)).reshape(-1, 2)
+        if hull.shape[0] < 4:
+            return fallback
+        pts = hull.astype(np.float64)
+        s, d = pts[:, 0] + pts[:, 1], pts[:, 0] - pts[:, 1]
+        quad = np.array([pts[np.argmin(s)], pts[np.argmax(d)],
+                         pts[np.argmin(d)], pts[np.argmax(s)]])
+        quad = core.order_corners_tl_tr_bl_br(quad)
+        if core.quad_area(quad) < 0.02 * w * h or not core.is_convex_quad(quad):
+            return fallback
+        return [[float(p[0]), float(p[1])] for p in quad]
+    except cv2.error:
+        return fallback
+
+
+# ---------------------------------------------------------------- 各接口实现
+
+def api_status() -> dict:
+    """工程现状：目录清单、标定摘要、逆透视状态、可选原图。"""
+    rows = (
+        ('calib_input', core.DIR_CALIB_IN, '相机标定照片'),
+        ('calib_data', core.DIR_CALIB_DATA, '标定结果 calib.json'),
+        ('calib_preview', core.DIR_CALIB_PREVIEW, '标定图去畸变验收'),
+        ('ipm_input', core.DIR_IPM_IN, '逆透视标定原图'),
+        ('ipm_output', core.DIR_IPM_OUT, '去畸变图 + BirdView'),
+        ('matrix', core.DIR_MATRIX, '六矩阵与逆透视状态'),
+        ('lookup_table', core.DIR_TABLE, '两套查找表'),
+        ('test_input', core.DIR_TEST_IN, '批量测试输入'),
+        ('test_output', core.DIR_TEST_OUT, '批量测试输出'),
+    )
+    dirs = []
+    for name, path, desc in rows:
+        files = [p for p in path.rglob('*') if p.is_file()] if path.is_dir() else []
+        dirs.append({
+            'name': name,
+            'desc': desc,
+            'exists': path.is_dir(),
+            'files': len(files),
+            'images': sum(1 for p in files if p.suffix.lower() in core.IMAGE_SUFFIXES),
+        })
+
+    calib = None
+    if core.CALIB_JSON.is_file():
+        try:
+            data = json.loads(core.CALIB_JSON.read_text(encoding='utf-8'))
+            K = np.asarray(data['camera_matrix'], dtype=np.float64).reshape(3, 3)
+            calib = {
+                'width': int(data['image_width']),
+                'height': int(data['image_height']),
+                'fx': float(K[0, 0]), 'fy': float(K[1, 1]),
+                'cx': float(K[0, 2]), 'cy': float(K[1, 2]),
+                'dist': [float(v) for v in np.asarray(data['dist_coeffs']).ravel()],
+                'hfov': float(2 * np.degrees(np.arctan2(data['image_width'] / 2.0, K[0, 0]))),
+            }
+        except (KeyError, ValueError, json.JSONDecodeError):
+            calib = None
+
+    # 三种格式的落盘文件名不同，任一存在就算这组表齐了
+    tables_ready = all(
+        any((core.DIR_TABLE / name / direction / f).is_file()
+            for f in ('MapW.txt', 'MapH.txt', 'MapW.bin', 'MapH.bin', 'Map.h'))
+        for name in ('undistort', 'undistort_ipm')
+        for direction in ('forward', 'reverse'))
+
+    # 报告上次导出用的表格式，让"交付给 C 端的到底是什么"一眼可见
+    last_table = None
+    if core.MATRIX_JSON.is_file():
+        try:
+            data = json.loads(core.MATRIX_JSON.read_text(encoding='utf-8'))
+            last_table = {
+                'format': data.get('table_format', 'txt'),
+                'fixed_point': data.get('table_fixed_point'),
+                'size_wh': data.get('table_size_wh'),
+            }
+        except (json.JSONDecodeError, OSError):
+            last_table = None
+
+    return {
+        'root': str(core.SCRIPT_DIR),
+        'dirs': dirs,
+        'calib': calib,
+        'ipm_state': core.load_ipm_state(),
+        'ipm_candidates': [p.name for p in core.list_images(core.DIR_IPM_IN)],
+        'ipm_source': safe_rel(STATE['src_path']) if STATE['src_path'] else None,
+        'tables_ready': tables_ready,
+        'last_table': last_table,
+        'photo_counts': api_import_status(),
+        'preview_count': len(core.list_images(core.DIR_CALIB_PREVIEW)),
+    }
+
+
+def api_import(body: dict) -> dict:
+    """导入混合素材目录。"""
+    raw = (body.get('dir') or '').strip()
+    if not raw:
+        raise ValueError('请填写素材目录。')
+    mode = body.get('mode') or 'add'
+    if mode not in ('add', 'replace'):
+        raise ValueError(f'--import-mode 需为 add 或 replace，收到 {mode!r}')
+    src = Path(raw).expanduser()
+    if not src.is_absolute():
+        src = core.SCRIPT_DIR / src
+    summary, log = capture(core.import_dataset, src, bool(body.get('move')), mode)
+    if not isinstance(summary, dict):
+        # 兼容旧版 import_dataset 返回 None 的情况
+        summary = {}
+    return {'log': log, 'summary': summary}
+
+
+def api_import_status() -> dict:
+    """统计 calib_input 下三类照片的数量，供前端显示导入后的分布。"""
+    def count(folder: Path) -> int:
+        return len(core.list_images(folder)) if folder.is_dir() else 0
+
+    return {
+        'calib': count(core.DIR_CALIB_IN),
+        'incomplete': count(core.DIR_CALIB_IN / core.INCOMPLETE_SUBDIR),
+        'ipm': count(core.DIR_IPM_IN),
+    }
+
+
+DIR_BACKUP = core.DIR_BACKUP
+
+# 会被打包 + 清空的目录（均位于 core.DATA_ROOT 下）。
+# 刻意不含 assets/checkerboard/（参考靶标，不是产物）、tools/、src/、主脚本本身，
+# 也不含工程根目录下用户自己的原始素材文件夹。
+BACKUP_FOLDERS = (
+    'calib_input', 'ipm_input', 'test_input',              # 输入
+    'calib_data', 'calib_preview', 'ipm_output',           # 标定产物
+    'matrix', 'lookup_table', 'test_output',               # 导出产物
+)
+
+# 这些文件是用户提供的参考资料 / 原始数据，不是本工具生成的产物，
+# 备份里会存一份，但清空时保留——它们无法由本工具重新生成。
+PRESERVE_ON_CLEAR = (
+    'matrix/legacy_matlab_reference.json',   # 历史 MATLAB 逆透视矩阵参照
+    'calib_data/calibrationSession.mat',     # 用户的 MATLAB 标定会话原始文件
+)
+
+
+def _clear_project_folders() -> tuple:
+    """清空输入/输出目录，返回 (清除数, 保留数, 各目录明细)。
+
+    「备份并清空」和「仅清空」共用这一段：两者的清空语义必须完全一致，
+    各写一份迟早会漂移（比如一边保留了参考资料、另一边忘了）。
+    """
+    present = [f for f in BACKUP_FOLDERS if (core.DATA_ROOT / f).is_dir()]
+    keep = {str((core.DATA_ROOT / p).resolve()) for p in PRESERVE_ON_CLEAR}
+    kept, removed, entries = 0, 0, []
+
+    for folder in present:
+        base = core.DATA_ROOT / folder
+        n = 0
+        for p in sorted(base.rglob('*'), reverse=True):
+            if p.is_file():
+                if str(p.resolve()) in keep:
+                    kept += 1
+                    continue
+                p.unlink()
+                removed += 1
+                n += 1
+            elif p.is_dir():
+                # 目录里可能还有被保留的文件，删不掉就跳过
+                try:
+                    p.rmdir()
+                except OSError:
+                    pass
+        base.mkdir(parents=True, exist_ok=True)
+        entries.append({'folder': folder, 'files': n})
+
+    # 内存里的标定与逆透视状态一并作废，否则界面还显示着已经被清掉的标定
+    STATE.update(K=None, D=None, Knew=None, img_size=None,
+                 src_path=None, src_raw=None, src_undist=None)
+    return removed, kept, entries
+
+
+def api_clear_all(body: dict) -> dict:
+    """不备份，直接清空输入/输出目录。
+
+    必须显式传 confirm=true 才执行。这个接口没有回退余地，光靠前端弹窗挡不住
+    误触（脚本、重放、手滑的请求都可能直接打过来），所以服务端也要一道闸。
+    """
+    if not body.get('confirm'):
+        raise ValueError('危险操作：需要在请求里显式带上 confirm=true 才会执行。')
+    removed, kept, entries = _clear_project_folders()
+    return {'cleared_files': removed, 'kept_files': kept, 'folders': entries}
+
+
+def api_backup_clear(body: dict) -> dict:
+    """把输入/输出产物打包成一个备份，然后清空它们，等待新素材导入。
+
+    顺序不能反：**先打包、校验压缩包确实落盘且非空，再清空**。
+    反过来的话一旦打包失败，用户的东西就没了。任何一步出问题都直接中止，不动原目录。
+    """
+    raw_name = (body.get('name') or '').strip()
+    # 名字里禁止路径分隔符和上跳，避免写到 backups/ 之外
+    if raw_name and (any(c in raw_name for c in '\\/:*?"<>|') or '..' in raw_name):
+        raise ValueError('备份名不能含 \\ / : * ? " < > | 等字符。')
+    stamp = time.strftime('%Y%m%d_%H%M%S')
+    name = raw_name or stamp
+
+    target = (DIR_BACKUP / name).resolve()
+    if not str(target).startswith(str(DIR_BACKUP.resolve())):
+        raise ValueError('备份路径越界。')
+    if target.exists():
+        raise ValueError(f'备份 {name} 已存在，换个名字或留空用时间戳。')
+
+    present = [f for f in BACKUP_FOLDERS if (core.DATA_ROOT / f).is_dir()]
+    if not present:
+        raise ValueError('没有可备份的目录。')
+
+    target.mkdir(parents=True, exist_ok=True)
+    archive = target / 'data.zip'
+
+    entries = []
+    total = 0
+    with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for folder in present:
+            base = core.DATA_ROOT / folder
+            files = [p for p in base.rglob('*') if p.is_file()]
+            for p in files:
+                zf.write(p, p.relative_to(core.DATA_ROOT).as_posix())
+                total += p.stat().st_size
+            entries.append({'folder': folder, 'files': len(files)})
+
+    # 打包完先自检：压缩包存在、非空、能打开
+    if not archive.is_file() or archive.stat().st_size == 0:
+        raise SystemExit(f'打包失败：{archive} 没有正常写出，已中止，原目录未改动。')
+    with zipfile.ZipFile(archive) as zf:
+        if zf.testzip() is not None:
+            raise SystemExit('打包失败：压缩包损坏，已中止，原目录未改动。')
+
+    manifest = {
+        'name': name,
+        'created': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'project_root': str(core.SCRIPT_DIR),
+        'archive': archive.name,
+        'archive_bytes': archive.stat().st_size,
+        'source_bytes': total,
+        'folders': entries,
+    }
+    (target / 'manifest.json').write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    # ---- 到这里才真正清空
+    removed, kept, entries = _clear_project_folders()
+
+    return {'name': name, 'path': str(target), 'archive': str(archive),
+            'archive_bytes': archive.stat().st_size, 'source_bytes': total,
+            'cleared_files': removed, 'kept_files': kept, 'folders': entries,
+            'manifest': manifest}
+
+
+def api_backup_list() -> dict:
+    """列出已有的备份，供界面回显。"""
+    items = []
+    if DIR_BACKUP.is_dir():
+        for d in sorted(DIR_BACKUP.iterdir(), reverse=True):
+            if not d.is_dir():
+                continue
+            man = d / 'manifest.json'
+            info = {'name': d.name}
+            if man.is_file():
+                try:
+                    m = json.loads(man.read_text(encoding='utf-8'))
+                    info.update({'created': m.get('created'),
+                                 'archive_bytes': m.get('archive_bytes'),
+                                 'source_bytes': m.get('source_bytes')})
+                except json.JSONDecodeError:
+                    pass
+            items.append(info)
+    return {'items': items, 'count': len(items)}
+
+
+def api_preview_gallery() -> dict:
+    """列出去畸变成果图，并配对回对应的标定原图。
+
+    calib_preview/ 里的文件名规则是 {原图名}_undist.jpg（见 export_undistort_previews），
+    据此反查 calib_input/ 里的原图，前端就能做"原图 vs 去畸变"并排对照——
+    这正是这个目录存在的意义：验收畸变矫正到底做没做对。
+    """
+    items = []
+    for p in core.list_images(core.DIR_CALIB_PREVIEW):
+        stem = p.stem[:-len('_undist')] if p.stem.endswith('_undist') else p.stem
+        # 原图扩展名可能与预览图不同，按 stem 在标定目录里找同名的任意图片
+        source = next((q for q in core.list_images(core.DIR_CALIB_IN)
+                       if q.stem == stem), None)
+        items.append({
+            # 前端拿这个相对路径去请求 /image，必须相对工程根（core.SCRIPT_DIR），
+            # 不能只拼目录名——数据目录已经收拢到 data/ 下了。
+            'preview': safe_rel(p),
+            'source': (safe_rel(source) if source is not None else None),
+            'stem': stem,
+        })
+    items.sort(key=lambda it: it['stem'])
+    return {'items': items, 'count': len(items),
+            'paired': sum(1 for it in items if it['source'])}
+
+
+def api_calibrate(body: dict) -> dict:
+    """跑相机标定；不勾选"强制重新标定"时优先复用已有的 calib.json。
+
+    返回 fit_result 是给前端画柱状图用的——逐帧误差、接受/被剔除的清单、整体 RMS。
+    """
+    err = body.get('max_reproj_err')
+    core.MAX_REPROJ_ERR = float(err) if err not in (None, '') else None
+
+    fit = None
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        if body.get('force') or not core.CALIB_JSON.is_file():
+            K, D, img_size, fit = core.calibrate_camera()
+            core.save_calibration(K, D, img_size)
+        else:
+            print(f'复用已有标定文件 {core.CALIB_JSON.name}'
+                  '（勾选"强制重新标定"可从头再算一遍）。')
+            K, D, img_size = core.load_calibration()
+        Knew = core.resolve_new_camera_matrix(K, D, img_size)
+        core.assert_invertible('K', K)
+        core.assert_invertible('Knew', Knew)
+    STATE.update(K=K, D=D, Knew=Knew, img_size=img_size,
+                 src_path=None, src_raw=None, src_undist=None)
+
+    response = {'log': buf.getvalue(), 'size': list(img_size)}
+    if fit is not None:
+        response['fit'] = fit
+    return response
+
+
+def api_source(body: dict) -> dict:
+    """选定逆透视标定原图并去畸变，返回图与一个起点四边形。"""
+    ensure_calibration()
+    name = (body.get('name') or '').strip()
+    path = core.resolve_user_path(name, core.DIR_IPM_IN) if name else None
+    if path is None or not path.is_file():
+        path = core.discover_ipm_source()
+    if path is None or not path.is_file():
+        raise ValueError('没有可用的逆透视标定原图，请先在 ipm_input/ 放入照片。')
+
+    raw = cv2.imread(str(path))
+    if raw is None:
+        raise ValueError(f'无法读取 {path}')
+    if (raw.shape[1], raw.shape[0]) != STATE['img_size']:
+        raw = cv2.resize(raw, STATE['img_size'])
+    undist = cv2.undistort(raw, STATE['K'], STATE['D'], None, STATE['Knew'])
+    STATE.update(src_path=path, src_raw=raw, src_undist=undist)
+
+    return {
+        'name': path.name,
+        'rel': safe_rel(path),
+        'width': int(undist.shape[1]),
+        'height': int(undist.shape[0]),
+        'image': encode_jpeg(undist, quality=92),
+        'quad': guess_quad(undist),
+    }
+
+
+def _preview_inputs(body: dict):
+    """从请求体里取出预览所需的全部参数。"""
+    if STATE['src_undist'] is None:
+        raise ValueError('请先选择一张逆透视标定原图。')
+    quad = np.asarray(body.get('quad'), dtype=np.float64).reshape(4, 2)
+    quad = core.order_corners_tl_tr_bl_br(quad)
+    if not core.is_convex_quad(quad) or core.quad_area(quad) < core.MIN_QUAD_AREA_PX:
+        raise ValueError('四点构成自交/非凸/退化的四边形，请调整。')
+    phys_w = float(body.get('phys_w', core.PHYS_W_CM))
+    phys_h = float(body.get('phys_h', core.PHYS_H_CM))
+    if phys_w <= 0 or phys_h <= 0:
+        raise ValueError('标定矩形的物理尺寸必须为正数。')
+    scale = body.get('scale')
+    return {
+        'quad': quad,
+        'phys_w': phys_w,
+        'phys_h': phys_h,
+        'anchor_x': float(body.get('anchor_x', core.ANCHOR_X)),
+        'anchor_y': float(body.get('anchor_y', core.ANCHOR_Y)),
+        'heading': float(body.get('heading', core.HEADING_DEG)),
+        'scale': float(scale) if scale not in (None, '') else None,
+    }
+
+
+def api_preview(body: dict) -> dict:
+    """实时预览：按当前四点与三自由度算 H，返回 BirdView 与标定矩形位置。"""
+    p = _preview_inputs(body)
+    cal = make_calibrator(p['quad'], p['phys_w'], p['phys_h'],
+                          p['anchor_x'], p['anchor_y'], p['heading'], p['scale'])
+    if cal.H is None or cal.birdview is None or cal.H0 is None:
+        raise ValueError('当前四点无法构成有效单应，请调整。')
+
+    view = cal.birdview.copy()
+    if view.ndim == 2:
+        view = cv2.cvtColor(view, cv2.COLOR_GRAY2BGR)
+    rect = core.apply_homography(cal.H, cal.corners)
+    cv2.polylines(view, [rect[[0, 1, 3, 2]].astype(np.int32)], True, (0, 255, 0), 2)
+    ax, ay = cal.anchor_px()
+    cv2.drawMarker(view, (int(round(ax)), int(round(ay))), (0, 140, 255),
+                   cv2.MARKER_CROSS, 18, 2)
+
+    return {
+        'birdview': encode_jpeg(view, quality=85),
+        'scale': float(cal.scale),
+        'max_scale': float(cal.max_scale),
+        'over_crop': bool(cal.is_over_crop()),
+        'horizon_sign': float(cal.sign),
+        'rect': [[float(v) for v in pt] for pt in rect],
+        'valid_ratio': float(np.isfinite(rect).all()),
+    }
+
+
+def apply_table_options(body: dict) -> None:
+    """把打表选项写回主脚本的模块级配置。
+
+    这些量在命令行里是全局参数，网页上按次请求给出，所以每次导出前都要重设一遍，
+    不能只设一次就放着——否则上一次的降采样尺寸会粘到下一次。
+    """
+    fmt = body.get('table_format')
+    if fmt in ('txt', 'bin', 'c'):
+        core.TABLE_FORMAT = fmt
+
+    size = body.get('table_size')
+    if size:
+        try:
+            w, h = int(size[0]), int(size[1])
+        except (TypeError, ValueError, IndexError):
+            raise ValueError('降采样尺寸格式不对，应为 [宽, 高]。')
+        if w <= 0 or h <= 0:
+            raise ValueError('降采样尺寸必须为正整数。')
+        core.TABLE_SIZE = (w, h)
+    else:
+        core.TABLE_SIZE = None
+
+    fp = body.get('table_fixed_point')
+    if fp not in (None, ''):
+        try:
+            fp = int(fp)
+        except (TypeError, ValueError):
+            raise ValueError('定点位数必须是整数。')
+        if not 0 <= fp <= 15:
+            raise ValueError('定点位数需在 0~15 之间。')
+        core.TABLE_FIXED_POINT = fp
+
+
+def api_commit(body: dict) -> dict:
+    """落盘：保存逆透视状态、导出六矩阵与两套查找表、跑批量测试。"""
+    p = _preview_inputs(body)
+    apply_table_options(body)
+    cal = make_calibrator(p['quad'], p['phys_w'], p['phys_h'],
+                          p['anchor_x'], p['anchor_y'], p['heading'], p['scale'])
+    if cal.H is None or cal.birdview is None or cal.H0 is None:
+        raise ValueError('当前四点无法构成有效单应，无法导出。')
+
+    K, D, Knew, img_size = STATE['K'], STATE['D'], STATE['Knew'], STATE['img_size']
+    H = cal.H
+    core.assert_invertible('H', H)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        core.safe_imwrite(core.IPM_RESULT, cal.birdview)
+        print('去畸变逆透视结果图已保存:', core.IPM_RESULT)
+        core.save_ipm_state(cal, p['phys_w'], p['phys_h'], img_size, STATE['src_path'])
+
+        over_crop = cal.is_over_crop()
+        if over_crop:
+            print(f'警告: scale={cal.scale:.3f} 超过不裁切视野的上限 '
+                  f'{cal.max_scale:.3f} px/cm，导出的表已裁掉部分有效视野。')
+
+        core.export_matrices(K, D, Knew, H, {
+            'H0': cal.H0.tolist(),
+            'phys_w_cm': p['phys_w'],
+            'phys_h_cm': p['phys_h'],
+            'scale_px_per_cm': cal.scale,
+            'max_scale_px_per_cm': cal.max_scale,
+            'over_crop': bool(over_crop),
+            'anchor_x': cal.anchor_x,
+            'anchor_y': cal.anchor_y,
+            'heading_deg': cal.heading,
+            'src_quad_tl_tr_bl_br': cal.corners.tolist(),
+            'horizon_sign': cal.sign,
+            'max_range_cm': core.MAX_RANGE_CM,
+            'max_lateral_cm': core.MAX_LATERAL_CM,
+        })
+        core.export_undistort_tables(K, D, Knew, img_size)
+        map_x, map_y = core.export_composite_tables(K, D, Knew, H, cal.H0,
+                                                    cal.sign, img_size)
+        core.batch_test(map_x, map_y, img_size)
+        print('\n全部完成。')
+    log = buf.getvalue()
+
+    files = []
+    for rel in ('matrix/matrices.json', 'matrix/matrices.txt', 'matrix/ipm_state.json'):
+        pth = core.DATA_ROOT / rel
+        if pth.is_file():
+            files.append({'name': rel, 'size': pth.stat().st_size})
+    return {'log': log, 'files': files}
+
+
+def api_batch() -> dict:
+    """只重跑批量测试，复用已落盘的逆透视状态。"""
+    ensure_calibration()
+    map_x, map_y = core.rebuild_reverse_map_from_state(
+        STATE['K'], STATE['D'], STATE['Knew'], STATE['img_size'])
+    _r, log = capture(core.batch_test, map_x, map_y, STATE['img_size'])
+    return {'log': log}
+
+
+# ---------------------------------------------------------------- HTTP
+
+class Handler(BaseHTTPRequestHandler):
+    """把上面的 api_* 函数暴露成 HTTP 接口。"""
+
+    server_version = 'NEUQCalibUI/1.0'
+
+    def log_message(self, fmt, *args):  # noqa: A003
+        """静音默认的逐请求日志，只保留真正的错误。"""
+        if str(args[1] if len(args) > 1 else '').startswith(('4', '5')):
+            sys.stderr.write('%s - %s\n' % (self.address_string(), fmt % args))
+
+    # ---- 输出辅助
+
+    def send_json(self, obj, status: int = 200) -> None:
+        """发送 JSON 响应。"""
+        body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_bytes(self, data: bytes, ctype: str) -> None:
+        """发送二进制响应。"""
+        self.send_response(200)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def read_body(self) -> dict:
+        """读取并解析 JSON 请求体。"""
+        length = int(self.headers.get('Content-Length') or 0)
+        if not length:
+            return {}
+        return json.loads(self.rfile.read(length).decode('utf-8') or '{}')
+
+    # ---- 路由
+
+    def do_GET(self) -> None:  # noqa: N802
+        """处理 GET：静态资源与图片。"""
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path in ('/', '/index.html'):
+                return self.serve_static('index.html')
+            if parsed.path.startswith('/static/'):
+                return self.serve_static(parsed.path[len('/static/'):])
+            if parsed.path == '/api/status':
+                with LOCK:
+                    return self.send_json(api_status())
+            if parsed.path == '/api/preview_gallery':
+                with LOCK:
+                    return self.send_json(api_preview_gallery())
+            if parsed.path == '/api/backup_list':
+                with LOCK:
+                    return self.send_json(api_backup_list())
+            if parsed.path == '/api/image':
+                return self.serve_image(parse_qs(parsed.query))
+            self.send_json({'error': f'未知路径 {parsed.path}'}, 404)
+        except Exception as exc:  # noqa: BLE001 - 统一转成前端可读的错误
+            self.send_json({'error': str(exc), 'trace': traceback.format_exc()}, 500)
+
+    def do_POST(self) -> None:  # noqa: N802
+        """处理 POST：所有计算型接口都走这里，加锁串行执行。"""
+        parsed = urlparse(self.path)
+        routes = {
+            '/api/import': lambda b: api_import(b),
+            '/api/calibrate': lambda b: api_calibrate(b),
+            '/api/source': lambda b: api_source(b),
+            '/api/preview': lambda b: api_preview(b),
+            '/api/commit': lambda b: api_commit(b),
+            '/api/batch': lambda b: api_batch(),
+            '/api/backup_clear': lambda b: api_backup_clear(b),
+            '/api/clear_all': lambda b: api_clear_all(b),
+        }
+        handler = routes.get(parsed.path)
+        if handler is None:
+            return self.send_json({'error': f'未知接口 {parsed.path}'}, 404)
+        try:
+            body = self.read_body()
+            with LOCK:
+                result = handler(body)
+            self.send_json({'ok': True, **result})
+        except (SystemExit, ValueError) as exc:
+            # 参数问题（四点退化、尺寸非法、文件不存在）属于用户可修正的输入错误，
+            # 用 400 而不是 500，前端才能把它和真正的服务端故障区分开。
+            self.send_json({'error': str(exc)}, 400)
+        except Exception as exc:  # noqa: BLE001
+            self.send_json({'error': str(exc), 'trace': traceback.format_exc()}, 500)
+
+    # ---- 静态与图片
+
+    def serve_static(self, rel: str) -> None:
+        """提供 webui/static 下的文件。"""
+        path = (STATIC_DIR / rel).resolve()
+        if not str(path).startswith(str(STATIC_DIR)) or not path.is_file():
+            return self.send_json({'error': '静态资源不存在'}, 404)
+        ctypes = {'.html': 'text/html; charset=utf-8', '.js': 'application/javascript; charset=utf-8',
+                  '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml'}
+        self.send_bytes(path.read_bytes(), ctypes.get(path.suffix, 'application/octet-stream'))
+
+    def serve_image(self, query: dict) -> None:
+        """按相对路径返回工程内的图片，可限制最大边以省带宽。"""
+        rel = (query.get('rel') or [''])[0]
+        path = (core.SCRIPT_DIR / rel).resolve()
+        if not str(path).startswith(str(core.SCRIPT_DIR)) or not path.is_file():
+            return self.send_json({'error': '图片不存在'}, 404)
+        img = cv2.imread(str(path))
+        if img is None:
+            return self.send_json({'error': '无法读取图片'}, 404)
+        max_edge = int((query.get('max') or ['0'])[0] or 0)
+        if max_edge and max(img.shape[:2]) > max_edge:
+            k = max_edge / max(img.shape[:2])
+            img = cv2.resize(img, (int(img.shape[1] * k), int(img.shape[0] * k)))
+        ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        if not ok:
+            return self.send_json({'error': '编码失败'}, 500)
+        self.send_bytes(buf.tobytes(), 'image/jpeg')
+
+
+def bind_server(host: str, port: int, attempts: int = 12):
+    """绑定监听端口，被占用就顺延试下一个，返回 (httpd, 实际端口)。
+
+    端口被占用是最常见的启动失败原因（上次没退干净、或同时开了两个控制台），
+    直接报错让用户自己去查端口很不友好，顺延一位继续试更省事。
+    """
+    last_exc = None
+    for offset in range(attempts):
+        try:
+            return ThreadingHTTPServer((host, port + offset), Handler), port + offset
+        except OSError as exc:
+            last_exc = exc
+            if offset < attempts - 1:
+                print(f'端口 {port + offset} 被占用，试 {port + offset + 1}…')
+    raise SystemExit(f'端口 {port}~{port + attempts - 1} 全被占用，无法启动。\n'
+                     f'最后一次错误: {last_exc}\n'
+                     f'请用 --port 指定别的端口，例如 --port 9000。')
+
+
+# 首次运行时自动建出来的数据目录。打包成 exe 后这一步尤其重要：
+# 用户双击 exe，旁边空荡荡的，得让他一眼看到该往哪个文件夹放素材。
+DATA_FOLDERS = ('calib_input', 'ipm_input', 'test_input', 'calib_data',
+                'calib_preview', 'ipm_output', 'matrix', 'lookup_table',
+                'test_output', 'backups')
+
+
+def ensure_data_folders() -> None:
+    """在工程根目录下把数据目录补齐（已存在则不动）。"""
+    for name in DATA_FOLDERS:
+        (core.DATA_ROOT / name).mkdir(parents=True, exist_ok=True)
+
+
+def main() -> None:
+    """解析参数并启动服务。"""
+    ap = argparse.ArgumentParser(description='NEUQ 视觉标定工具 Web 控制台')
+    ap.add_argument('--port', type=int, default=8770, help='监听端口，默认 8770')
+    ap.add_argument('--host', default='127.0.0.1', help='监听地址，默认仅本机')
+    ap.add_argument('--root', type=Path, help='工程根目录，默认取主脚本所在目录')
+    ap.add_argument('--no-browser', action='store_true', help='启动后不自动打开浏览器')
+    args = ap.parse_args()
+
+    core.configure_paths(root=args.root)
+    ensure_data_folders()
+
+    httpd, port = bind_server(args.host, args.port)
+    url = f'http://{args.host}:{port}/'
+    print('=' * 56)
+    print('  NEUQ 视觉标定控制台已启动')
+    print(f'  请在浏览器打开:  {url}')
+    print(f'  工程根目录:      {core.SCRIPT_DIR}')
+    print('  按 Ctrl+C 退出')
+    print('=' * 56)
+
+    if not args.no_browser:
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print('\n已停止。')
+    finally:
+        httpd.server_close()
+
+
+if __name__ == '__main__':
+    main()
