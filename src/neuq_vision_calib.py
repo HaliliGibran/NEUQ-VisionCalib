@@ -172,6 +172,35 @@ def resolve_user_path(value, fallback_dir: Path) -> Path:
     return candidate.resolve() if candidate.is_file() else p.resolve()
 
 
+def resolve_import_dir(value) -> Path:
+    """把用户给的素材目录解析成真实目录。
+
+    只认一个基准不够用：前端"选择文件夹"只能拿到文件夹名，命令行里又常常
+    随手敲一个相对路径，而素材可能放在工程根，也可能是整理工程时收进
+    data/import/ 的那批原始素材。这里按可能性依次试探，全都找不到时把试过
+    的路径列全——比干巴巴一句"不是目录"有用得多。
+    """
+    raw = Path(str(value)).expanduser()
+    if raw.is_absolute():
+        if raw.is_dir():
+            return raw.resolve()
+        raise SystemExit(f'--import-dir 不是目录: {raw}')
+
+    tried: List[Path] = []
+    for base in (Path.cwd(), SCRIPT_DIR, DATA_ROOT, DATA_ROOT / 'import'):
+        p = (base / raw).resolve()
+        if p in tried:
+            continue
+        tried.append(p)
+        if p.is_dir():
+            return p
+
+    raise SystemExit(
+        f'找不到素材目录 {raw}。已依次尝试：\n  '
+        + '\n  '.join(str(p) for p in tried)
+        + '\n改用绝对路径，或把素材目录放进 data/import/ 下再填文件夹名。')
+
+
 def configure_paths(root: Optional[Path] = None,
                     calib_dir: Optional[Path] = None,
                     ipm_dir: Optional[Path] = None,
@@ -2126,7 +2155,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         return
 
     if args.import_dir is not None:
-        import_dataset(args.import_dir, move=args.move, mode=args.import_mode)
+        import_dataset(resolve_import_dir(args.import_dir),
+                       move=args.move, mode=args.import_mode)
         if stage == 'import':
             return
         print()

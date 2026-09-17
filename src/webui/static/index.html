@@ -33,7 +33,7 @@
       <div class="row file-row">
         <button id="btn-browse" class="ghost sm" type="button">选择文件夹…</button>
         <input id="in-import-browse" type="file" webkitdirectory multiple style="display:none">
-        <span class="hint inline">支持相对路径（相对工程根）或绝对路径。</span>
+        <span class="hint inline">只填文件夹名即可，会依次在工程根、data/、data/import/ 下查找；也支持绝对路径。</span>
       </div>
       <div class="row mode-row">
         <label><input type="radio" name="import-mode" value="add" checked> 增量添加（按文件名去重）</label>

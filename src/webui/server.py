@@ -276,9 +276,8 @@ def api_import(body: dict) -> dict:
     mode = body.get('mode') or 'add'
     if mode not in ('add', 'replace'):
         raise ValueError(f'--import-mode 需为 add 或 replace，收到 {mode!r}')
-    src = Path(raw).expanduser()
-    if not src.is_absolute():
-        src = core.SCRIPT_DIR / src
+    # 交给 core 统一解析：素材可能在工程根，也可能在 data/import/ 下
+    src = core.resolve_import_dir(raw)
     summary, log = capture(core.import_dataset, src, bool(body.get('move')), mode)
     if not isinstance(summary, dict):
         # 兼容旧版 import_dataset 返回 None 的情况
