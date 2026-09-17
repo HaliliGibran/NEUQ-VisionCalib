@@ -234,7 +234,16 @@ def load_reference_image(root: Path, size: tuple[int, int]) -> np.ndarray:
             if p.is_file():
                 candidates.append(p)
             else:
-                print(f'  提示: ipm_state.json 记录的原图已不在 {p}，退回目录内查找。')
+                # 工程被搬过家、或数据目录重组过（例如各目录收拢进 data/）：
+                # 记录的绝对路径失效，但同名图多半还在 ipm_input/ 下。
+                # 先按文件名捞一次——直接退回"目录里第一张"会挑到另一张图，
+                # 让后面的逐像素比对彻底失去意义。
+                by_name = root / 'data' / 'ipm_input' / p.name
+                if by_name.is_file():
+                    print(f'  提示: 记录的原图路径已失效，改用同名图 {by_name.name}。')
+                    candidates.append(by_name)
+                else:
+                    print(f'  提示: ipm_state.json 记录的原图已不在 {p}，退回目录内查找。')
     preferred = root / 'data' / 'ipm_input' / 'UnInverseImage.jpg'
     if preferred.is_file():
         candidates.append(preferred)
