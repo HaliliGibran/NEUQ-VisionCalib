@@ -195,6 +195,19 @@ async function api(path, body) {
   return data;
 }
 
+async function upload(path, formData) {
+  const res = await fetch(path, { method: 'POST', body: formData });
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    throw new Error('服务端返回了非 JSON 响应（HTTP ' + res.status + '）');
+  }
+  if (data.error) throw new Error(data.error);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return data;
+}
+
 function setChip(el, text, cls) {
   el.textContent = text;
   el.className = 'chip' + (cls ? ' ' + cls : '');
@@ -904,16 +917,19 @@ function bindControls() {
   $('btn-mode-corner').onclick = () => setMode('corner');
   $('btn-mode-line').onclick = () => setMode('line');
 
-  // 文件夹选择：input[type=file][webkitdirectory] 不能直接显示路径，
-  // 只能拿到第一个文件，把它的 .webkitRelativePath 头一段当作所选目录。
+  // 文件夹选择：浏览器出于安全不给真实磁盘路径，只给文件内容 + 相对路径。
+  // 所以这里把选中的文件整个留着，点「开始导入」时直接上传，
+  // 而不是把文件夹名丢给服务端去磁盘上猜位置（改名/挪地方必然失败）。
   $('btn-browse').onclick = () => $('in-import-browse').click();
   $('in-import-browse').onchange = (e) => {
-    const file = e.target.files && e.target.files[0];
-    if (!file) return;
+    const picked = Array.from(e.target.files || [])
+      .filter(f => /\.(jpe?g|png|bmp)$/i.test(f.name));
+    if (!picked.length) return;
+    pendingImportFiles = picked;
     // webkitRelativePath 形如 "MyFolder/sub/file.jpg"，目录是第一段
-    const dir = file.webkitRelativePath.split('/')[0];
+    const dir = (picked[0].webkitRelativePath || picked[0].name).split('/')[0];
     $('in-import-dir').value = dir;
-    log(`已选择文件夹：${dir}（共 ${e.target.files.length} 个文件）`);
+    log(`已选择 ${picked.length} 个文件，点「开始导入」会上传到 data/import/${dir}/`, 'ok');
   };
 }
 
@@ -1077,6 +1093,9 @@ async function refreshBackups() {
 
 // ---------------------------------------------------------------- 动作
 
+// 浏览器选中、等待上传的素材文件（见 bindActions 里的文件夹选择）
+let pendingImportFiles = [];
+
 function bindActions() {
   $('btn-refresh').onclick = () => withBusy($('btn-refresh'), async () => {
     try { await refreshStatus(); } catch (e) { log('扫描失败: ' + e.message, 'err'); }
@@ -1099,11 +1118,23 @@ function bindActions() {
   $('btn-import').onclick = () => withBusy($('btn-import'), async () => {
     try {
       const mode = document.querySelector('input[name="import-mode"]:checked').value;
-      const data = await api('/api/import', {
-        dir: $('in-import-dir').value,
-        mode,
-        move: $('in-import-move').checked,
-      });
+      // 用"选择文件夹"选的：直接把文件传上去，不走路径查找
+      let data;
+      if (pendingImportFiles && pendingImportFiles.length) {
+        const fd = new FormData();
+        fd.append('name', $('in-import-dir').value.trim());
+        pendingImportFiles.forEach(f => {
+          fd.append('files', f, f.webkitRelativePath || f.name);
+        });
+        data = await upload('/api/upload_import', fd);
+        pendingImportFiles = [];
+      } else {
+        data = await api('/api/import', {
+          dir: $('in-import-dir').value,
+          mode,
+          move: $('in-import-move').checked,
+        });
+      }
       log(data.log);
       const s = data.summary;
       if (s) {

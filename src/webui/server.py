@@ -18,6 +18,7 @@ import argparse
 import base64
 import io
 import json
+import re
 import sys
 import threading
 import time
@@ -268,6 +269,89 @@ def api_status() -> dict:
     }
 
 
+def parse_multipart(headers, body: bytes):
+    """解析 multipart/form-data，返回 (普通字段, [(字段名, 文件名, 字节])。
+
+    标准库里已经没有现成的 multipart 解析器了（cgi 在 3.13 被移除），
+    为一个上传接口引入第三方依赖又不值当。这里只处理浏览器 FormData
+    实际会生成的那种格式，够用即可。
+    """
+    ctype = headers.get('Content-Type') or ''
+    if not ctype.lower().startswith('multipart/form-data'):
+        raise ValueError('上传需要 multipart/form-data 请求')
+    boundary = None
+    for seg in ctype.split(';'):
+        seg = seg.strip()
+        if seg.startswith('boundary='):
+            boundary = seg[len('boundary='):].strip('"').encode('utf-8')
+    if not boundary:
+        raise ValueError('请求头里缺少 boundary')
+
+    fields: dict = {}
+    files = []
+    for chunk in body.split(b'--' + boundary):
+        chunk = chunk.strip(b'\r\n')
+        if not chunk or chunk == b'--':
+            continue
+        head, sep, data = chunk.partition(b'\r\n\r\n')
+        if not sep:
+            continue
+        head_s = head.decode('utf-8', 'replace')
+        name_m = re.search(r'name="([^"]*)"', head_s)
+        file_m = re.search(r'filename="([^"]*)"', head_s)
+        name = name_m.group(1) if name_m else ''
+        if file_m:
+            files.append((name, file_m.group(1), data))
+        else:
+            fields[name] = data.decode('utf-8', 'replace')
+    return fields, files
+
+
+def api_upload_import(fields: dict, files: list) -> dict:
+    """把浏览器选中的素材原样上传到 data/import/<文件夹名>/ 并导入。
+
+    浏览器出于安全只肯给出文件内容和相对路径，绝不给真实磁盘路径，所以
+    "选了文件夹"这件事只能靠把文件真的传上来完成——让服务端拿一个文件夹名
+    去磁盘上猜位置，改个名、挪个地方就必然失败。
+    """
+    if not files:
+        raise ValueError('没有选中任何文件。')
+
+    first_rel = files[0][1].replace('\\', '/')
+    folder = (fields.get('name') or '').strip() or first_rel.split('/')[0]
+    folder = folder.replace('\\', '/').strip('/').split('/')[0]
+    if not folder or folder in ('.', '..') or any(c in folder for c in ':*?"<>|'):
+        raise ValueError(f'素材文件夹名不合法: {folder!r}')
+
+    dest = core.DIR_IMPORT / folder
+    dest.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    for _field, rel, data in files:
+        parts = [p for p in rel.replace('\\', '/').split('/')
+                 if p not in ('', '.', '..')]
+        if parts and parts[0] == folder:
+            parts = parts[1:]           # 去掉最外层那个与文件夹同名的目录
+        if not parts:
+            continue
+        target = dest.joinpath(*parts).resolve()
+        # 目录穿越防护：落点必须在 dest 之内
+        if dest.resolve() not in target.parents:
+            raise ValueError(f'非法的相对路径: {rel}')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        written += 1
+
+    if not written:
+        raise ValueError('没有可写入的图片文件（只支持 jpg/jpeg/png/bmp）。')
+
+    summary, log = capture(core.import_dataset, dest, False, 'add')
+    if not isinstance(summary, dict):
+        summary = {}
+    return {'log': f'已上传 {written} 个文件 → data/import/{folder}/\n' + log,
+            'summary': summary, 'folder': folder, 'uploaded': written}
+
+
 def api_import(body: dict) -> dict:
     """导入混合素材目录。"""
     raw = (body.get('dir') or '').strip()
@@ -299,9 +383,9 @@ def api_import_status() -> dict:
 
 DIR_BACKUP = core.DIR_BACKUP
 
-# 会被打包 + 清空的目录（均位于 core.DATA_ROOT 下）。
+# 会被打包 + 清空的目录（均直接位于工程根）。
 # 刻意不含 assets/checkerboard/（参考靶标，不是产物）、tools/、src/、主脚本本身，
-# 也不含工程根目录下用户自己的原始素材文件夹。
+# 也不含 data/import/ 下用户自己的原始素材。
 BACKUP_FOLDERS = (
     'calib_input', 'ipm_input', 'test_input',              # 输入
     'calib_data', 'calib_preview', 'ipm_output',           # 标定产物
@@ -322,12 +406,12 @@ def _clear_project_folders() -> tuple:
     「备份并清空」和「仅清空」共用这一段：两者的清空语义必须完全一致，
     各写一份迟早会漂移（比如一边保留了参考资料、另一边忘了）。
     """
-    present = [f for f in BACKUP_FOLDERS if (core.DATA_ROOT / f).is_dir()]
-    keep = {str((core.DATA_ROOT / p).resolve()) for p in PRESERVE_ON_CLEAR}
+    present = [f for f in BACKUP_FOLDERS if (core.SCRIPT_DIR / f).is_dir()]
+    keep = {str((core.SCRIPT_DIR / p).resolve()) for p in PRESERVE_ON_CLEAR}
     kept, removed, entries = 0, 0, []
 
     for folder in present:
-        base = core.DATA_ROOT / folder
+        base = core.SCRIPT_DIR / folder
         n = 0
         for p in sorted(base.rglob('*'), reverse=True):
             if p.is_file():
@@ -383,7 +467,7 @@ def api_backup_clear(body: dict) -> dict:
     if target.exists():
         raise ValueError(f'备份 {name} 已存在，换个名字或留空用时间戳。')
 
-    present = [f for f in BACKUP_FOLDERS if (core.DATA_ROOT / f).is_dir()]
+    present = [f for f in BACKUP_FOLDERS if (core.SCRIPT_DIR / f).is_dir()]
     if not present:
         raise ValueError('没有可备份的目录。')
 
@@ -394,10 +478,10 @@ def api_backup_clear(body: dict) -> dict:
     total = 0
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as zf:
         for folder in present:
-            base = core.DATA_ROOT / folder
+            base = core.SCRIPT_DIR / folder
             files = [p for p in base.rglob('*') if p.is_file()]
             for p in files:
-                zf.write(p, p.relative_to(core.DATA_ROOT).as_posix())
+                zf.write(p, p.relative_to(core.SCRIPT_DIR).as_posix())
                 total += p.stat().st_size
             entries.append({'folder': folder, 'files': len(files)})
 
@@ -666,7 +750,7 @@ def api_commit(body: dict) -> dict:
 
     files = []
     for rel in ('matrix/matrices.json', 'matrix/matrices.txt', 'matrix/ipm_state.json'):
-        pth = core.DATA_ROOT / rel
+        pth = core.SCRIPT_DIR / rel
         if pth.is_file():
             files.append({'name': rel, 'size': pth.stat().st_size})
     return {'log': log, 'files': files}
@@ -748,6 +832,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         """处理 POST：所有计算型接口都走这里，加锁串行执行。"""
         parsed = urlparse(self.path)
+        if parsed.path == '/api/upload_import':
+            # 上传是 multipart，不是 JSON，单独走一条分支
+            return self.handle_upload()
         routes = {
             '/api/import': lambda b: api_import(b),
             '/api/calibrate': lambda b: api_calibrate(b),
@@ -770,6 +857,22 @@ class Handler(BaseHTTPRequestHandler):
         except (SystemExit, ValueError) as exc:
             # 参数问题（四点退化、尺寸非法、文件不存在）属于用户可修正的输入错误，
             # 用 400 而不是 500，前端才能把它和真正的服务端故障区分开。
+            self.send_json({'error': str(exc)}, 400)
+        except Exception as exc:  # noqa: BLE001
+            self.send_json({'error': str(exc), 'trace': traceback.format_exc()}, 500)
+
+    def handle_upload(self) -> None:
+        """接收浏览器上传的素材文件。"""
+        length = int(self.headers.get('Content-Length') or 0)
+        if not length:
+            return self.send_json({'error': '空请求'}, 400)
+        body = self.rfile.read(length)
+        try:
+            fields, files = parse_multipart(self.headers, body)
+            with LOCK:
+                result = api_upload_import(fields, files)
+            self.send_json({'ok': True, **result})
+        except (SystemExit, ValueError) as exc:
             self.send_json({'error': str(exc)}, 400)
         except Exception as exc:  # noqa: BLE001
             self.send_json({'error': str(exc), 'trace': traceback.format_exc()}, 500)
@@ -823,17 +926,16 @@ def bind_server(host: str, port: int, attempts: int = 12):
                      f'请用 --port 指定别的端口，例如 --port 9000。')
 
 
-# 首次运行时自动建出来的数据目录。打包成 exe 后这一步尤其重要：
-# 用户双击 exe，旁边空荡荡的，得让他一眼看到该往哪个文件夹放素材。
-DATA_FOLDERS = ('calib_input', 'ipm_input', 'test_input', 'calib_data',
-                'calib_preview', 'ipm_output', 'matrix', 'lookup_table',
-                'test_output', 'backups')
-
-
 def ensure_data_folders() -> None:
-    """在工程根目录下把数据目录补齐（已存在则不动）。"""
-    for name in DATA_FOLDERS:
-        (core.DATA_ROOT / name).mkdir(parents=True, exist_ok=True)
+    """只保证 data/import/ 与 data/backups/ 存在。
+
+    刻意不去预建 calib_input/、matrix/、lookup_table/ 这些工作目录：
+    它们都是"跑起来才会有的产物"，全部提前铺一遍空文件夹只会让工程根变得
+    杂乱，用户也分不清哪些目录是自己该往里放东西的。真正写入时各函数自己
+    会 mkdir(parents=True)，不存在就建、不写就不建。
+    """
+    for folder in (core.DIR_IMPORT, core.DIR_BACKUP):
+        folder.mkdir(parents=True, exist_ok=True)
 
 
 def main() -> None:

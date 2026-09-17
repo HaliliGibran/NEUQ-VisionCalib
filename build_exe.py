@@ -27,13 +27,10 @@ EXCLUDES = (
     'notebook', 'jupyter', 'sqlite3', 'pydoc',
 )
 
-# 首次运行时程序会自己建这些目录，但预先放好能让用户一眼看到该往哪放素材。
-# 与 src/neuq_vision_calib.py 的 DATA_ROOT 约定保持一致：全部挂在 data/ 下。
-DATA_FOLDERS = (
-    'calib_input', 'ipm_input', 'test_input',
-    'calib_data', 'calib_preview', 'ipm_output',
-    'matrix', 'lookup_table', 'test_output', 'backups',
-)
+# 预先放好 data/import/ 与 data/backups/ 这两个"用户投放区"。
+# 其余工作目录不预建：它们都是跑起来才产生的产物，提前铺一排空文件夹只会
+# 让 exe 目录显得杂乱，真正写入时程序自己会 mkdir(parents=True)。
+IMPORT_FOLDERS = ('data/import', 'data/backups')
 
 
 def build(clean: bool) -> Path:
@@ -63,9 +60,8 @@ def build(clean: bool) -> Path:
     if not out.is_dir():
         raise SystemExit(f'打包似乎没成功：{out} 不存在。')
 
-    data_root = out / 'data'
-    for name in DATA_FOLDERS:
-        (data_root / name).mkdir(parents=True, exist_ok=True)
+    for name in IMPORT_FOLDERS:
+        (out / name).mkdir(parents=True, exist_ok=True)
 
     # 棋盘靶标是参考资料不是产物，跟源码里的位置保持一致，放 assets/ 下
     checker = ROOT / 'assets' / 'checkerboard'

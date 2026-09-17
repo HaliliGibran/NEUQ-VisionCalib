@@ -25,23 +25,27 @@
 │   └── verify_outputs.py      校验导出的矩阵与查找表是否自洽
 ├── assets/
 │   └── checkerboard/          12x9 方格、20mm 棋盘靶标（PDF/PNG/DOCX，打印用）
-├── data/                      运行数据（自动创建，**不入库**，见 .gitignore）
-│   ├── calib_input/           相机标定照片，_incomplete/ 存检不出完整棋盘的
-│   ├── calib_preview/         标定图去畸变验收图
-│   ├── calib_data/            calib.json —— 相机内参与畸变系数
-│   ├── ipm_input/             逆透视标定原图
-│   ├── ipm_output/            去畸变图 + BirdView 结果
-│   ├── matrix/                六矩阵、逆透视状态
-│   ├── lookup_table/          undistort/ 与 undistort_ipm/ 两套正反向查找表
-│   ├── test_input/            批量测试输入
-│   ├── test_output/           批量测试输出
-│   ├── backups/               「备份并清空」产生的归档
-│   └── import/                待整理的原始素材
+├── data/                      只放两类东西（均不入库）
+│   ├── import/                导入前的原始素材（网页上传的落点）
+│   └── backups/               「备份并清空」产生的归档
+├── calib_input/               相机标定照片，_incomplete/ 存检不出完整棋盘的
+├── calib_preview/             标定图去畸变验收图
+├── calib_data/                calib.json —— 相机内参与畸变系数
+├── ipm_input/                 逆透视标定原图
+├── ipm_output/                去畸变图 + BirdView 结果
+├── matrix/                    六矩阵、逆透视状态
+├── lookup_table/              undistort/ 与 undistort_ipm/ 两套正反向查找表
+├── test_input/                批量测试输入
+├── test_output/               批量测试输出
 └── dist/                      打包产物（不入库）
 ```
 
-**约定**：所有输入输出集中在 `data/` 下，由 `src/neuq_vision_calib.py` 的
-`DATA_ROOT` 统一定义；`--root` 参数可整体改指向别的工程目录。
+**约定**：工作目录平铺在工程根，跑起来才会产生、不写就不建（写入时各函数自己
+`mkdir(parents=True)`，不需要提前铺空文件夹）。`data/` 是唯一的例外，它只装
+"不属于流水线产物"的两样东西：导入前的原始素材和备份压缩包。
+
+素材导入有两种方式：在网页里用「选择文件夹…」**直接上传**（推荐，文件夹改名、
+放在哪个盘都无所谓），或在输入框里填路径让服务端按 `工程根 → data/import/` 查找。
 
 ---
 

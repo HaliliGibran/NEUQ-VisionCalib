@@ -1,16 +1,17 @@
 """NEUQ 智能车视觉标定一体化工具。
 
-数据统一放在工程根的 data/ 下（该目录不入库，见 .gitignore）。
+目录约定：各工作目录平铺在工程根；data/ 只装两类不属于流水线产物的东西——
+导入前的原始素材（data/import/）与备份压缩包（data/backups/），两者都不入库。
 
 流程：
-  1. 相机标定（读 data/calib_input/ 已有照片，或在线拍摄自动存入）
-     → data/calib_data/calib.json
-  2. 标定照片去畸变效果 → data/calib_preview/
-  3. 逆透视标定原图去畸变 → data/ipm_output/UnDistortionImage.jpg
+  1. 相机标定（读 calib_input/ 已有照片，或在线拍摄自动存入）
+     → calib_data/calib.json
+  2. 标定照片去畸变效果 → calib_preview/
+  3. 逆透视标定原图去畸变 → ipm_output/UnDistortionImage.jpg
   4. 交互标定逆透视：四条线定义地平面几何约束，三自由度调节目标 ROI
-  5. 六矩阵导出 → data/matrix/
-  6. 两套打表（各含正向/反向）→ data/lookup_table/undistort/、data/lookup_table/undistort_ipm/
-  7. 批量测试 data/test_input/ → data/test_output/
+  5. 六矩阵导出 → matrix/
+  6. 两套打表（各含正向/反向）→ lookup_table/undistort/、lookup_table/undistort_ipm/
+  7. 批量测试 test_input/ → test_output/
 
 坐标约定：全程 OpenCV 0-based 像素坐标。物理坐标单位 cm，x 向右、y 向下（朝向车辆），
 标定矩形中心为原点；BirdView 图正上方为车辆前进方向。
@@ -35,8 +36,8 @@ T/S/R 第三行均为 [0,0,1]，故 H[2,:] 恒等于 H0[2,:]，地平线只随�
   python src/neuq_vision_calib.py --stage tables --quad ...
                                                          无 GUI 跑完整链路
   python src/webui/server.py                             打开浏览器控制台（推荐）
-不带任何参数时的行为与改造前一致：从 data/calib_input/ 标定，
-用 data/ipm_input/ 的原图交互标定。
+不带任何参数时的行为与改造前一致：从 calib_input/ 标定，
+用 ipm_input/ 的原图交互标定。
 """
 
 import argparse
@@ -117,8 +118,11 @@ def default_project_root() -> Path:
     目录，`__file__` 指向那里，于是所有输入输出都会跑到 Temp 下去，用户双击 exe
     之后会发现"素材放进去了但程序说没有"。冻结状态下要取 exe 自己所在的目录。
 
-    源码方式运行时本文件位于 <工程根>/src/ 下，所以要再上一级才是工程根；
-    数据则统一收敛到 <工程根>/data/，避免十个数据目录直接散落在根目录。
+    源码方式运行时本文件位于 <工程根>/src/ 下，所以要再上一级才是工程根。
+
+    目录约定：各工作目录（calib_input/、matrix/、lookup_table/ …）直接放在工程根，
+    与改造前一致；只有 data/ 是个例外，它只装两类"不属于流水线产物"的东西——
+    导入前的原始素材（data/import/）和备份压缩包（data/backups/）。
     """
     if getattr(sys, 'frozen', False):
         return Path(sys.executable).resolve().parent
@@ -126,17 +130,18 @@ def default_project_root() -> Path:
 
 
 SCRIPT_DIR = default_project_root()
-DATA_ROOT = SCRIPT_DIR / 'data'          # 全部输入输出集中在此，便于备份与 .gitignore
-DIR_BACKUP = DATA_ROOT / 'backups'
-DIR_CALIB_IN = DATA_ROOT / 'calib_input'
-DIR_CALIB_PREVIEW = DATA_ROOT / 'calib_preview'
-DIR_CALIB_DATA = DATA_ROOT / 'calib_data'
-DIR_IPM_IN = DATA_ROOT / 'ipm_input'
-DIR_IPM_OUT = DATA_ROOT / 'ipm_output'
-DIR_MATRIX = DATA_ROOT / 'matrix'
-DIR_TABLE = DATA_ROOT / 'lookup_table'
-DIR_TEST_IN = DATA_ROOT / 'test_input'
-DIR_TEST_OUT = DATA_ROOT / 'test_output'
+# 原始素材与备份归档单独收在 data/ 下，其余产物目录平铺在工程根
+DIR_IMPORT = SCRIPT_DIR / 'data' / 'import'
+DIR_BACKUP = SCRIPT_DIR / 'data' / 'backups'
+DIR_CALIB_IN = SCRIPT_DIR / 'calib_input'
+DIR_CALIB_PREVIEW = SCRIPT_DIR / 'calib_preview'
+DIR_CALIB_DATA = SCRIPT_DIR / 'calib_data'
+DIR_IPM_IN = SCRIPT_DIR / 'ipm_input'
+DIR_IPM_OUT = SCRIPT_DIR / 'ipm_output'
+DIR_MATRIX = SCRIPT_DIR / 'matrix'
+DIR_TABLE = SCRIPT_DIR / 'lookup_table'
+DIR_TEST_IN = SCRIPT_DIR / 'test_input'
+DIR_TEST_OUT = SCRIPT_DIR / 'test_output'
 
 CALIB_JSON = DIR_CALIB_DATA / 'calib.json'
 IPM_SOURCE = DIR_IPM_IN / 'UnInverseImage.jpg'
@@ -187,7 +192,7 @@ def resolve_import_dir(value) -> Path:
         raise SystemExit(f'--import-dir 不是目录: {raw}')
 
     tried: List[Path] = []
-    for base in (Path.cwd(), SCRIPT_DIR, DATA_ROOT, DATA_ROOT / 'import'):
+    for base in (Path.cwd(), SCRIPT_DIR, DIR_IMPORT):
         p = (base / raw).resolve()
         if p in tried:
             continue
@@ -211,28 +216,28 @@ def configure_paths(root: Optional[Path] = None,
     这些常量在模块级被各函数直接引用，这里用 global 重写而不是层层传参：
     改动面最小，且所有调用点都不必知道路径是从哪来的。
     """
-    global SCRIPT_DIR, DATA_ROOT, DIR_BACKUP
+    global SCRIPT_DIR, DIR_IMPORT, DIR_BACKUP
     global DIR_CALIB_IN, DIR_CALIB_PREVIEW, DIR_CALIB_DATA
     global DIR_IPM_IN, DIR_IPM_OUT, DIR_MATRIX, DIR_TABLE, DIR_TEST_IN, DIR_TEST_OUT
     global CALIB_JSON, IPM_SOURCE, UNDIST_RESULT, IPM_RESULT, MATRIX_JSON
 
     if root is not None:
         SCRIPT_DIR = Path(root).expanduser().resolve()
-    DATA_ROOT = SCRIPT_DIR / 'data'
-    DIR_BACKUP = DATA_ROOT / 'backups'
+    DIR_IMPORT = SCRIPT_DIR / 'data' / 'import'
+    DIR_BACKUP = SCRIPT_DIR / 'data' / 'backups'
 
     DIR_CALIB_IN = (Path(calib_dir).expanduser().resolve() if calib_dir
-                    else DATA_ROOT / 'calib_input')
+                    else SCRIPT_DIR / 'calib_input')
     DIR_IPM_IN = (Path(ipm_dir).expanduser().resolve() if ipm_dir
-                  else DATA_ROOT / 'ipm_input')
+                  else SCRIPT_DIR / 'ipm_input')
     DIR_TEST_IN = (Path(test_dir).expanduser().resolve() if test_dir
-                   else DATA_ROOT / 'test_input')
-    DIR_CALIB_PREVIEW = DATA_ROOT / 'calib_preview'
-    DIR_CALIB_DATA = DATA_ROOT / 'calib_data'
-    DIR_IPM_OUT = DATA_ROOT / 'ipm_output'
-    DIR_MATRIX = DATA_ROOT / 'matrix'
-    DIR_TABLE = DATA_ROOT / 'lookup_table'
-    DIR_TEST_OUT = DATA_ROOT / 'test_output'
+                   else SCRIPT_DIR / 'test_input')
+    DIR_CALIB_PREVIEW = SCRIPT_DIR / 'calib_preview'
+    DIR_CALIB_DATA = SCRIPT_DIR / 'calib_data'
+    DIR_IPM_OUT = SCRIPT_DIR / 'ipm_output'
+    DIR_MATRIX = SCRIPT_DIR / 'matrix'
+    DIR_TABLE = SCRIPT_DIR / 'lookup_table'
+    DIR_TEST_OUT = SCRIPT_DIR / 'test_output'
 
     CALIB_JSON = DIR_CALIB_DATA / 'calib.json'
     IPM_SOURCE = (resolve_user_path(ipm_source, DIR_IPM_IN) if ipm_source

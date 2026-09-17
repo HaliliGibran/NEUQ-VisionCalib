@@ -181,7 +181,7 @@ def check_export_fidelity(root: Path, calib: dict, matrices: dict) -> bool:
     fx, fy = core.build_composite_reverse_map(K, D, Knew, H, H0, sign, size)
     if TABLE_SHAPE != size:
         fx, fy = core.resample_map_pair(fx, fy, TABLE_SHAPE)
-    ax, ay = load_pair(root / 'data' / 'lookup_table' / 'undistort_ipm' / 'reverse')
+    ax, ay = load_pair(root / 'lookup_table' / 'undistort_ipm' / 'reverse')
 
     if ax.shape != fx.shape:
         return report('落盘表 == 流水线重算', False,
@@ -223,7 +223,7 @@ def load_reference_image(root: Path, size: tuple[int, int]) -> np.ndarray:
         return _REF_CACHE[key]
 
     candidates: list[Path] = []
-    state_path = root / 'data' / 'matrix' / 'ipm_state.json'
+    state_path = root / 'matrix' / 'ipm_state.json'
     if state_path.is_file():
         try:
             recorded = json.loads(state_path.read_text(encoding='utf-8')).get('src_image')
@@ -234,23 +234,23 @@ def load_reference_image(root: Path, size: tuple[int, int]) -> np.ndarray:
             if p.is_file():
                 candidates.append(p)
             else:
-                # 工程被搬过家、或数据目录重组过（例如各目录收拢进 data/）：
-                # 记录的绝对路径失效，但同名图多半还在 ipm_input/ 下。
+                # 工程被搬过家、或目录结构调整过：记录的绝对路径失效，
+                # 但同名图多半还在 ipm_input/ 下。
                 # 先按文件名捞一次——直接退回"目录里第一张"会挑到另一张图，
                 # 让后面的逐像素比对彻底失去意义。
-                by_name = root / 'data' / 'ipm_input' / p.name
+                by_name = root / 'ipm_input' / p.name
                 if by_name.is_file():
                     print(f'  提示: 记录的原图路径已失效，改用同名图 {by_name.name}。')
                     candidates.append(by_name)
                 else:
                     print(f'  提示: ipm_state.json 记录的原图已不在 {p}，退回目录内查找。')
-    preferred = root / 'data' / 'ipm_input' / 'UnInverseImage.jpg'
+    preferred = root / 'ipm_input' / 'UnInverseImage.jpg'
     if preferred.is_file():
         candidates.append(preferred)
     if not candidates:
-        candidates = sorted((root / 'data' / 'ipm_input').glob('*.jpg'))
+        candidates = sorted((root / 'ipm_input').glob('*.jpg'))
     if not candidates:
-        raise SystemExit(f'{root / "data" / "ipm_input"} 下没有可用于比对的图片。')
+        raise SystemExit(f'{root / "ipm_input"} 下没有可用于比对的图片。')
 
     src = cv2.imread(str(candidates[0]))
     if src is None:
@@ -313,7 +313,7 @@ def check_undistort_tables(root: Path, calib: dict) -> bool:
     size = (int(calib['image_width']), int(calib['image_height']))
     src = load_reference_image(root, size)
 
-    map_x, map_y = load_pair(root / 'data' / 'lookup_table' / 'undistort' / 'reverse')
+    map_x, map_y = load_pair(root / 'lookup_table' / 'undistort' / 'reverse')
     invalid = (map_x < 0) | (map_y < 0)
     mx = np.where(invalid, -1e6, map_x).astype(np.float32)
     my = np.where(invalid, -1e6, map_y).astype(np.float32)
@@ -339,7 +339,7 @@ def check_composite_tables(root: Path, calib: dict, matrices: dict) -> bool:
     size = (int(calib['image_width']), int(calib['image_height']))
     src = load_reference_image(root, size)
 
-    map_x, map_y = load_pair(root / 'data' / 'lookup_table' / 'undistort_ipm' / 'reverse')
+    map_x, map_y = load_pair(root / 'lookup_table' / 'undistort_ipm' / 'reverse')
     invalid = (map_x < 0) | (map_y < 0)
     mx = np.where(invalid, -1e6, map_x).astype(np.float32)
     my = np.where(invalid, -1e6, map_y).astype(np.float32)
@@ -355,7 +355,7 @@ def check_composite_tables(root: Path, calib: dict, matrices: dict) -> bool:
 
     # 顺带确认落盘的结果图确实由这张表生成。必须在有效区内比：无效区里表是黑的，
     # 而 warpPerspective 会照常填上标定矩形以外的画面，不屏蔽就会得出误导性的差异率。
-    result_path = root / 'data' / 'ipm_output' / 'UnDistortionInverseImage.jpg'
+    result_path = root / 'ipm_output' / 'UnDistortionInverseImage.jpg'
     if result_path.is_file():
         produced = cv2.imread(str(result_path))
         if produced is not None and produced.shape[:2] == via_table.shape[:2]:
@@ -367,8 +367,8 @@ def check_composite_tables(root: Path, calib: dict, matrices: dict) -> bool:
 
 def check_forward_reverse(root: Path) -> bool:
     """检查 4: 逆透视的 forward 与 reverse 互为逆映射。"""
-    rev_x, rev_y = load_pair(root / 'data' / 'lookup_table' / 'undistort_ipm' / 'reverse')
-    fwd_x, fwd_y = load_pair(root / 'data' / 'lookup_table' / 'undistort_ipm' / 'forward')
+    rev_x, rev_y = load_pair(root / 'lookup_table' / 'undistort_ipm' / 'reverse')
+    fwd_x, fwd_y = load_pair(root / 'lookup_table' / 'undistort_ipm' / 'forward')
     th, tw = rev_x.shape
     if fwd_x.shape != (th, tw):
         return report('forward/reverse 互逆', False,
@@ -411,7 +411,7 @@ def check_sentinel(root: Path) -> bool:
     ok = True
     for name in ('undistort', 'undistort_ipm'):
         for direction in ('reverse', 'forward'):
-            map_x, map_y = load_pair(root / 'data' / 'lookup_table' / name / direction)
+            map_x, map_y = load_pair(root / 'lookup_table' / name / direction)
             neg_x, neg_y = map_x < 0, map_y < 0
             mismatch = int(np.count_nonzero(neg_x != neg_y))
             only_neg1 = bool(np.all(map_x[neg_x] == -1.0) and np.all(map_y[neg_y] == -1.0))
@@ -432,7 +432,7 @@ def print_table_inventory(root: Path) -> None:
     total = 0
     for name in ('undistort', 'undistort_ipm'):
         for direction in ('reverse', 'forward'):
-            folder = root / 'data' / 'lookup_table' / name / direction
+            folder = root / 'lookup_table' / name / direction
             if not folder.is_dir():
                 continue
             size = sum(p.stat().st_size for p in folder.rglob('*') if p.is_file())
@@ -448,8 +448,8 @@ def main() -> int:
     root = (Path(sys.argv[1]).resolve() if len(sys.argv) > 1
             else Path(__file__).resolve().parent.parent)
 
-    calib_path = root / 'data' / 'calib_data' / 'calib.json'
-    matrix_path = root / 'data' / 'matrix' / 'matrices.json'
+    calib_path = root / 'calib_data' / 'calib.json'
+    matrix_path = root / 'matrix' / 'matrices.json'
     for p in (calib_path, matrix_path):
         if not p.is_file():
             raise SystemExit(f'缺少 {p}，请先跑完标定与打表。')
