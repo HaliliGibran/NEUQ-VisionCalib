@@ -67,7 +67,6 @@ def scenario_calibration() -> None:
     calibrate_camera() 里根本没有 board 这个变量，"运行相机标定"直接 NameError。
     当时测试把规格对象、检测、JSON 都测了，唯独没按下那个按钮。
     """
-    import shutil
     tmp = Path(tempfile.mkdtemp(prefix='neuq_calib_'))
     old_root = core.SCRIPT_DIR
     old_board = core.BOARD
@@ -116,6 +115,63 @@ def scenario_calibration() -> None:
     finally:
         core.configure_paths(root=old_root)
         core.configure_board(old_board)
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def scenario_persistence() -> None:
+    """棋盘规格必须能跨重启存活。
+
+    只放在进程全局里的话：设好 9x7 → 导入素材 → 关掉程序，
+    第二天重开又变成 12x9，接着导入的新照片就会按另一套规格分类。
+    """
+    import shutil
+    tmp = Path(tempfile.mkdtemp(prefix='neuq_proj_'))
+    old_root = core.SCRIPT_DIR
+    old_board = core.BOARD
+    try:
+        core.configure_paths(root=tmp)
+        check(core.BOARD == core.DEFAULT_BOARD,
+              '新工程默认用 12x9 / 20mm', str(core.BOARD.squares_x))
+
+        spec = core.CheckerboardSpec(9, 7, 25.0)
+        core.configure_board(spec, persist=True)
+        cfg = core.load_project_config()
+        check((cfg.get('board') or {}).get('squares_x') == 9,
+              '设置后立即写进 project.json',
+              str((cfg.get('board') or {}).get('squares_x')))
+        check(cfg.get('schema_version') == core.SCHEMA_VERSION,
+              'project.json 带 schema_version')
+
+        # 模拟重启：清空进程状态，走启动路径重新解析工程根
+        core.BOARD = core.DEFAULT_BOARD
+        core.configure_paths(root=tmp)
+        check(core.BOARD == spec, '重启后规格被恢复',
+              f'{core.BOARD.squares_x}x{core.BOARD.squares_y}/{core.BOARD.square_size_mm}')
+
+        # 未显式给参数时，启动不得把 project.json 覆盖回默认值
+        core.BOARD = core.DEFAULT_BOARD
+        core.configure_paths(root=tmp)
+        check((core.load_project_config().get('board') or {}).get('squares_x') == 9,
+              '启动不会把已保存的规格冲掉')
+
+        # 素材按旧规格分类后改规格 → 必须提示
+        core.configure_paths(root=tmp)
+        import numpy as np
+        core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_CALIB_IN / 'a.jpg',
+                          np.zeros((40, 40, 3), dtype=np.uint8))
+        core.update_project_config(last_import={'board': spec.to_dict()})
+        other = core.CheckerboardSpec(12, 9, 20.0)
+        stale = core.material_stale_reason(other)
+        check(stale is not None and '不一致' in stale,
+              '改规格后提示素材已按旧规格分类',
+              (stale or '').splitlines()[0] if stale else '')
+        check(core.material_stale_reason(spec) is None,
+              '规格没变则不报警')
+    finally:
+        core.configure_paths(root=old_root)
+        core.configure_board(old_board, persist=False)
         import shutil as _sh
         _sh.rmtree(tmp, ignore_errors=True)
 
@@ -227,6 +283,9 @@ def main() -> int:
 
     print('\n[E] 端到端：真的调用一次相机标定')
     scenario_calibration()
+
+    print('\n[F] 持久化：project.json 记住项目用的棋盘')
+    scenario_persistence()
 
     print()
     if FAILED:

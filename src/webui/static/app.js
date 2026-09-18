@@ -1115,8 +1115,13 @@ let pendingImportFiles = [];
 function updateBoardHint() {
   const x = parseInt($('in-board-x').value, 10);
   const y = parseInt($('in-board-y').value, 10);
-  const ok = x >= 5 && y >= 4;
-  $('board-corners').textContent = ok ? `${x - 1} × ${y - 1}` : '方格数至少 5 × 4';
+  const cx = x - 1;
+  const cy = y - 1;
+  // 与后端 CheckerboardSpec 用同一判据：内角点短边 ≥3、长边 ≥4。
+  // 刻意不假设"横向一定多于纵向"——4x5 与 5x4 只是转了 90°，应当等价。
+  const ok = Number.isFinite(cx) && Number.isFinite(cy)
+    && Math.min(cx, cy) >= 3 && Math.max(cx, cy) >= 4;
+  $('board-corners').textContent = ok ? `${cx} × ${cy}` : '内角点至少 3×4（方格 4×5）';
   $('board-corners').style.color = ok ? '' : 'var(--danger)';
 }
 
@@ -1153,7 +1158,10 @@ function bindActions() {
     try {
       const b = await api('/api/board', boardPayload());
       $('board-active').textContent = '当前生效：' + b.label;
-      log(`标定板规格已设为 ${b.label}（OpenCV 内角点 ${b.corners_x}×${b.corners_y}）`, 'ok');
+      log(`标定板规格已设为 ${b.label}（OpenCV 内角点 ${b.corners_x}×${b.corners_y}）`
+        + '，已写入 project.json', 'ok');
+      // 规格参与"棋盘照/地面照"的判定：改了规格，已导入的素材就是按旧标准分的
+      if (b.material_stale) log('⚠ ' + b.material_stale, 'err');
     } catch (e) { log('规格设置失败: ' + e.message, 'err'); }
   });
 

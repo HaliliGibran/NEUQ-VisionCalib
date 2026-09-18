@@ -1,7 +1,16 @@
 # 开发 / 打包依赖（运行程序本身不需要）
-# 安装: python -m pip install -r requirements-dev.txt
+#
+# 建议装在独立 venv 里：本项目唯一装了 opencv 的解释器可能是系统 Python，
+# 往里装开发包不合适。而且 ruff 检查源码时根本不需要导入 OpenCV，
+# 两条链完全可以分开：
+#
+#   python -m venv .venv-lint
+#   .venv-lint/Scripts/python -m pip install -r requirements-dev.txt
+#   .venv-lint/Scripts/ruff check .        # 静态检查
+#   python tests/run_all.py                # 回归测试（在装了 cv2 的解释器上）
 
--r requirements.txt
+# 静态检查，配置见 pyproject.toml
+ruff>=0.5.0
 
 # 打包成 Windows 可执行文件，见 build_exe.py
 pyinstaller>=6.0.0

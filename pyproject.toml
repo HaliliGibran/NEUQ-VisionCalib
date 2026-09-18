@@ -1,0 +1,45 @@
+[project]
+name = "neuq-vision-calib"
+version = "0.1.0"
+description = "NEUQ 相机标定程序 —— 智能车视觉标定一体化工具"
+requires-python = ">=3.10"
+dependencies = ["opencv-python>=4.8.0", "numpy>=1.24.0"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = ["dist", "build", "lookup_table", "data"]
+
+[tool.ruff.lint]
+# 只挑"真的可能出错"的规则集。刻意不含 UP（pyupgrade）：
+# 那会把 130 多处 Optional[X] / typing.List 全改成 X | None / list，
+# 属于独立的一次风格重构，混在这里只会把有价值的信号淹掉。
+select = [
+    "F",      # pyflakes：未使用的导入/变量、重复定义
+    "E", "W", # pycodestyle
+    "I",      # import 排序
+    "SIM",    # 可以简化的写法
+    "B",      # bugbear：容易踩的坑（可变默认值、except 裸捕获等）
+    "PLW",    # pylint 的警告类子集
+    "RUF",    # ruff 自带规则
+    "DTZ",    # 日期时间相关（天真 datetime 之类）
+]
+
+ignore = [
+    # 本项目是中文代码库，注释与文档字符串里的全角标点是正确的，
+    # 这三条规则会把它们全部报成"歧义字符"（1400+ 条噪声）。
+    "RUF001", "RUF002", "RUF003",
+    # 模块级配置用 global 重写是本工程既有的、写在文档里的设计
+    # （configure_paths / apply_options 的注释解释了为什么这样做）。
+    # 等拆成包、配置收进 dataclass 之后这两条自然消失。
+    "PLW0603",
+    # int(...) 包一层是为了让 JSON 落盘拿到 Python 原生 int，
+    # numpy 标量不能直接被 json 序列化——不是多余的转换。
+    "RUF046",
+    # 行宽与紧凑写法：中文注释按字宽算很容易超 100，压行只会更难读。
+    "E501", "E701",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试与校验脚本里，为了可读性常常要显式写出"用不到"的东西
+"tests/*" = ["RUF059"]

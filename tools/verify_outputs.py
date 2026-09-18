@@ -141,7 +141,7 @@ def check_export_fidelity(root: Path, calib: dict, matrices: dict) -> bool:
     size = IMAGE_SIZE
 
     fx, fy = core.build_composite_reverse_map(K, D, Knew, H, H0, sign, size)
-    if TABLE_SHAPE != size:
+    if size != TABLE_SHAPE:
         fx, fy = core.resample_map_pair(fx, fy, TABLE_SHAPE)
     ax, ay = load_pair(root / 'lookup_table' / 'undistort_ipm' / 'reverse')
 

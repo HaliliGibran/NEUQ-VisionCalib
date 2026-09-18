@@ -31,7 +31,7 @@
         所以必须在导入<strong>之前</strong>设对。</p>
       <div class="row board-row">
         <label>横向方格数
-          <input id="in-board-x" type="number" min="5" max="60" step="1" value="12">
+          <input id="in-board-x" type="number" min="4" max="60" step="1" value="12">
         </label>
         <label>纵向方格数
           <input id="in-board-y" type="number" min="4" max="60" step="1" value="9">
@@ -44,7 +44,7 @@
         <button id="btn-board-apply" class="primary">应用规格</button>
         <button id="btn-board-reset" class="ghost">用仓库自带 12×9 / 20 mm</button>
       </div>
-      <p class="hint inline">OpenCV 内角点：<code id="board-corners">11 × 8</code></p>
+      <p class="hint inline">方格至少 4×5 或 5×4；OpenCV 内角点：<code id="board-corners">11 × 8</code></p>
       <div id="board-active" class="hint mono"></div>
     </article>
 

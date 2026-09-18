@@ -41,11 +41,13 @@ T/S/R 第三行均为 [0,0,1]，故 H[2,:] 恒等于 H0[2,:]，地平线只随�
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -155,12 +157,103 @@ DEFAULT_BOARD = CheckerboardSpec()
 # 之后素材导入、在线拍摄、相机标定、结果落盘全部读这一份，不再各留一套常量。
 BOARD: CheckerboardSpec = DEFAULT_BOARD
 
+# 项目级配置。棋盘规格属于"这个项目用什么板"的前置事实，必须落盘：
+# 只放在进程全局里的话，设好规格、导完素材、关掉程序，第二天重开又变回默认，
+# 接着导入的新照片就会按另一套规格分类。
+PROJECT_JSON_NAME = 'project.json'
 
-def configure_board(spec: CheckerboardSpec) -> CheckerboardSpec:
-    """设置当前工程的标定板规格，返回生效后的对象。"""
+
+def project_config_path() -> Path:
+    """项目配置文件路径。"""
+    return SCRIPT_DIR / PROJECT_JSON_NAME
+
+
+def load_project_config() -> dict:
+    """读取 project.json；不存在或损坏时返回空 dict（不阻断启动）。"""
+    p = project_config_path()
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f'注意: {p} 无法读取（{exc}），本次按默认配置运行。')
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    try:
+        check_schema(data, str(p))
+    except SystemExit as exc:
+        print(f'注意: {exc}')          # 配置读不动不该让整个工具起不来
+        return {}
+    return data
+
+
+def update_project_config(**sections) -> dict:
+    """合并若干段落到 project.json 并落盘，返回合并后的完整内容。"""
+    data = load_project_config()
+    data.update(sections)
+    data['schema_version'] = SCHEMA_VERSION
+    data['tool_version'] = TOOL_VERSION
+    p = project_config_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
+    except OSError as exc:
+        print(f'警告: 无法写入 {p}（{exc}），本次设置重启后不会保留。')
+    return data
+
+
+def restore_board() -> CheckerboardSpec:
+    """决定启动时该用哪块棋盘：project.json → calib.json → 默认。
+
+    顺序不能反。project.json 是用户显式设过的；calib.json 只是"上次标定时用的"，
+    作为迁移来源；都没有才退回仓库自带的 12x9/20mm。
+    """
+    saved = spec_from_meta(load_project_config().get('board'))
+    if saved is not None:
+        return saved
+    from_calib = spec_from_meta(calib_board_meta())
+    if from_calib is not None:
+        return from_calib
+    return DEFAULT_BOARD
+
+
+def configure_board(spec: CheckerboardSpec,
+                    persist: bool = False) -> CheckerboardSpec:
+    """设置当前工程的标定板规格。
+
+    persist=True 时写进 project.json —— 用户在界面/命令行上显式设定的场合才用它；
+    启动时的自动恢复不要写回去，否则会把用户的设置覆盖成默认值。
+    """
     global BOARD
+    changed = spec != BOARD
     BOARD = spec
+    if persist:
+        update_project_config(board=spec.to_dict())
+    if changed:
+        warning = material_stale_reason(spec)
+        if warning:
+            print(f'注意: {warning}')
     return BOARD
+
+
+def material_stale_reason(spec: Optional[CheckerboardSpec] = None) -> Optional[str]:
+    """素材是否是按「另一块棋盘」分类的；是则返回说明，否则 None。
+
+    规格不只用于标定，导入时"这张算棋盘照还是地面照"用的也是它。改了规格却不
+    重新分类，calib_input/ 与 ipm_input/ 里躺着的还是旧标准的产物，
+    后面选逆透视原图时会莫名其妙看到混进来的棋盘照。
+    """
+    now = BOARD if spec is None else spec
+    cfg = load_project_config()
+    used = spec_from_meta((cfg.get('last_import') or {}).get('board'))
+    if used is None or used == now:
+        return None
+    if not any(list_images(d) for d in (DIR_CALIB_IN, DIR_IPM_IN)):
+        return None                       # 素材库是空的，无所谓
+    return (f'当前素材是按「{used.label}」分类导入的，与现在的「{now.label}」不一致。\n'
+            '规格参与"棋盘照 / 地面照"的判定，请重新分类素材：'
+            '在界面上用「备份并清空」清空后按新规格重新导入。')
 
 
 def resolve_board(squares: Optional[Sequence[int]] = None,
@@ -366,6 +459,10 @@ def configure_paths(root: Optional[Path] = None,
     UNDIST_RESULT = DIR_IPM_OUT / 'UnDistortionImage.jpg'
     IPM_RESULT = DIR_IPM_OUT / 'UnDistortionInverseImage.jpg'
     MATRIX_JSON = DIR_MATRIX / 'matrices.json'
+
+    # 棋盘规格属于项目级配置，随工程根一起重新解析。
+    # 不写回盘：这是"读配置"，不是"用户改了设置"。
+    configure_board(restore_board())
 
 
 # ---------------------------------------------------------------- 通用
@@ -742,7 +839,7 @@ def report_reprojection_error(obj_points, img_points, rvecs, tvecs,
     """
     total_err = 0.0
     total_pts = 0
-    for objp, imgp, rvec, tvec in zip(obj_points, img_points, rvecs, tvecs):
+    for objp, imgp, rvec, tvec in zip(obj_points, img_points, rvecs, tvecs, strict=True):
         proj, _ = cv2.projectPoints(objp, rvec, tvec, K, D)
         diff = proj.reshape(-1, 2) - imgp.reshape(-1, 2)
         total_err += float(np.sum(np.linalg.norm(diff, axis=1)))
@@ -773,8 +870,15 @@ def resolve_new_camera_matrix(K: np.ndarray, D: np.ndarray,
     return np.asarray(Knew, dtype=np.float64)
 
 
-def save_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int]) -> None:
-    """把内参、畸变系数与标定分辨率写入 calib_data/calib.json。"""
+def save_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
+                     board: Optional[CheckerboardSpec] = None) -> None:
+    """把内参、畸变系数与标定分辨率写入 calib_data/calib.json。
+
+    board 显式传入时以它为准：provenance 必须跟着"实际用于标定的那块板"走，
+    不能只读当时的全局状态——否则 calibrate_camera(board=A) 之后再改全局，
+    落盘的就会是 A 的参数配 B 的规格。
+    """
+    spec = BOARD if board is None else board
     DIR_CALIB_DATA.mkdir(parents=True, exist_ok=True)
     payload = {
         'image_width': int(img_size[0]),
@@ -783,10 +887,10 @@ def save_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int]) ->
         'dist_coeffs': D.tolist(),
         'schema_version': SCHEMA_VERSION,
         'tool_version': TOOL_VERSION,
-        'board': BOARD.to_dict(),
+        'board': spec.to_dict(),
         # 老字段保留一轮：外部脚本或旧版网页可能还在读这两个键
-        'chessboard_corners': list(BOARD.corners),
-        'square_size_mm': BOARD.square_size_mm,
+        'chessboard_corners': list(spec.corners),
+        'square_size_mm': spec.square_size_mm,
     }
     CALIB_JSON.write_text(json.dumps(payload, indent=2), encoding='utf-8')
     print('标定数据已保存:', CALIB_JSON)
@@ -836,7 +940,7 @@ def load_calibration() -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int]
     try:
         data = json.loads(CALIB_JSON.read_text(encoding='utf-8'))
     except json.JSONDecodeError as exc:
-        raise SystemExit(f'{CALIB_JSON} 不是合法 JSON: {exc}')
+        raise SystemExit(f'{CALIB_JSON} 不是合法 JSON: {exc}') from None
     if not isinstance(data, dict):
         raise SystemExit(f'{CALIB_JSON} 顶层应为 JSON 对象。')
     check_schema(data, str(CALIB_JSON))
@@ -854,7 +958,7 @@ def load_calibration() -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int]
         D = np.asarray(data['dist_coeffs'], dtype=np.float64).ravel()
         img_size = (int(data['image_width']), int(data['image_height']))
     except (ValueError, TypeError) as exc:
-        raise SystemExit(f'{CALIB_JSON} 字段格式不正确: {exc}')
+        raise SystemExit(f'{CALIB_JSON} 字段格式不正确: {exc}') from None
 
     if D.size == 0:
         raise SystemExit(f'{CALIB_JSON} 的 dist_coeffs 为空。')
@@ -902,7 +1006,7 @@ def compute_homography(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
         raise ValueError('compute_homography 只接受 4 点。')
 
     A = np.zeros((src.shape[0] * 2, 9), dtype=np.float64)
-    for i, ((x, y), (u, v)) in enumerate(zip(src, dst)):
+    for i, ((x, y), (u, v)) in enumerate(zip(src, dst, strict=True)):
         A[2 * i] = [-x, -y, -1.0, 0.0, 0.0, 0.0, u * x, u * y, u]
         A[2 * i + 1] = [0.0, 0.0, 0.0, -x, -y, -1.0, v * x, v * y, v]
 
@@ -1426,10 +1530,10 @@ class IpmCalibrator:
 
             return self.H
         finally:
-            try:
+            # 窗口可能已经被用户关掉了，setMouseCallback 会抛 cv2.error；
+            # 这里只关心"无论如何把窗口收干净"，直接抑制掉最清楚。
+            with contextlib.suppress(cv2.error):
                 cv2.setMouseCallback(self.raw_win, lambda *_a: None)
-            except cv2.error:
-                pass
             cv2.destroyWindow(self.raw_win)
             cv2.destroyWindow(self.preview_win)
 
@@ -1460,7 +1564,9 @@ def export_matrices(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
     payload = {
         'schema_version': SCHEMA_VERSION,
         'tool_version': TOOL_VERSION,
-        'board': BOARD.to_dict(),          # 这份矩阵是哪块棋盘标出来的
+        # 这份矩阵是哪块棋盘标出来的 —— 以 calib.json 记录的为准，
+        # 而不是当次的全局变量：provenance 要跟着标定结果走。
+        'board': (spec_from_meta(calib_board_meta()) or BOARD).to_dict(),
         'note': (
             '去畸变的非线性部分由 dist_coeffs 承载，无法写成矩阵；'
             f'因此原图->BirdView 的复合变换只以查表形式给出，见 {DIR_TABLE.name}/undistort/ '
@@ -1498,7 +1604,7 @@ def assert_invertible(name: str, m: np.ndarray) -> None:
     try:
         np.linalg.inv(m)
     except np.linalg.LinAlgError as exc:
-        raise SystemExit(f'{name} 不可逆，无法导出: {exc}')
+        raise SystemExit(f'{name} 不可逆，无法导出: {exc}') from None
 
 
 # ---------------------------------------------------------------- 6. 打表
@@ -1847,7 +1953,7 @@ def check_schema(data: dict, what: str) -> None:
     try:
         version = int(version)
     except (TypeError, ValueError):
-        raise SystemExit(f'{what} 的 schema_version 不是整数: {version!r}')
+        raise SystemExit(f'{what} 的 schema_version 不是整数: {version!r}') from None
     if version > SCHEMA_VERSION:
         raise SystemExit(
             f'{what} 的结构版本是 {version}，本程序只认到 {SCHEMA_VERSION}。\n'
@@ -2315,13 +2421,15 @@ def apply_options(args: argparse.Namespace) -> None:
     global TABLE_FORMAT, TABLE_SIZE, TABLE_FIXED_POINT
 
     # 棋盘规格要在最前面定下来：素材导入是否把一张图判成棋盘照，用的就是它。
-    try:
-        board = resolve_board(args.board_squares, args.board_corners,
-                              args.square_size_mm)
-    except ValueError as exc:
-        raise SystemExit(f'标定板规格不合法: {exc}')
-    configure_board(board)
-    if board != DEFAULT_BOARD:
+    # 只有用户显式给了参数才落盘——否则每次启动都会把 project.json 覆盖成默认值。
+    if (args.board_squares is not None or args.board_corners is not None
+            or args.square_size_mm is not None):
+        try:
+            board = resolve_board(args.board_squares, args.board_corners,
+                                  args.square_size_mm)
+        except ValueError as exc:
+            raise SystemExit(f'标定板规格不合法: {exc}') from None
+        configure_board(board, persist=True)
         print(f'标定板规格: {board.label}')
 
     if args.undist_alpha is not None:
@@ -2360,7 +2468,7 @@ def parse_quad(text: str) -> np.ndarray:
     try:
         vals = [float(v) for v in text.replace(';', ',').split(',') if v.strip()]
     except ValueError as exc:
-        raise SystemExit(f'--quad 含无法解析的数值: {exc}')
+        raise SystemExit(f'--quad 含无法解析的数值: {exc}') from None
     if len(vals) != 8:
         raise SystemExit(f'--quad 需要 8 个数字（4 个点的 x,y），收到 {len(vals)} 个。')
     quad = np.asarray(vals, dtype=np.float64).reshape(4, 2)
@@ -2496,7 +2604,7 @@ def import_dataset(src_dir: Path, move: bool = False,
     if dup_n: parts.append(f'重复跳过 {dup_n} 张')
     if skip_n: parts.append(f'无法读取 {skip_n} 张')
     parts.append('移动完成' if move else '复制完成')
-    print(f'\n完成: ' + '，'.join(parts) + '。')
+    print('\n完成: ' + '，'.join(parts) + '。')
     if partial_n:
         print(f'  「棋盘不全」指检不出完整 {BOARD.corners[0]}x{BOARD.corners[1]} '
               f'但能匹配到局部子网格的照片，已归到 '
@@ -2505,6 +2613,14 @@ def import_dataset(src_dir: Path, move: bool = False,
     if ipm_n > 1:
         print(f'{DIR_IPM_IN.name}/ 里有 {ipm_n} 张地面候选，'
               '需人工挑出真正用于逆透视标定的那一张，再用 --ipm-source 指定。')
+
+    # 记下这批素材是按哪块棋盘分类的：以后改了规格就能立刻判断出"素材已过期"，
+    # 而不是等用户在逆透视候选里看到混进来的棋盘照才发现。
+    update_project_config(last_import={
+        'board': BOARD.to_dict(),
+        'at': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'mode': mode,
+    })
 
     return {'mode': mode, 'imported_calib': calib_n,
             'imported_partial': partial_n, 'imported_ipm': ipm_n,
@@ -2548,7 +2664,7 @@ def print_inventory() -> None:
 
     print('\n下一步:')
     if not list_images(DIR_CALIB_IN):
-        print(f'  calib_input/ 是空的，先用 --import-dir <素材目录> 导入棋盘照片。')
+        print('  calib_input/ 是空的，先用 --import-dir <素材目录> 导入棋盘照片。')
     elif not CALIB_JSON.is_file():
         print('  运行 --stage calib 生成 calib.json。')
     elif not list_images(DIR_IPM_IN):
@@ -2684,7 +2800,7 @@ def load_ipm_state() -> Optional[dict]:
     try:
         data = json.loads(p.read_text(encoding='utf-8'))
     except json.JSONDecodeError as exc:
-        raise SystemExit(f'{p} 不是合法 JSON: {exc}')
+        raise SystemExit(f'{p} 不是合法 JSON: {exc}') from None
     if not isinstance(data, dict):
         return None
     check_schema(data, str(p))
@@ -2793,7 +2909,7 @@ def run_ipm_calibration(src: np.ndarray, img_size: Tuple[int, int],
     phys_w, phys_h = resolve_physical_size(args)
     if quad is not None:
         print('无 GUI 模式：使用命令行指定的四点')
-        for name, p in zip(('TL', 'TR', 'BL', 'BR'), quad):
+        for name, p in zip(('TL', 'TR', 'BL', 'BR'), quad, strict=True):
             print(f'  {name} = ({p[0]:.1f}, {p[1]:.1f})')
         cal = make_calibrator_from_quad(src, quad, phys_w, phys_h, scale=args.scale)
         if cal.H0 is None or cal.H is None:
@@ -2846,6 +2962,7 @@ def load_exported_reverse_pair(img_size: Tuple[int, int]) -> MapPair:
     if MATRIX_JSON.is_file():
         try:
             meta = json.loads(MATRIX_JSON.read_text(encoding='utf-8'))
+            check_schema(meta, str(MATRIX_JSON))   # 契约要覆盖所有读它的地方
             size = meta.get('table_size_wh')
             grid = (int(size[0]), int(size[1])) if size else None
             fp = meta.get('table_fixed_point')
@@ -2874,8 +2991,9 @@ def load_or_run_calibration(force: bool = False
             print('按要求忽略已有 calib.json，重新标定。')
         else:
             print('未找到 calib.json，开始从标定照片重新标定。')
-        K, D, img_size, _fit = calibrate_camera()
-        save_calibration(K, D, img_size)
+        spec = BOARD          # 显式捕获：provenance 跟着本次实际用的板走
+        K, D, img_size, _fit = calibrate_camera(board=spec)
+        save_calibration(K, D, img_size, board=spec)
     Knew = resolve_new_camera_matrix(K, D, img_size)
     assert_invertible('K', K)
     assert_invertible('Knew', Knew)

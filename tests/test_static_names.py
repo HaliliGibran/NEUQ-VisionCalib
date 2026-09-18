@@ -34,6 +34,18 @@ class ScopeChecker:
 
     @staticmethod
     def bound_names(node: ast.AST) -> set[str]:
+        """收集**当前作用域**绑定的名字。
+
+        必须在下探时停住嵌套函数/类/lamdba 的边界：它们的局部变量不属于当前
+        作用域。用 ast.walk() 一路走进去的话，
+
+            def outer():
+                print(x)        # 实际未定义
+                def inner():
+                    x = 1
+
+        会把 inner 里的 x 当成 outer 的绑定，漏报真问题。
+        """
         names: set[str] = set()
 
         def add_target(t: ast.AST) -> None:
@@ -45,29 +57,35 @@ class ScopeChecker:
             elif isinstance(t, ast.Starred):
                 add_target(t.value)
 
-        for sub in ast.walk(node):
-            if isinstance(sub, ast.Assign):
-                for t in sub.targets:
-                    add_target(t)
-            elif isinstance(sub, (ast.AnnAssign, ast.AugAssign)):
-                add_target(sub.target)
-            elif isinstance(sub, (ast.For, ast.AsyncFor)):
-                add_target(sub.target)
-            elif isinstance(sub, ast.comprehension):
-                add_target(sub.target)
-            elif isinstance(sub, ast.withitem) and sub.optional_vars is not None:
-                add_target(sub.optional_vars)
-            elif isinstance(sub, ast.ExceptHandler) and sub.name:
-                names.add(sub.name)
-            elif isinstance(sub, ast.NamedExpr):
-                add_target(sub.target)
-            elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                names.add(sub.name)
-            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
-                for a in sub.names:
-                    names.add((a.asname or a.name).split('.')[0])
-            elif isinstance(sub, (ast.Global, ast.Nonlocal)):
-                names.update(sub.names)
+        def walk(scope_node: ast.AST) -> None:
+            for sub in ast.iter_child_nodes(scope_node):
+                # 嵌套作用域：只记它的名字，不进去看它的局部变量
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                    ast.ClassDef, ast.Lambda)):
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                        ast.ClassDef)):
+                        names.add(sub.name)
+                    continue
+                if isinstance(sub, (ast.Assign, ast.NamedExpr)):
+                    # Assign 有多个 target，NamedExpr 只有一个
+                    targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                    for t in targets:
+                        add_target(t)
+                elif isinstance(sub, (ast.AnnAssign, ast.AugAssign, ast.For,
+                                      ast.AsyncFor, ast.comprehension)):
+                    add_target(sub.target)
+                elif isinstance(sub, ast.withitem) and sub.optional_vars is not None:
+                    add_target(sub.optional_vars)
+                elif isinstance(sub, ast.ExceptHandler) and sub.name:
+                    names.add(sub.name)
+                elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    for a in sub.names:
+                        names.add((a.asname or a.name).split('.')[0])
+                elif isinstance(sub, (ast.Global, ast.Nonlocal)):
+                    names.update(sub.names)
+                walk(sub)
+
+        walk(node)
         return names
 
     @staticmethod
@@ -87,22 +105,24 @@ class ScopeChecker:
         """scopes[0] 是最内层。"""
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                inner = set(scopes[-1]) if False else set()
-                inner.add(child.name)
+                # 函数名属于外层作用域（bound_names 已在外层收下它），
+                # 函数自身的局部 = 参数 + 本层绑定（不含更内层）。
                 local = self.params_of(child) | self.bound_names(child)
-                self.visit(child, [local] + scopes, globals_)
+                self.visit(child, [local, *scopes], globals_)
             elif isinstance(child, ast.ClassDef):
                 local = self.bound_names(child)
-                self.visit(child, [local] + scopes, globals_)
+                self.visit(child, [local, *scopes], globals_)
             elif isinstance(child, ast.Lambda):
                 local = self.params_of(child)
-                self.visit(child, [local] + scopes, globals_)
+                self.visit(child, [local, *scopes], globals_)
+            elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                if not self.resolvable(child.id, scopes, globals_):
+                    self.problems.append(
+                        f'{self.path.name}:{child.lineno}: 名字 {child.id!r} 未定义 '
+                        f'（既不是局部/参数，也不是模块全局或内建）')
+                self.visit(child, scopes, globals_)
             else:
-                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
-                    if not self.resolvable(child.id, scopes, globals_):
-                        self.problems.append(
-                            f'{self.path.name}:{child.lineno}: 名字 {child.id!r} 未定义 '
-                            f'（既不是局部/参数，也不是模块全局或内建）')
+                self.visit(child, scopes, globals_)
                 self.visit(child, scopes, globals_)
 
     @staticmethod
@@ -116,20 +136,82 @@ class ScopeChecker:
         return self.problems
 
 
+# 这个检查器本身也需要被验证：给几个"故意写坏"的片段，确认它真的会报。
+# 否则它可能悄悄退化成"什么都不报"，而没人发现。
+SELF_CASES: list[tuple[str, str, bool]] = [
+    ('直接引用不存在的名字', 'def f():\n    return undefined_name\n', True),
+    ('参数漏写（本项目真实事故的形态）',
+     'def f():\n    a = board.corners\n', True),
+    ('嵌套函数的局部变量不得算作外层绑定',
+     'def outer():\n    print(x)\n    def inner():\n        x = 1\n', True),
+    ('模块全局应当可见',
+     'G = 1\ndef f():\n    return G\n', False),
+    ('参数与局部正常',
+     'def f(a):\n    b = a + 1\n    return b\n', False),
+    ('for / with / except 的绑定',
+     'def f(xs):\n    for i in xs:\n        pass\n    return i\n', False),
+    ('内建函数正常', 'def f():\n    return len([1])\n', False),
+]
+
+
+# 这个检查器本身也需要被验证：给几个"故意写坏"的片段，确认它真的会报。
+# 否则它可能悄悄退化成"什么都不报"，而没人发现。
+SELF_CASES: list[tuple[str, str, bool]] = [
+    ('直接引用不存在的名字', 'def f():\n    return undefined_name\n', True),
+    ('参数漏写（本项目真实事故的形态）',
+     'def f():\n    a = board.corners\n', True),
+    ('嵌套函数的局部变量不得算作外层绑定',
+     'def outer():\n    print(x)\n    def inner():\n        x = 1\n', True),
+    ('模块全局应当可见',
+     'G = 1\ndef f():\n    return G\n', False),
+    ('参数与局部正常',
+     'def f(a):\n    b = a + 1\n    return b\n', False),
+    ('for / with / except 的绑定',
+     'def f(xs):\n    for i in xs:\n        pass\n    return i\n', False),
+    ('内建函数正常', 'def f():\n    return len([1])\n', False),
+]
+
+
+def self_check() -> int:
+    bad = 0
+    for label, src, should_report in SELF_CASES:
+        checker = ScopeChecker.__new__(ScopeChecker)
+        tree = ast.parse(src)
+        checker.path = Path('<self-check>')
+        checker.problems = []
+        checker.visit(tree, [set()], checker.bound_names(tree))
+        reported = bool(checker.problems)
+        if reported != should_report:
+            print(f'  [!!] 自检失败: {label}  期望报告={should_report} 实际={reported}')
+            bad += 1
+        else:
+            print(f'  [OK] 自检: {label}')
+    return bad
+
+
 def main() -> int:
+    print('自检（确认检查器本身没退化）:')
+    bad = self_check()
+    print()
+
     files = sorted(p for d in TARGETS if d.is_dir()
                    for p in d.rglob('*.py'))
     problems: list[str] = []
     for path in files:
         problems.extend(ScopeChecker(path).check())
 
-    if problems:
-        print(f'发现 {len(problems)} 处未定义的名字：\n')
-        for p in problems:
-            print('  ', p)
-        print('\n这类问题在运行时才炸，且往往只在某一条分支上炸——必须当错误处理。')
+    if bad or problems:
+        if problems:
+            print(f'发现 {len(problems)} 处未定义的名字：\n')
+            for p in problems:
+                print('  ', p)
+            print('\n这类问题在运行时才炸，且往往只在某一条分支上炸——必须当错误处理。')
         return 1
     print(f'检查 {len(files)} 个文件，未发现未定义的名字。')
+    print()
+    print('说明: 这是项目自带的轻量检查，覆盖"名字有没有来源"，'
+          '不等价于 ruff/pyflakes——\n      '
+          '它不做流程分析（例如 print(x) 之后才 x = 1 的 UnboundLocalError 它看不出来）。')
     return 0
 
 

@@ -25,7 +25,7 @@ import time
 import traceback
 import webbrowser
 import zipfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -43,8 +43,9 @@ if not FROZEN:
 try:
     import cv2
     import numpy as np
+
     import neuq_vision_calib as core
-except ImportError as exc:  # noqa: E402
+except ImportError as exc:
     raise SystemExit(
         f'\n启动失败: 缺少依赖 ({exc})\n'
         f'当前解释器: {sys.executable}\n\n'
@@ -53,7 +54,7 @@ except ImportError as exc:  # noqa: E402
         '     <装了依赖的 python> src\\webui\\server.py\n\n'
         '  2) 或者给当前解释器装上依赖：\n'
         f'     "{sys.executable}" -m pip install -r requirements.txt\n\n'
-        '也可以直接双击工程根目录下的 start_webui.bat，它会自动挑解释器并补依赖。\n')
+        '也可以直接双击工程根目录下的 start_webui.bat，它会自动挑解释器并补依赖。\n') from None
 
 
 def static_dir() -> Path:
@@ -120,8 +121,6 @@ def api_shutdown() -> dict:
     后者会追问一句 "Terminate batch job (Y/N)?" —— 双击 start_webui.bat 的
     用户经常被这句卡住。给浏览器留个体面的退出按钮，就不必再碰 Ctrl+C 了。
     """
-    global HTTPD
-
     def stop() -> None:
         # 必须等响应发完再关，否则前端收不到回包，看起来像崩了
         if HTTPD is not None:
@@ -291,19 +290,19 @@ def parse_multipart(headers, body: bytes):
         raise ValueError('上传需要 multipart/form-data 请求')
     boundary = None
     for seg in ctype.split(';'):
-        seg = seg.strip()
-        if seg.startswith('boundary='):
-            boundary = seg[len('boundary='):].strip('"').encode('utf-8')
+        part = seg.strip()          # 不覆盖循环变量本身，避免读起来像在改迭代状态
+        if part.startswith('boundary='):
+            boundary = part[len('boundary='):].strip('"').encode('utf-8')
     if not boundary:
         raise ValueError('请求头里缺少 boundary')
 
     fields: dict = {}
     files = []
     for chunk in body.split(b'--' + boundary):
-        chunk = chunk.strip(b'\r\n')
-        if not chunk or chunk == b'--':
+        piece = chunk.strip(b'\r\n')
+        if not piece or piece == b'--':
             continue
-        head, sep, data = chunk.partition(b'\r\n\r\n')
+        head, sep, data = piece.partition(b'\r\n\r\n')
         if not sep:
             continue
         head_s = head.decode('utf-8', 'replace')
@@ -416,9 +415,13 @@ def apply_board(body: dict) -> dict:
         spec = core.CheckerboardSpec(int(body['squares_x']),
                                      int(body['squares_y']), size_mm)
     except ValueError as exc:
-        raise ValueError(str(exc))
-    core.configure_board(spec)
-    return board_payload()
+        raise ValueError(str(exc)) from None
+    # persist=True：规格是项目级配置，必须落盘，否则重启后又回到默认，
+    # 接着导入的新照片就会按另一套规格分类。
+    core.configure_board(spec, persist=True)
+    payload = board_payload()
+    payload['material_stale'] = core.material_stale_reason()
+    return payload
 
 
 def api_board(body: dict) -> dict:
@@ -505,10 +508,8 @@ def _clear_project_folders() -> tuple:
                 n += 1
             elif p.is_dir():
                 # 目录里可能还有被保留的文件，删不掉就跳过
-                try:
+                with suppress(OSError):
                     p.rmdir()
-                except OSError:
-                    pass
         base.mkdir(parents=True, exist_ok=True)
         entries.append({'folder': folder, 'files': n})
 
@@ -662,8 +663,9 @@ def api_calibrate(body: dict) -> dict:
     buf = io.StringIO()
     with redirect_stdout(buf):
         if body.get('force') or not core.CALIB_JSON.is_file():
-            K, D, img_size, fit = core.calibrate_camera()
-            core.save_calibration(K, D, img_size)
+            spec = core.BOARD     # 显式捕获：provenance 跟着本次实际用的板走
+            K, D, img_size, fit = core.calibrate_camera(board=spec)
+            core.save_calibration(K, D, img_size, board=spec)
         else:
             print(f'复用已有标定文件 {core.CALIB_JSON.name}'
                   '（勾选"强制重新标定"可从头再算一遍）。')
@@ -775,7 +777,7 @@ def apply_table_options(body: dict) -> None:
         try:
             w, h = int(size[0]), int(size[1])
         except (TypeError, ValueError, IndexError):
-            raise ValueError('降采样尺寸格式不对，应为 [宽, 高]。')
+            raise ValueError('降采样尺寸格式不对，应为 [宽, 高]。') from None
         if w <= 0 or h <= 0:
             raise ValueError('降采样尺寸必须为正整数。')
         core.TABLE_SIZE = (w, h)
@@ -787,7 +789,7 @@ def apply_table_options(body: dict) -> None:
         try:
             fp = int(fp)
         except (TypeError, ValueError):
-            raise ValueError('定点位数必须是整数。')
+            raise ValueError('定点位数必须是整数。') from None
         if not 0 <= fp <= 15:
             raise ValueError('定点位数需在 0~15 之间。')
         core.TABLE_FIXED_POINT = fp
@@ -874,7 +876,7 @@ class Handler(BaseHTTPRequestHandler):
 
     server_version = 'NEUQCalibUI/1.0'
 
-    def log_message(self, fmt, *args):  # noqa: A003
+    def log_message(self, fmt, *args):
         """静音默认的逐请求日志，只保留真正的错误。"""
         if str(args[1] if len(args) > 1 else '').startswith(('4', '5')):
             sys.stderr.write('%s - %s\n' % (self.address_string(), fmt % args))
@@ -908,7 +910,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 路由
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         """处理 GET：静态资源与图片。"""
         parsed = urlparse(self.path)
         try:
@@ -928,26 +930,26 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == '/api/image':
                 return self.serve_image(parse_qs(parsed.query))
             self.send_json({'error': f'未知路径 {parsed.path}'}, 404)
-        except Exception as exc:  # noqa: BLE001 - 统一转成前端可读的错误
+        except Exception as exc:
             self.send_json({'error': str(exc), 'trace': traceback.format_exc()}, 500)
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         """处理 POST：所有计算型接口都走这里，加锁串行执行。"""
         parsed = urlparse(self.path)
         if parsed.path == '/api/upload_import':
             # 上传是 multipart，不是 JSON，单独走一条分支
             return self.handle_upload()
         routes = {
-            '/api/import': lambda b: api_import(b),
-            '/api/calibrate': lambda b: api_calibrate(b),
-            '/api/source': lambda b: api_source(b),
-            '/api/preview': lambda b: api_preview(b),
-            '/api/commit': lambda b: api_commit(b),
-            '/api/batch': lambda b: api_batch(),
-            '/api/backup_clear': lambda b: api_backup_clear(b),
-            '/api/clear_all': lambda b: api_clear_all(b),
-            '/api/board': lambda b: api_board(b),
-            '/api/shutdown': lambda b: api_shutdown(),
+            '/api/import': api_import,
+            '/api/calibrate': api_calibrate,
+            '/api/source': api_source,
+            '/api/preview': api_preview,
+            '/api/commit': api_commit,
+            '/api/batch': lambda b: api_batch(),          # 签名一致化：body 未使用
+            '/api/backup_clear': api_backup_clear,
+            '/api/clear_all': api_clear_all,
+            '/api/board': api_board,
+            '/api/shutdown': lambda b: api_shutdown(),    # 同上
         }
         handler = routes.get(parsed.path)
         if handler is None:
@@ -961,7 +963,7 @@ class Handler(BaseHTTPRequestHandler):
             # 参数问题（四点退化、尺寸非法、文件不存在）属于用户可修正的输入错误，
             # 用 400 而不是 500，前端才能把它和真正的服务端故障区分开。
             self.send_json({'error': str(exc)}, 400)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.send_json({'error': str(exc), 'trace': traceback.format_exc()}, 500)
 
     def handle_upload(self) -> None:
@@ -977,7 +979,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({'ok': True, **result})
         except (SystemExit, ValueError) as exc:
             self.send_json({'error': str(exc)}, 400)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.send_json({'error': str(exc), 'trace': traceback.format_exc()}, 500)
 
     # ---- 静态与图片

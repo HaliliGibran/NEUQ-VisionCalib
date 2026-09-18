@@ -131,6 +131,30 @@ python tools/scan_dataset.py <图片目录> --board-squares 12 9
 provenance 被写错且事后说不清）。确实要换板就用 `--force-calib`，
 或在网页上勾选"强制重新标定"。
 
+规格存在工程根的 **`project.json`** 里，属于项目级配置：设好一次，关掉程序再打开
+仍然是它。启动时的恢复顺序是 `project.json` → `calib.json`（迁移用）→ 仓库自带的
+12×9/20mm。改规格时若素材库非空，会提示"当前素材是按旧规格分类的，请重新分类"。
+
+---
+
+## 代码检查
+
+```bash
+# 装一次（独立 venv，不污染装 opencv 的那个解释器）
+python -m venv .venv-lint && .venv-lint/Scripts/python -m pip install -r requirements-dev.txt
+
+.venv-lint/Scripts/ruff check .        # 静态检查
+python tests/run_all.py                # 回归测试（需要 cv2）
+```
+
+两条链是分开的：ruff 不需要导入 OpenCV，所以可以装在任何解释器里；
+测试仍然跑在装了 cv2/numpy 的那个上。
+
+`pyproject.toml` 里的规则集是挑过的，只留"真的可能出错"的规则
+（F/E/W/I/SIM/B/PLW/RUF/DTZ）。刻意没开 pyupgrade 的注解现代化——那会把 130 多处
+`Optional[X]` 一次性改成 `X | None`，属于独立的一次风格重构。
+另外关掉了 RUF001-003：本项目是中文代码库，注释里的全角标点是正确的。
+
 ---
 
 ## 测试
@@ -181,7 +205,7 @@ python tools/verify_outputs.py <工程根目录>
 标定前想先摸清素材质量：
 
 ```bash
-python tools/scan_dataset.py <图片目录> [--corners 11 8]
+python tools/scan_dataset.py <图片目录> --board-squares 12 9
 ```
 
 ---

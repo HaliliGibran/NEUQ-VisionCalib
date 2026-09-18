@@ -15,7 +15,6 @@ C 是重点。老实现是"逐个目录 _swap_dir"，第二个目录换装失败
 from __future__ import annotations
 
 import hashlib
-import json
 import pathlib
 import shutil
 import sys
@@ -29,8 +28,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'src'))
 sys.path.insert(0, str(ROOT / 'tests'))
 
-import neuq_vision_calib as core  # noqa: E402
 from test_lut_roundtrip import SRC_SIZE, synth_camera, synth_ipm  # noqa: E402
+
+import neuq_vision_calib as core  # noqa: E402
 
 FAILED: list[str] = []
 
@@ -202,7 +202,7 @@ def main() -> int:
         core.TABLE_SIZE = None
         core.DIR_TEST_IN = core.SCRIPT_DIR / 'test_input'
         core.DIR_TEST_OUT = core.SCRIPT_DIR / 'test_output'
-    except Exception:  # noqa: BLE001
+    except Exception:
         print(traceback.format_exc())
         FAILED.append('未捕获异常')
     finally:

@@ -52,7 +52,6 @@ def main() -> int:
         print(f'{args.folder} 下没有图片。')
         return 1
 
-    corners = board.corners
     sizes = Counter()
     ok_list, fail_list = [], []
 

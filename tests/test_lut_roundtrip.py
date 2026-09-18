@@ -22,14 +22,12 @@
 """
 from __future__ import annotations
 
-import json
 import shutil
 import sys
 import tempfile
 import traceback
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -173,7 +171,7 @@ def main() -> int:
             try:
                 if not run_case(*args, case_dir):
                     failed.append(args)
-            except Exception:  # noqa: BLE001 - 一条组合炸掉不该中断整轮
+            except Exception:
                 print('    [!!] 抛异常:')
                 print('    ' + traceback.format_exc().replace('\n', '\n    '))
                 failed.append(args)
