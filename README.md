@@ -103,6 +103,32 @@ python src/neuq_vision_calib.py --stage tables --quad "<四点>"   # 无 GUI 跑
 
 ---
 
+## 测试
+
+```bash
+python tests/run_all.py              # 跑全部
+python tests/test_lut_roundtrip.py   # 打表链路，60 组参数组合
+python tests/test_export_transaction.py   # 导出事务与回滚
+```
+
+零依赖，不需要 pytest——只要有 cv2 和 numpy 就行。两组测试都只用**合成数据**
+（合成相机参数 + 合成单应），不需要任何真实照片。
+
+`test_lut_roundtrip` 的参数矩阵是刻意铺开的，因为本项目的缺陷几乎都藏在组合里：
+
+| 维度 | 取值 |
+|---|---|
+| 表格式 | txt / bin / c |
+| 网格 | 原尺寸 / 320×240 / 160×120 |
+| 定点位数 | Q0 / Q4 |
+| heading | 0° / −1.6° |
+| Knew | 与 K 相同 / alpha=0.5 算出的不同矩阵 |
+
+每个组合都验证：导出网格 == 落盘网格、采样坐标空间仍是源图分辨率、
+读回值与导出值逐值一致、`batch_test` 的输出网格等于最终表网格。
+
+---
+
 ## 验证产物
 
 ```bash

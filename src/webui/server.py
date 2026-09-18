@@ -610,8 +610,8 @@ def api_source(body: dict) -> dict:
     raw = core.safe_imread(path)
     if raw is None:
         raise ValueError(f'无法读取 {path}')
-    if (raw.shape[1], raw.shape[0]) != STATE['img_size']:
-        raw = cv2.resize(raw, STATE['img_size'])
+    # 与命令行共用同一套尺寸契约：宽高比不同直接报错，不静默硬缩
+    raw = core.normalize_camera_image(raw, STATE['img_size'], f'{path.name}')
     undist = cv2.undistort(raw, STATE['K'], STATE['D'], None, STATE['Knew'])
     STATE.update(src_path=path, src_raw=raw, src_undist=undist)
 
@@ -727,12 +727,16 @@ def api_commit(body: dict) -> dict:
     with redirect_stdout(buf):
         core.safe_imwrite(core.IPM_RESULT, cal.birdview)
         print('去畸变逆透视结果图已保存:', core.IPM_RESULT)
-        core.save_ipm_state(cal, p['phys_w'], p['phys_h'], img_size, STATE['src_path'])
 
         over_crop = cal.is_over_crop()
         if over_crop:
             print(f'警告: scale={cal.scale:.3f} 超过不裁切视野的上限 '
                   f'{cal.max_scale:.3f} px/cm，导出的表已裁掉部分有效视野。')
+
+        # 状态文件不单独保存，交给 export_all 随事务一起提交，
+        # 免得导出失败后留下"新状态 + 旧矩阵"。
+        ipm_state = core.build_ipm_state(cal, p['phys_w'], p['phys_h'],
+                                         img_size, STATE['src_path'])
 
         # 事务式导出，并把同一份最终表交给批量测试——写盘与验证同源
         pair = core.export_all(K, D, Knew, H, cal.H0, cal.sign, {
@@ -749,7 +753,7 @@ def api_commit(body: dict) -> dict:
             'horizon_sign': cal.sign,
             'max_range_cm': core.MAX_RANGE_CM,
             'max_lateral_cm': core.MAX_LATERAL_CM,
-        }, img_size)
+        }, img_size, ipm_state=ipm_state)
         core.batch_test(pair)
         print('\n全部完成。')
     log = buf.getvalue()

@@ -1399,13 +1399,19 @@ def write_table_bin(path: Path, table: np.ndarray) -> None:
     np.asarray(table, dtype='<i2').tofile(path)
 
 
-def dequantize_table(q: np.ndarray, fixed_point: int = TABLE_FIXED_POINT) -> np.ndarray:
+def dequantize_table(q: np.ndarray,
+                     fixed_point: Optional[int] = None) -> np.ndarray:
     """定点表 -> 像素坐标，无效哨兵还原成 -1。
 
     这正是 C 端的算法（表值 / 2^shift），所以它就是"交付内容的浮点视图"：
     拿它去跑批量测试，等于拿 C 端真正会用的坐标去跑。
+
+    注意 fixed_point 默认值必须写成 None 再在函数内取 TABLE_FIXED_POINT：
+    写成 `fixed_point=TABLE_FIXED_POINT` 会在**函数定义时**就把当时的值绑死，
+    之后运行时改全局（--table-fixed-point、Web 上的格式选择）都不会生效。
     """
-    arr = np.asarray(q, dtype=np.float64) / float(1 << fixed_point)
+    fp = TABLE_FIXED_POINT if fixed_point is None else int(fixed_point)
+    arr = np.asarray(q, dtype=np.float64) / float(1 << fp)
     arr[np.asarray(q) == BIN_SENTINEL] = -1.0
     return arr
 
@@ -1419,15 +1425,22 @@ def format_int16_array(values: np.ndarray, per_line: int = 12) -> str:
 
 
 def write_table_c(out_dir: Path, tag: str, desc: str,
-                  qx: np.ndarray, qy: np.ndarray) -> None:
+                  qx: np.ndarray, qy: np.ndarray,
+                  source_size: Tuple[int, int]) -> None:
     """写一个自包含的 C 头文件，含两张 int16 定点表。
 
     直接把维度、定点位数、无效哨兵和用法都写进注释与宏，C 端拿到就能用，
     不必再回头翻本工程的文档去猜表的排布和单位。
+
+    **网格尺寸与源图分辨率必须分开写**：表被 --table-size 降采样后，网格是
+    160x120，而表里的采样坐标仍然活在 1280x720 的原图上。只写一个模糊的
+    W/H，读回来的人（包括本工程自己的 load_map_pair）就会把网格当成原图尺寸，
+    拿缩到 160x120 的图去采 800 多的坐标。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     qx, qy = np.asarray(qx, dtype=np.int16), np.asarray(qy, dtype=np.int16)
     th, tw = qx.shape
+    sw, sh = source_size
     safe = ''.join(c if c.isalnum() else '_' for c in tag).upper()
     guard = f'NEUQ_MAP_{safe}_H'
     unit = 1 << TABLE_FIXED_POINT
@@ -1436,19 +1449,23 @@ def write_table_c(out_dir: Path, tag: str, desc: str,
  *
  * 映射: {desc}
  * 网格: {tw} x {th}（宽 x 高），按行优先，索引 = y * {tw} + x
+ * 源图: {sw} x {sh} —— 表里的采样坐标是这张图上的像素坐标
  * 定点: Q{TABLE_FIXED_POINT}，实际像素坐标 = 表值 / {unit}.0f
  * 无效: {BIN_SENTINEL}，表示该输出点映射到无穷远、地平线另一侧或超出图像范围
  *
- * 用法: int16_t w = {safe}_mapW[y * {safe}_W + x];
+ * 用法: int16_t w = {safe}_mapW[y * {safe}_GRID_W + x];
  *       if (w == {safe}_INVALID) 填黑，否则采样坐标 = w / {unit}.0f
+ *       （采样的是 {safe}_SRC_W x {safe}_SRC_H 的原图，不是网格尺寸）
  */
 #ifndef {guard}
 #define {guard}
 
 #include <stdint.h>
 
-#define {safe}_W       {tw}
-#define {safe}_H       {th}
+#define {safe}_GRID_W  {tw}
+#define {safe}_GRID_H  {th}
+#define {safe}_SRC_W   {sw}
+#define {safe}_SRC_H   {sh}
 #define {safe}_SHIFT   {TABLE_FIXED_POINT}
 #define {safe}_INVALID ({BIN_SENTINEL})
 
@@ -1546,7 +1563,7 @@ def serialize_map_pair(pair: MapPair, out_dir: Path, tag: str, desc: str) -> Non
     clear_stale_tables(out_dir)
 
     if TABLE_FORMAT == 'c':
-        write_table_c(out_dir, tag, desc, pair.qx, pair.qy)
+        write_table_c(out_dir, tag, desc, pair.qx, pair.qy, pair.source_size)
     elif TABLE_FORMAT == 'bin':
         write_table_bin(out_dir / 'MapW.bin', pair.qx)
         write_table_bin(out_dir / 'MapH.bin', pair.qy)
@@ -1555,9 +1572,13 @@ def serialize_map_pair(pair: MapPair, out_dir: Path, tag: str, desc: str) -> Non
         write_table_txt(out_dir / 'MapH.txt', pair.y)
 
 
-def load_table(path: Path, fixed_point: int = TABLE_FIXED_POINT,
+def load_table(path: Path, fixed_point: Optional[int] = None,
                grid: Optional[Tuple[int, int]] = None) -> np.ndarray:
-    """读回一张已落盘的表，返回 (H, W) 的 float64，无效点统一成 -1。"""
+    """读回一张已落盘的表，返回 (H, W) 的 float64，无效点统一成 -1。
+
+    fixed_point 同样走 None 占位，避免默认值在定义时被绑死。
+    """
+    fp = TABLE_FIXED_POINT if fixed_point is None else int(fixed_point)
     if path.suffix == '.bin':
         if grid is None:
             raise SystemExit(f'读取 {path.name} 需要先确定网格尺寸。')
@@ -1565,23 +1586,35 @@ def load_table(path: Path, fixed_point: int = TABLE_FIXED_POINT,
         raw = np.fromfile(path, dtype='<i2').astype(np.int64)
         if raw.size != w * h:
             raise SystemExit(f'{path} 有 {raw.size} 个值，与网格 {w}x{h} 不符。')
-        return dequantize_table(raw, fixed_point).reshape(h, w)
+        return dequantize_table(raw, fp).reshape(h, w)
 
     arr = np.loadtxt(path, delimiter=',', dtype=np.float64)
     return np.atleast_2d(arr)
 
 
-def _load_c_header(path: Path) -> MapPair:
-    """从生成的 C 头文件里把两张定点表与网格抠出来。"""
+def _load_c_header(path: Path, source_size: Tuple[int, int]) -> MapPair:
+    """从生成的 C 头文件里把两张定点表与网格抠出来。
+
+    网格尺寸（GRID_W/GRID_H）与源图分辨率（SRC_W/SRC_H）是两回事：降采样后
+    网格是 160x120，采样坐标却仍在 1280x720 的原图上。老版本的头文件只有
+    模糊的 W/H，读回来时只能拿调用方知道的 source_size 兜底。
+    """
     text = path.read_text(encoding='utf-8')
 
-    def macro(name: str) -> int:
+    def macro(name: str) -> Optional[int]:
         m = re.search(rf'#define\s+\w+_{name}\s+\(?(-?\d+)\)?', text)
-        if not m:
-            raise SystemExit(f'{path} 里找不到 {name} 宏。')
-        return int(m.group(1))
+        return int(m.group(1)) if m else None
 
-    shift, w, h = macro('SHIFT'), macro('W'), macro('H')
+    shift = macro('SHIFT')
+    if shift is None:
+        raise SystemExit(f'{path} 里找不到 SHIFT 宏。')
+    w = macro('GRID_W') or macro('W')
+    h = macro('GRID_H') or macro('H')
+    if w is None or h is None:
+        raise SystemExit(f'{path} 里找不到网格尺寸宏（GRID_W/GRID_H）。')
+    src = (macro('SRC_W'), macro('SRC_H'))
+    real_src = (src[0], src[1]) if src[0] and src[1] else source_size
+
     qs = []
     for suffix in ('mapW', 'mapH'):
         m = re.search(rf'_{suffix}\[[^\]]*\]\s*=\s*\{{(.*?)\}};', text, re.S)
@@ -1592,7 +1625,7 @@ def _load_c_header(path: Path) -> MapPair:
             raise SystemExit(f'{path} 的 {suffix} 数组长度 {len(vals)} 与 {w}x{h} 不符。')
         qs.append(np.asarray(vals, dtype=np.int16).reshape(h, w))
     return MapPair(x=dequantize_table(qs[0], shift), y=dequantize_table(qs[1], shift),
-                   source_size=(w, h), fixed_point=shift, qx=qs[0], qy=qs[1])
+                   source_size=real_src, fixed_point=shift, qx=qs[0], qy=qs[1])
 
 
 def load_map_pair(folder: Path, source_size: Tuple[int, int],
@@ -1611,12 +1644,14 @@ def load_map_pair(folder: Path, source_size: Tuple[int, int],
             if suffix == '.txt':
                 x, y = load_table(wx, fp, grid), load_table(wy, fp, grid)
                 return MapPair(x=x, y=y, source_size=source_size)
-            x = load_table(wx, fp, grid)
-            y = load_table(wy, fp, grid)
+            # bin 是裸数组，文件里没有维度。没指定 --table-size 时，输出网格
+            # 就是源图尺寸——这正是默认配置，不能因为"查不到网格"就报错。
+            g = tuple(grid) if grid else tuple(source_size)
+            x, y = load_table(wx, fp, g), load_table(wy, fp, g)
             return MapPair(x=x, y=y, source_size=source_size, fixed_point=fp)
     header = folder / 'Map.h'
     if header.is_file():
-        return _load_c_header(header)
+        return _load_c_header(header, source_size)
     raise SystemExit(f'{folder} 下没有可识别的查找表'
                      '（MapW.txt / MapW.bin / Map.h 都没有）。')
 
@@ -1757,26 +1792,38 @@ def export_composite_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
 
 def export_all(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                H: np.ndarray, H0: np.ndarray, sign: float, extra: dict,
-               size: Tuple[int, int]) -> MapPair:
-    """事务式导出：六矩阵 + 两套表，全部成功才落到正式目录。
+               size: Tuple[int, int],
+               ipm_state: Optional[dict] = None) -> MapPair:
+    """事务式导出：六矩阵 + 逆透视状态 + 两套表，全部成功才落到正式目录。
 
     原先的顺序是"先写 matrix/，再写两套表"。中间任何一步失败（打表溢出、
     磁盘满、被 Ctrl+C）都会留下"新矩阵配旧表"的组合，而两边的文件单看都正常，
-    几乎无法察觉。这里改成先全部写进 *.staging/，成功后再整体替换：
-    失败时正式目录保持原样，不会出现半套产物。
+    几乎无法察觉。这里改成：
+
+      1) 全部写进 *.staging/（暂存区先用正式目录内容播种——否则整体替换会
+         删掉本轮不生成的文件，比如用户自己放进去的参考资料）
+      2) 两个正式目录一起挪到 *.old
+      3) 两个暂存目录一起就位
+      4) 全部成功才删掉 *.old
+
+    第 2、3 步刻意跨目录成对执行：matrix 与 lookup_table 必须作为一套一起换，
+    不能一个换成了新的、另一个还留着旧的。
+
+    `ipm_state` 若给出，会写进 matrix 的暂存区，随事务一起提交；这样就不必
+    事先单独保存状态文件，也就不会出现"新状态 + 旧矩阵"的中间态。
     """
     table_stage = DIR_TABLE.with_name(DIR_TABLE.name + '.staging')
     matrix_stage = DIR_MATRIX.with_name(DIR_MATRIX.name + '.staging')
     for stage, target in ((table_stage, DIR_TABLE), (matrix_stage, DIR_MATRIX)):
         shutil.rmtree(stage, ignore_errors=True)
-        # 先把正式目录里已有的文件带进暂存区。本轮导出不负责生成的东西——
-        # ipm_state.json、用户自己放进去的参考资料——必须原样保留，
-        # 否则"整体替换"会连它们一起删掉（这一步曾经真的丢过 ipm_state.json）。
         if target.is_dir():
             shutil.copytree(target, stage, dirs_exist_ok=True)
 
     try:
         export_matrices(K, D, Knew, H, extra, matrix_root=matrix_stage)
+        if ipm_state is not None:
+            (matrix_stage / 'ipm_state.json').write_text(
+                json.dumps(ipm_state, indent=2, ensure_ascii=False), encoding='utf-8')
         export_undistort_tables(K, D, Knew, size, table_root=table_stage)
         pair = export_composite_tables(K, D, Knew, H, H0, sign, size,
                                        table_root=table_stage)
@@ -1786,28 +1833,79 @@ def export_all(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
         shutil.rmtree(matrix_stage, ignore_errors=True)
         raise
 
-    for stage, target in ((table_stage, DIR_TABLE), (matrix_stage, DIR_MATRIX)):
-        _swap_dir(stage, target)
+    _commit_dirs(((table_stage, DIR_TABLE), (matrix_stage, DIR_MATRIX)))
     print(f'导出完成: {DIR_MATRIX} 与 {DIR_TABLE}')
     return pair
 
 
-def _swap_dir(stage: Path, target: Path) -> None:
-    """把暂存目录换成正式目录，中途失败则回滚。"""
-    backup = target.with_name(target.name + '.old')
-    shutil.rmtree(backup, ignore_errors=True)
-    if target.exists():
-        target.rename(backup)
+def _commit_dirs(pairs: Sequence[Tuple[Path, Path]]) -> None:
+    """把一批暂存目录整体换成正式目录；任何一步失败则全部回滚。
+
+    先统一"挪走旧的"，再统一"放上新的"。这样一旦中途出错，两个目录都还躺在
+    .old 里，可以一起复原——不会留下"一个已是新版、另一个还是旧版"的中间态。
+    """
+    moved: List[Tuple[Path, Path, Path]] = []      # (target, backup, stage)
     try:
-        stage.rename(target)
-    except OSError:
-        if backup.exists() and not target.exists():
-            backup.rename(target)     # 换装失败，把旧的原样放回去
+        for stage, target in pairs:
+            backup = target.with_name(target.name + '.old')
+            shutil.rmtree(backup, ignore_errors=True)
+            if target.exists():
+                target.rename(backup)
+            moved.append((target, backup, stage))
+        for target, _backup, stage in moved:
+            stage.rename(target)
+    except BaseException:
+        # 先撤掉可能已经就位的新目录，再把 .old 全部放回去
+        for target, backup, _stage in moved:
+            shutil.rmtree(target, ignore_errors=True)
+            if backup.exists():
+                backup.rename(target)
+        # 暂存区里是这一轮没能提交的新内容：留着只会让人误以为导出成功了
+        for stage, _target in pairs:
+            shutil.rmtree(stage, ignore_errors=True)
+        print('换装失败，已回滚到导出前的状态（matrix 与 lookup_table 一并复原）。')
         raise
-    shutil.rmtree(backup, ignore_errors=True)
+    for _target, backup, _stage in moved:
+        shutil.rmtree(backup, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- 7. 批量测试
+
+def same_aspect(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
+    """两个分辨率是否同宽高比（1% 容差，容忍编码器把奇数边裁掉一个像素）。"""
+    return abs(a[0] / a[1] - b[0] / b[1]) <= 0.01 * (b[0] / b[1])
+
+
+def normalize_camera_image(img: np.ndarray, want_size: Tuple[int, int],
+                           what: str = '图像', strict: bool = True
+                           ) -> Optional[np.ndarray]:
+    """把一张相机原图统一到标定分辨率，统一入口。
+
+    规则刻意收紧到只有"同宽高比"才允许缩放：
+      - 尺寸相同          → 原样返回
+      - 尺寸不同但同比例  → 缩放（几何等价，但前提是拍摄时的 FOV 与裁剪模式没变，
+                            所以会打印一条明确的警告）
+      - 宽高比不同        → 拒绝。硬缩会把透视几何揉变形，而结果看上去"正常"，
+                            是这一类里最难查的错。
+
+    strict=True 时拒绝会抛 SystemExit（CLI 与 Web 都把它当作用户输入错误）；
+    strict=False 时返回 None，交给调用方按"跳过这一张"处理（批量测试用）。
+    """
+    w, h = img.shape[1], img.shape[0]
+    if (w, h) == want_size:
+        return img
+    if not same_aspect((w, h), want_size):
+        msg = (f'{what}的分辨率 {w}x{h} 与标定时的 {want_size[0]}x{want_size[1]} '
+               '宽高比不同，直接缩放会让透视几何失真。'
+               '请换同比例的图片，或按正确分辨率重新标定。')
+        if strict:
+            raise SystemExit(msg)
+        print(f'跳过：{msg}')
+        return None
+    print(f'提示: {what}是 {w}x{h}，与标定分辨率 {want_size[0]}x{want_size[1]} 同比例，'
+          f'已缩放后使用（前提是拍摄时的视场与裁剪模式没有变化）。')
+    return cv2.resize(img, want_size, interpolation=cv2.INTER_AREA)
+
 
 def batch_test(pair: MapPair) -> None:
     """用一份"最终交付"的映射表批量处理 test_input/ 的图片，结果写入 test_output/。
@@ -1824,7 +1922,6 @@ def batch_test(pair: MapPair) -> None:
     mx32 = pair.x.astype(np.float32)
     my32 = pair.y.astype(np.float32)
     invalid = pair.invalid
-    sw, sh = pair.source_size
     ow, oh = pair.size
 
     for path in files:
@@ -1832,24 +1929,14 @@ def batch_test(pair: MapPair) -> None:
         if img is None:
             print(f'跳过无法读取的文件: {path.name}')
             continue
-        if (img.shape[1], img.shape[0]) != pair.source_size:
-            if not _same_aspect((img.shape[1], img.shape[0]), pair.source_size):
-                print(f'跳过 {path.name}: 分辨率 {img.shape[1]}x{img.shape[0]} 与标定时的 '
-                      f'{sw}x{sh} 宽高比不同，直接缩放会让几何失真，'
-                      '请换同比例的图片或重做标定。')
-                continue
-            print(f'提示: {path.name} 是 {img.shape[1]}x{img.shape[0]}，'
-                  f'按同比例缩放到标定分辨率 {sw}x{sh} 后再打表（几何等价）。')
-            img = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
+        img = normalize_camera_image(img, pair.source_size, f'{path.name}',
+                                     strict=False)
+        if img is None:
+            continue
         out = cv2.remap(img, mx32, my32, cv2.INTER_LINEAR, borderValue=(0, 0, 0))
         out[invalid] = 0
         safe_imwrite(DIR_TEST_OUT / f'{path.stem}_birdview.jpg', out)
     print(f'批量测试完成（网格 {ow}x{oh}，来源是导出后的表）: {DIR_TEST_OUT}')
-
-
-def _same_aspect(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
-    """两个分辨率是否同宽高比（1% 容差，容忍编码器把奇数边裁掉一个像素）。"""
-    return abs(a[0] / a[1] - b[0] / b[1]) <= 0.01 * (b[0] / b[1])
 
 
 # ---------------------------------------------------------------- 8. 命令行与素材管理
@@ -2172,15 +2259,13 @@ def ipm_state_path() -> Path:
     return DIR_MATRIX / 'ipm_state.json'
 
 
-def save_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
-                   img_size: Tuple[int, int], src_path: Optional[Path] = None) -> None:
-    """把逆透视标定的结果落盘。
+def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
+                    img_size: Tuple[int, int],
+                    src_path: Optional[Path] = None) -> dict:
+    """组装逆透视标定状态。
 
-    交互标定是全流程里唯一需要人工介入的一步，如果只存在于内存里，
-    后面想单独重跑打表或批量测试就得把四条线再拖一遍。
-
-    同时记录用的是哪张原图：ipm_input/ 里通常躺着多张候选，不记下来的话，
-    后续校验工具只能靠猜，猜错就会拿另一张图去对表，得出满屏假差异。
+    与"落盘"分开是为了让它能并进导出事务：矩阵、查找表、状态三者要么一起
+    换成新的，要么一起保持旧的。否则导出中途失败会留下"新状态配旧矩阵"。
     """
     payload = {
         'H': cal.H.tolist(),
@@ -2199,6 +2284,23 @@ def save_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
     }
     if src_path is not None:
         payload['src_image'] = str(Path(src_path).resolve())
+    return payload
+
+
+def save_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
+                   img_size: Tuple[int, int], src_path: Optional[Path] = None) -> None:
+    """把逆透视标定的结果落盘。
+
+    交互标定是全流程里唯一需要人工介入的一步，如果只存在于内存里，
+    后面想单独重跑打表或批量测试就得把四条线再拖一遍。
+
+    同时记录用的是哪张原图：ipm_input/ 里通常躺着多张候选，不记下来的话，
+    后续校验工具只能靠猜，猜错就会拿另一张图去对表，得出满屏假差异。
+
+    只有"到此为止、不导出"的 --stage ipm 才走这里；要导出的话应该把
+    build_ipm_state() 的结果交给 export_all()，随事务一起提交。
+    """
+    payload = build_ipm_state(cal, phys_w, phys_h, img_size, src_path)
     p = ipm_state_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
@@ -2361,17 +2463,24 @@ def load_exported_reverse_pair(img_size: Tuple[int, int]) -> MapPair:
 
     批量测试优先走这条路：验证的是真正落盘、将来要烧进车里的那份表，
     而不是重算出来的数学结果。
+
+    网格尺寸与定点位数都必须从 matrices.json 恢复。bin 是裸二进制，文件里
+    既没有维度也没有 Q 位数：导出时用了 Q2、重启后按程序默认的 Q4 去读，
+    同一串字节会解出 4 倍大的坐标，而且看起来"读成功了"。
     """
     folder = DIR_TABLE / 'undistort_ipm' / 'reverse'
-    grid = None
+    grid: Optional[Tuple[int, int]] = None
+    fixed_point: Optional[int] = None
     if MATRIX_JSON.is_file():
         try:
             meta = json.loads(MATRIX_JSON.read_text(encoding='utf-8'))
             size = meta.get('table_size_wh')
             grid = (int(size[0]), int(size[1])) if size else None
+            fp = meta.get('table_fixed_point')
+            fixed_point = None if fp is None else int(fp)
         except (json.JSONDecodeError, TypeError, ValueError):
-            grid = None
-    return load_map_pair(folder, img_size, grid)
+            grid = fixed_point = None
+    return load_map_pair(folder, img_size, grid, fixed_point)
 
 
 def load_or_run_calibration() -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]:
@@ -2471,10 +2580,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if src is None:
         raise SystemExit(f'无法读取逆透视标定原图: {src_path}')
     print('逆透视标定原图:', src_path)
-    if (src.shape[1], src.shape[0]) != img_size:
-        print(f'  分辨率 {src.shape[1]}x{src.shape[0]} 与标定分辨率 '
-              f'{img_size[0]}x{img_size[1]} 不一致，已缩放。')
-        src = cv2.resize(src, img_size)
+    src = normalize_camera_image(src, img_size, '逆透视标定原图')
 
     undist = cv2.undistort(src, K, D, None, Knew)
     safe_imwrite(UNDIST_RESULT, undist)
@@ -2489,7 +2595,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     safe_imwrite(IPM_RESULT, calibrator.birdview)
     print('去畸变逆透视结果图已保存:', IPM_RESULT)
-    save_ipm_state(calibrator, phys_w, phys_h, img_size, src_path)
+
+    # 状态文件不在这里写：它要和矩阵、查找表一起由 export_all 提交，
+    # 否则导出失败会留下"新状态配旧矩阵"。只有 --stage ipm 这种不导出的
+    # 情况才需要单独落盘。
+    ipm_state = build_ipm_state(calibrator, phys_w, phys_h, img_size, src_path)
 
     over_crop = calibrator.is_over_crop()
     if over_crop:
@@ -2498,6 +2608,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
               '如需保留完整视野，重跑并按 f 吸附到 max_scale。')
 
     if stage == 'ipm':
+        save_ipm_state(calibrator, phys_w, phys_h, img_size, src_path)
         print('\n逆透视标定阶段完成。运行 --stage tables 可继续导出矩阵与查找表。')
         return
 
@@ -2515,7 +2626,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         'horizon_sign': calibrator.sign,
         'max_range_cm': MAX_RANGE_CM,
         'max_lateral_cm': MAX_LATERAL_CM,
-    }, img_size)
+    }, img_size, ipm_state=ipm_state)
     batch_test(pair)
 
     print('\n全部完成。')

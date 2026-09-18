@@ -44,7 +44,17 @@ FIXED_POINT = core.TABLE_FIXED_POINT
 # bin 是裸数组，文件里没有维度信息，必须靠 matrices.json 与标定分辨率还原
 TABLE_SHAPE: tuple[int, int] | None = None   # (W, H)
 IMAGE_SIZE: tuple[int, int] = (0, 0)         # 源图尺寸，来自 calib.json
+KNEW: np.ndarray | None = None               # 去畸变输出矩阵，来自 matrices.json
 SKIPPED = 0                                  # 因降采样而跳过的检查条数
+
+
+def undistort_reference(src: np.ndarray, K: np.ndarray, D: np.ndarray) -> np.ndarray:
+    """按导出时用的同一个 Knew 做去畸变，作为比对参考。
+
+    表的坐标是 build_composite_reverse_map 用 Knew 反投影出来的；若这里用 K
+    去构造参考，只在 UNDIST_ALPHA 为 None（Knew == K）时才对得上。
+    """
+    return cv2.undistort(src, K, D, None, K if KNEW is None else KNEW)
 
 
 
@@ -201,7 +211,7 @@ def load_reference_image(root: Path, size: tuple[int, int]) -> np.ndarray:
     if not candidates:
         raise SystemExit(f'{root / "ipm_input"} 下没有可用于比对的图片。')
 
-    src = cv2.imread(str(candidates[0]))
+    src = core.safe_imread(candidates[0])
     if src is None:
         raise SystemExit(f'无法读取 {candidates[0]}')
     print(f'  比对源图: {candidates[0].name}')
@@ -297,7 +307,7 @@ def check_undistort_tables(root: Path, calib: dict) -> bool:
     mx = np.where(invalid, -1e6, map_x).astype(np.float32)
     my = np.where(invalid, -1e6, map_y).astype(np.float32)
     via_table = cv2.remap(src, mx, my, cv2.INTER_LINEAR, borderValue=(0, 0, 0))
-    reference = cv2.undistort(src, K, D, None, K)
+    reference = undistort_reference(src, K, D)
 
     visible, p999, mx_diff = compare_images(via_table, reference, invalid)
     return report('undistort/reverse 表 == cv2.undistort', visible <= VISIBLE_FRAC,
@@ -324,7 +334,7 @@ def check_composite_tables(root: Path, calib: dict, matrices: dict) -> bool:
     my = np.where(invalid, -1e6, map_y).astype(np.float32)
     via_table = cv2.remap(src, mx, my, cv2.INTER_LINEAR, borderValue=(0, 0, 0))
 
-    undist = cv2.undistort(src, K, D, None, K)
+    undist = undistort_reference(src, K, D)
     reference = cv2.warpPerspective(undist, H, size, flags=cv2.INTER_LINEAR)
 
     visible, p999, mx_diff = compare_images(via_table, reference, invalid)
@@ -336,7 +346,7 @@ def check_composite_tables(root: Path, calib: dict, matrices: dict) -> bool:
     # 而 warpPerspective 会照常填上标定矩形以外的画面，不屏蔽就会得出误导性的差异率。
     result_path = root / 'ipm_output' / 'UnDistortionInverseImage.jpg'
     if result_path.is_file():
-        produced = cv2.imread(str(result_path))
+        produced = core.safe_imread(result_path)
         if produced is not None and produced.shape[:2] == via_table.shape[:2]:
             vis2, _p, m2 = compare_images(produced, via_table, invalid)
             print(f'         结果图 vs 表重建（限有效区）: 可见差异 {100 * vis2:.4f}%，'
@@ -437,18 +447,24 @@ def main() -> int:
     matrices = json.loads(matrix_path.read_text(encoding='utf-8'))
 
     fmt = matrices.get('table_format', 'txt')
-    if fmt != 'txt':
-        FIXED_POINT = int(matrices.get('table_fixed_point') or 4)
+    # Q0 是合法配置，不能用 `or 4` 兜底——0 在这里会被当成假值，静默变成 Q4
+    _fp = matrices.get('table_fixed_point')
+    FIXED_POINT = 4 if _fp is None else int(_fp)
 
     # 表被重采样过就用重采样后的网格，否则与标定分辨率同尺寸
     IMAGE_SIZE = (int(calib['image_width']), int(calib['image_height']))
     size = matrices.get('table_size_wh')
     TABLE_SHAPE = (int(size[0]), int(size[1])) if size else IMAGE_SIZE
+    # 去畸变输出用的相机矩阵。UNDIST_ALPHA 非 None 时 Knew != K，
+    # 拿 K 当参考就会用错的去畸变模型去比表，得出满屏假差异。
+    KNEW = (np.asarray(matrices['Knew'], dtype=np.float64).reshape(3, 3)
+            if matrices.get('Knew') is not None else None)
     SKIPPED = 0
 
     print(f'校验 {root}')
     print(f'表格式 {fmt}' + (f'（Q{FIXED_POINT} 定点）' if fmt != 'txt' else '')
-          + f'，源图 {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]}，表网格 {TABLE_SHAPE[0]}x{TABLE_SHAPE[1]}\n')
+          + f'，源图 {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]}，表网格 {TABLE_SHAPE[0]}x{TABLE_SHAPE[1]}')
+    print(f'去畸变输出矩阵 Knew: {"来自 matrices.json" if KNEW is not None else "缺省，回退用 K"}')
 
     print('查找表清单:')
     print_table_inventory(root)
