@@ -235,10 +235,18 @@ def api_status() -> dict:
         except (KeyError, ValueError, json.JSONDecodeError):
             calib = None
 
-    # 三种格式的落盘文件名不同，任一存在就算这组表齐了
+    # 三种格式成对校验：txt/bin 必须 W 和 H 同时在，C 格式要有 Map.h。
+    # 只看"文件名出现过"会把只写了半张表（MapW.txt 有、MapH.txt 没写成功）
+    # 的目录误判成已完成。
+    def pair_ready(folder) -> bool:
+        if (folder / 'MapW.txt').is_file() and (folder / 'MapH.txt').is_file():
+            return True
+        if (folder / 'MapW.bin').is_file() and (folder / 'MapH.bin').is_file():
+            return True
+        return (folder / 'Map.h').is_file()
+
     tables_ready = all(
-        any((core.DIR_TABLE / name / direction / f).is_file()
-            for f in ('MapW.txt', 'MapH.txt', 'MapW.bin', 'MapH.bin', 'Map.h'))
+        pair_ready(core.DIR_TABLE / name / direction)
         for name in ('undistort', 'undistort_ipm')
         for direction in ('forward', 'reverse'))
 
@@ -462,7 +470,7 @@ def api_backup_clear(body: dict) -> dict:
     name = raw_name or stamp
 
     target = (DIR_BACKUP / name).resolve()
-    if not str(target).startswith(str(DIR_BACKUP.resolve())):
+    if not target.is_relative_to(DIR_BACKUP.resolve()):
         raise ValueError('备份路径越界。')
     if target.exists():
         raise ValueError(f'备份 {name} 已存在，换个名字或留空用时间戳。')
@@ -599,7 +607,7 @@ def api_source(body: dict) -> dict:
     if path is None or not path.is_file():
         raise ValueError('没有可用的逆透视标定原图，请先在 ipm_input/ 放入照片。')
 
-    raw = cv2.imread(str(path))
+    raw = core.safe_imread(path)
     if raw is None:
         raise ValueError(f'无法读取 {path}')
     if (raw.shape[1], raw.shape[0]) != STATE['img_size']:
@@ -726,7 +734,8 @@ def api_commit(body: dict) -> dict:
             print(f'警告: scale={cal.scale:.3f} 超过不裁切视野的上限 '
                   f'{cal.max_scale:.3f} px/cm，导出的表已裁掉部分有效视野。')
 
-        core.export_matrices(K, D, Knew, H, {
+        # 事务式导出，并把同一份最终表交给批量测试——写盘与验证同源
+        pair = core.export_all(K, D, Knew, H, cal.H0, cal.sign, {
             'H0': cal.H0.tolist(),
             'phys_w_cm': p['phys_w'],
             'phys_h_cm': p['phys_h'],
@@ -740,11 +749,8 @@ def api_commit(body: dict) -> dict:
             'horizon_sign': cal.sign,
             'max_range_cm': core.MAX_RANGE_CM,
             'max_lateral_cm': core.MAX_LATERAL_CM,
-        })
-        core.export_undistort_tables(K, D, Knew, img_size)
-        map_x, map_y = core.export_composite_tables(K, D, Knew, H, cal.H0,
-                                                    cal.sign, img_size)
-        core.batch_test(map_x, map_y, img_size)
+        }, img_size)
+        core.batch_test(pair)
         print('\n全部完成。')
     log = buf.getvalue()
 
@@ -757,12 +763,21 @@ def api_commit(body: dict) -> dict:
 
 
 def api_batch() -> dict:
-    """只重跑批量测试，复用已落盘的逆透视状态。"""
+    """只重跑批量测试。
+
+    优先消费已经导出的那套表——这才是"交付给 C 端的表能不能用"的直接验证；
+    表不在时才退回按 ipm_state.json 重算。
+    """
     ensure_calibration()
-    map_x, map_y = core.rebuild_reverse_map_from_state(
-        STATE['K'], STATE['D'], STATE['Knew'], STATE['img_size'])
-    _r, log = capture(core.batch_test, map_x, map_y, STATE['img_size'])
-    return {'log': log}
+    try:
+        pair = core.load_exported_reverse_pair(STATE['img_size'])
+        prefix = '使用已导出的查找表。\n'
+    except SystemExit as exc:
+        pair = core.rebuild_reverse_map_from_state(
+            STATE['K'], STATE['D'], STATE['Knew'], STATE['img_size'])
+        prefix = f'未找到已导出的表（{exc}），改为按 ipm_state.json 重算。\n'
+    _r, log = capture(core.batch_test, pair)
+    return {'log': prefix + log}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -882,7 +897,7 @@ class Handler(BaseHTTPRequestHandler):
     def serve_static(self, rel: str) -> None:
         """提供 webui/static 下的文件。"""
         path = (STATIC_DIR / rel).resolve()
-        if not str(path).startswith(str(STATIC_DIR)) or not path.is_file():
+        if not path.is_relative_to(STATIC_DIR) or not path.is_file():
             return self.send_json({'error': '静态资源不存在'}, 404)
         ctypes = {'.html': 'text/html; charset=utf-8', '.js': 'application/javascript; charset=utf-8',
                   '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml'}
@@ -892,9 +907,9 @@ class Handler(BaseHTTPRequestHandler):
         """按相对路径返回工程内的图片，可限制最大边以省带宽。"""
         rel = (query.get('rel') or [''])[0]
         path = (core.SCRIPT_DIR / rel).resolve()
-        if not str(path).startswith(str(core.SCRIPT_DIR)) or not path.is_file():
+        if not path.is_relative_to(core.SCRIPT_DIR) or not path.is_file():
             return self.send_json({'error': '图片不存在'}, 404)
-        img = cv2.imread(str(path))
+        img = core.safe_imread(path)
         if img is None:
             return self.send_json({'error': '无法读取图片'}, 404)
         max_edge = int((query.get('max') or ['0'])[0] or 0)

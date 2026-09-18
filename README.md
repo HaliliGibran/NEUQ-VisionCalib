@@ -1,7 +1,11 @@
 # NEUQ 相机标定程序（NEUQ-VisionCalib）
 
 智能车视觉标定一体化工具：相机内参标定 → 畸变矫正 → 逆透视（BirdView）标定 →
-六矩阵与查找表导出 → 批量验证，全部流程可在本地 Web 控制台中完成。
+导出 **6 个线性矩阵 + 畸变系数 + 两套去畸变/复合查找表（LUT）** → 批量验证，
+全部流程可在本地 Web 控制台中完成。
+
+> 说明：去畸变是非线性变换，无法写成矩阵。交付给 C 端的是「6 个矩阵 + 畸变系数
+> （`dist_coeffs`）」，原图到 BirdView 的复合变换则以查找表形式给出。
 
 核心几何逻辑只实现一份（`src/neuq_vision_calib.py`），命令行与网页调用同一批函数，
 因此网页上看到的结果与命令行跑出来的完全一致。
@@ -92,10 +96,10 @@ python src/neuq_vision_calib.py --stage tables --quad "<四点>"   # 无 GUI 跑
 ## 标定流程
 
 1. 打印 `assets/checkerboard/` 里的棋盘靶标（12x9 方格，边长 20mm）
-2. 从多个角度拍摄 15 张以上棋盘照片，放入 `data/calib_input/`
-3. 拍摄一张地面（车道）照片放入 `data/ipm_input/`
+2. 从多个角度拍摄 15 张以上棋盘照片，放入 `calib_input/`
+3. 拍摄一张地面（车道）照片放入 `ipm_input/`
 4. 打开控制台，依次执行「相机标定 → 逆透视标定 → 导出」
-5. 产物落在 `data/matrix/`（矩阵）与 `data/lookup_table/`（查找表）
+5. 产物落在 `matrix/`（矩阵）与 `lookup_table/`（查找表）
 
 ---
 

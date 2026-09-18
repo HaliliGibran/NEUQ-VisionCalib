@@ -42,8 +42,10 @@ T/S/R 第三行均为 [0,0,1]，故 H[2,:] 恒等于 H0[2,:]，地平线只随�
 
 import argparse
 import json
+import re
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -262,18 +264,38 @@ def to_gray(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
 
 
-def safe_imwrite(path: Path, img: np.ndarray) -> None:
+def safe_imread(path: Path, flags: int = cv2.IMREAD_COLOR) -> Optional[np.ndarray]:
+    """读图；读不出来返回 None。
+
+    cv2.imread 在 Windows 上按 ANSI 代码页解释路径，中文用户名、中文工程目录
+    一律读不到——而且不报错，只是返回 None，排查起来很费劲。绕开的办法是自己
+    把字节读进来再解码，这样路径只经过 Python 的 Unicode 文件 API。
+    """
+    try:
+        buf = np.frombuffer(Path(path).read_bytes(), dtype=np.uint8)
+    except OSError:
+        return None
+    if buf.size == 0:
+        return None
+    return cv2.imdecode(buf, flags)
+
+
+def safe_imwrite(path: Path, img: np.ndarray, quality: int = 95) -> None:
     """写图并校验结果。
 
     cv2.imwrite 失败时只返回 False 而不抛异常，静默失败会让用户看到"已保存"
-    却什么都没写。本项目路径含非 ASCII 字符，这一校验不是可选项。
+    却什么都没写；和 imread 一样，它也不可靠地支持非 ASCII 路径。统一走
+    imencode + Path.write_bytes，路径不再经过 OpenCV 的编码转换。
     """
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(path), img):
-        raise SystemExit(
-            f'写入图片失败: {path}\n'
-            '（若路径含非 ASCII 字符，当前 OpenCV 构建可能无法处理，'
-            '请把工程移到纯英文路径下重试）')
+    ext = path.suffix.lower() or '.png'
+    params = ([int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+              if ext in ('.jpg', '.jpeg') else [])
+    ok, buf = cv2.imencode(ext, img, params)
+    if not ok:
+        raise SystemExit(f'编码图片失败: {path}')
+    path.write_bytes(buf.tobytes())
 
 
 SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
@@ -482,7 +504,7 @@ def calibrate_camera() -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
     # 而全部剔除，最后以 0 张有效收场，报错信息还完全指向错误的方向。
     size_votes: Dict[Tuple[int, int], int] = {}
     for path in files:
-        img = cv2.imread(str(path))
+        img = safe_imread(path)
         if img is None:
             failed.append(f'{path.name}（无法读取）')
             continue
@@ -501,7 +523,7 @@ def calibrate_camera() -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
               f'{img_size[0]}x{img_size[1]}，以下将被剔除: {others}')
 
     for path in files:
-        img = cv2.imread(str(path))
+        img = safe_imread(path)
         if img is None:
             continue
         gray = to_gray(img)
@@ -597,7 +619,7 @@ def export_undistort_previews(files: List[Path], K: np.ndarray, D: np.ndarray,
     DIR_CALIB_PREVIEW.mkdir(parents=True, exist_ok=True)
     Knew = resolve_new_camera_matrix(K, D, img_size)
     for path in files:
-        img = cv2.imread(str(path))
+        img = safe_imread(path)
         if img is None:
             continue
         undist = cv2.undistort(img, K, D, None, Knew)
@@ -1260,9 +1282,11 @@ def table_convention_text() -> str:
 
 
 def export_matrices(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
-                    H: np.ndarray, extra: dict) -> None:
-    """导出六矩阵与畸变系数到 matrix/，同时写一份高精度文本便于粘贴。"""
-    DIR_MATRIX.mkdir(parents=True, exist_ok=True)
+                    H: np.ndarray, extra: dict,
+                    matrix_root: Optional[Path] = None) -> None:
+    """导出六矩阵与畸变系数，同时写一份高精度文本便于粘贴。"""
+    out_dir = Path(matrix_root) if matrix_root is not None else DIR_MATRIX
+    out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         'note': (
             '去畸变的非线性部分由 dist_coeffs 承载，无法写成矩阵；'
@@ -1282,8 +1306,8 @@ def export_matrices(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
         'dist_coeffs': D.tolist(),
     }
     payload.update(extra)
-    MATRIX_JSON.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
-                           encoding='utf-8')
+    (out_dir / 'matrices.json').write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
 
     lines = []
     for name in ('K', 'K_inv', 'Knew', 'Knew_inv', 'H', 'H_inv'):
@@ -1292,8 +1316,8 @@ def export_matrices(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
         lines.append(f'{name} = [\n    {body}\n];')
     d = np.asarray(D, dtype=np.float64).ravel()
     lines.append('D = [' + ', '.join(f'{v:.17e}' for v in d) + '];')
-    (DIR_MATRIX / 'matrices.txt').write_text('\n\n'.join(lines) + '\n', encoding='utf-8')
-    print('六矩阵与畸变系数已保存:', MATRIX_JSON)
+    (out_dir / 'matrices.txt').write_text('\n\n'.join(lines) + '\n', encoding='utf-8')
+    print('六矩阵与畸变系数已保存:', out_dir / 'matrices.json')
 
 
 def assert_invertible(name: str, m: np.ndarray) -> None:
@@ -1365,10 +1389,25 @@ def write_table_txt(path: Path, mat: np.ndarray) -> None:
     np.savetxt(path, m, fmt='%.2f', delimiter=', ')
 
 
-def write_table_bin(path: Path, mat: np.ndarray) -> None:
-    """int16 小端裸二进制，无效点写 BIN_SENTINEL。"""
+def write_table_bin(path: Path, table: np.ndarray) -> None:
+    """int16 小端裸二进制，无效点写 BIN_SENTINEL。
+
+    入参必须是 quantize_table() 的输出，这里不再二次量化：落盘的字节要和
+    batch_test、校验脚本消费的那一份严格同源。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    quantize_table(mat).astype('<i2').tofile(path)
+    np.asarray(table, dtype='<i2').tofile(path)
+
+
+def dequantize_table(q: np.ndarray, fixed_point: int = TABLE_FIXED_POINT) -> np.ndarray:
+    """定点表 -> 像素坐标，无效哨兵还原成 -1。
+
+    这正是 C 端的算法（表值 / 2^shift），所以它就是"交付内容的浮点视图"：
+    拿它去跑批量测试，等于拿 C 端真正会用的坐标去跑。
+    """
+    arr = np.asarray(q, dtype=np.float64) / float(1 << fixed_point)
+    arr[np.asarray(q) == BIN_SENTINEL] = -1.0
+    return arr
 
 
 def format_int16_array(values: np.ndarray, per_line: int = 12) -> str:
@@ -1380,14 +1419,14 @@ def format_int16_array(values: np.ndarray, per_line: int = 12) -> str:
 
 
 def write_table_c(out_dir: Path, tag: str, desc: str,
-                  map_x: np.ndarray, map_y: np.ndarray) -> None:
+                  qx: np.ndarray, qy: np.ndarray) -> None:
     """写一个自包含的 C 头文件，含两张 int16 定点表。
 
     直接把维度、定点位数、无效哨兵和用法都写进注释与宏，C 端拿到就能用，
     不必再回头翻本工程的文档去猜表的排布和单位。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    qx, qy = quantize_table(map_x), quantize_table(map_y)
+    qx, qy = np.asarray(qx, dtype=np.int16), np.asarray(qy, dtype=np.int16)
     th, tw = qx.shape
     safe = ''.join(c if c.isalnum() else '_' for c in tag).upper()
     guard = f'NEUQ_MAP_{safe}_H'
@@ -1444,26 +1483,142 @@ def clear_stale_tables(out_dir: Path) -> None:
             path.unlink()
 
 
-def write_map_pair(out_dir: Path, map_x: np.ndarray, map_y: np.ndarray,
-                   tag: str, desc: str) -> Tuple[int, int]:
-    """写出一个方向的一组映射表，格式由 TABLE_FORMAT 决定，返回实际网格 (W, H)。
+@dataclass
+class MapPair:
+    """一份"最终交付"的映射表。
 
-    无论哪种格式，都先按 TABLE_SIZE 重采样（未指定则保持原尺寸）。
+    这是整条打表链路的分水岭。重采样、无效哨兵、定点量化只在这里做一次，
+    之后序列化与批量测试消费的是同一个对象——而不是"写文件走一条链、
+    验证走另一条链"，那正是导出的表与验过的表其实是两份数据的老毛病。
+
+    `x`/`y` 里放的是 C 端重建出来的坐标（bin/c 已按 Q 定点还原），
+    所以拿它跑批量测试等价于拿真实交付物跑。
+    """
+
+    x: np.ndarray                      # (H, W) 输出像素 -> 源图采样坐标 X
+    y: np.ndarray                      # 同上，Y
+    source_size: Tuple[int, int]       # 采样坐标所在的原图分辨率 (W, H)
+    fixed_point: Optional[int] = None  # bin/c 的定点位数；文本格式为 None
+    qx: Optional[np.ndarray] = None    # 已量化的 int16 载荷（仅 bin/c）
+    qy: Optional[np.ndarray] = None
+
+    @property
+    def size(self) -> Tuple[int, int]:
+        """输出网格 (W, H)。TABLE_SIZE 生效时它就是重采样后的网格。"""
+        return self.x.shape[1], self.x.shape[0]
+
+    @property
+    def invalid(self) -> np.ndarray:
+        """无效点掩码；-1 是两套表约定的哨兵，任一分量落到图上即视为无效。"""
+        return (self.x < 0) | (self.y < 0)
+
+
+def prepare_map_pair(map_x: np.ndarray, map_y: np.ndarray,
+                     source_size: Tuple[int, int]) -> MapPair:
+    """把数学上算出的映射表加工成最终要交付的那一份。
+
+    加工顺序刻意与落盘顺序一致：先按 TABLE_SIZE 重采样，再统一无效哨兵，
+    最后按 TABLE_FORMAT 量化。走完这一步，磁盘上的字节与内存里的 `x`/`y`
+    就是同一份数据的两种表示——批量测试与校验脚本都只认后者。
     """
     if TABLE_SIZE is not None:
         map_x, map_y = resample_map_pair(map_x, map_y, TABLE_SIZE)
+
+    ok = np.isfinite(map_x) & np.isfinite(map_y) & (map_x >= 0.0) & (map_y >= 0.0)
+    invalid = ~ok
+
+    if TABLE_FORMAT in ('bin', 'c'):
+        qx = quantize_table(np.where(invalid, -1.0, map_x))
+        qy = quantize_table(np.where(invalid, -1.0, map_y))
+        return MapPair(x=dequantize_table(qx), y=dequantize_table(qy),
+                       source_size=source_size,
+                       fixed_point=TABLE_FIXED_POINT, qx=qx, qy=qy)
+
+    # 文本表按 %.2f 落盘，内存里也先舍到同一位；否则测到的精度比交付的高
+    x = np.where(invalid, -1.0, np.round(map_x, 2))
+    y = np.where(invalid, -1.0, np.round(map_y, 2))
+    return MapPair(x=x, y=y, source_size=source_size)
+
+
+def serialize_map_pair(pair: MapPair, out_dir: Path, tag: str, desc: str) -> None:
+    """把 MapPair 写成文件。只做序列化，不再改动任何数值。"""
     out_dir.mkdir(parents=True, exist_ok=True)
     clear_stale_tables(out_dir)
 
     if TABLE_FORMAT == 'c':
-        write_table_c(out_dir, tag, desc, map_x, map_y)
+        write_table_c(out_dir, tag, desc, pair.qx, pair.qy)
     elif TABLE_FORMAT == 'bin':
-        write_table_bin(out_dir / 'MapW.bin', map_x)
-        write_table_bin(out_dir / 'MapH.bin', map_y)
+        write_table_bin(out_dir / 'MapW.bin', pair.qx)
+        write_table_bin(out_dir / 'MapH.bin', pair.qy)
     else:
-        write_table_txt(out_dir / 'MapW.txt', map_x)
-        write_table_txt(out_dir / 'MapH.txt', map_y)
-    return map_x.shape[1], map_x.shape[0]
+        write_table_txt(out_dir / 'MapW.txt', pair.x)
+        write_table_txt(out_dir / 'MapH.txt', pair.y)
+
+
+def load_table(path: Path, fixed_point: int = TABLE_FIXED_POINT,
+               grid: Optional[Tuple[int, int]] = None) -> np.ndarray:
+    """读回一张已落盘的表，返回 (H, W) 的 float64，无效点统一成 -1。"""
+    if path.suffix == '.bin':
+        if grid is None:
+            raise SystemExit(f'读取 {path.name} 需要先确定网格尺寸。')
+        w, h = grid
+        raw = np.fromfile(path, dtype='<i2').astype(np.int64)
+        if raw.size != w * h:
+            raise SystemExit(f'{path} 有 {raw.size} 个值，与网格 {w}x{h} 不符。')
+        return dequantize_table(raw, fixed_point).reshape(h, w)
+
+    arr = np.loadtxt(path, delimiter=',', dtype=np.float64)
+    return np.atleast_2d(arr)
+
+
+def _load_c_header(path: Path) -> MapPair:
+    """从生成的 C 头文件里把两张定点表与网格抠出来。"""
+    text = path.read_text(encoding='utf-8')
+
+    def macro(name: str) -> int:
+        m = re.search(rf'#define\s+\w+_{name}\s+\(?(-?\d+)\)?', text)
+        if not m:
+            raise SystemExit(f'{path} 里找不到 {name} 宏。')
+        return int(m.group(1))
+
+    shift, w, h = macro('SHIFT'), macro('W'), macro('H')
+    qs = []
+    for suffix in ('mapW', 'mapH'):
+        m = re.search(rf'_{suffix}\[[^\]]*\]\s*=\s*\{{(.*?)\}};', text, re.S)
+        if not m:
+            raise SystemExit(f'{path} 里找不到 {suffix} 数组。')
+        vals = [int(v) for v in m.group(1).replace('\n', ' ').split(',') if v.strip()]
+        if len(vals) != w * h:
+            raise SystemExit(f'{path} 的 {suffix} 数组长度 {len(vals)} 与 {w}x{h} 不符。')
+        qs.append(np.asarray(vals, dtype=np.int16).reshape(h, w))
+    return MapPair(x=dequantize_table(qs[0], shift), y=dequantize_table(qs[1], shift),
+                   source_size=(w, h), fixed_point=shift, qx=qs[0], qy=qs[1])
+
+
+def load_map_pair(folder: Path, source_size: Tuple[int, int],
+                  grid: Optional[Tuple[int, int]] = None,
+                  fixed_point: Optional[int] = None) -> MapPair:
+    """读回一组已落盘的表，还原成 MapPair（按 txt / bin / C 三种格式自动识别）。
+
+    批量测试与校验脚本都走这条路，验证的就是"真正交出去的那一份"，
+    而不是重算出来的数学结果。
+    """
+    folder = Path(folder)
+    fp = TABLE_FIXED_POINT if fixed_point is None else int(fixed_point)
+    for suffix in ('.txt', '.bin'):
+        wx, wy = folder / f'MapW{suffix}', folder / f'MapH{suffix}'
+        if wx.is_file() and wy.is_file():
+            if suffix == '.txt':
+                x, y = load_table(wx, fp, grid), load_table(wy, fp, grid)
+                return MapPair(x=x, y=y, source_size=source_size)
+            x = load_table(wx, fp, grid)
+            y = load_table(wy, fp, grid)
+            return MapPair(x=x, y=y, source_size=source_size, fixed_point=fp)
+    header = folder / 'Map.h'
+    if header.is_file():
+        return _load_c_header(header)
+    raise SystemExit(f'{folder} 下没有可识别的查找表'
+                     '（MapW.txt / MapW.bin / Map.h 都没有）。')
 
 
 def report_table_size(out_dir: Path, shape: Tuple[int, int]) -> None:
@@ -1521,22 +1676,27 @@ def distort_points(pts_undist: np.ndarray, K: np.ndarray, D: np.ndarray,
 
 
 def export_undistort_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
-                            size: Tuple[int, int]) -> None:
-    """原图 <-> 去畸变图，正反两套表。"""
-    out_dir = DIR_TABLE / 'undistort'
+                            size: Tuple[int, int],
+                            table_root: Optional[Path] = None) -> MapPair:
+    """原图 <-> 去畸变图，正反两套表。返回反向表的最终交付版本。"""
+    out_dir = (Path(table_root) if table_root is not None else DIR_TABLE) / 'undistort'
     w, h = size
 
     map_x, map_y = cv2.initUndistortRectifyMap(K, D, None, Knew, size, cv2.CV_32FC1)
     rev = mask_out_of_range(np.column_stack((map_x.ravel(), map_y.ravel())), size)
-    shape = write_map_pair(out_dir / 'reverse', rev[:, 0].reshape(h, w),
-                           rev[:, 1].reshape(h, w), 'undistort_reverse',
-                           '去畸变 反向表（去畸变图像素 -> 原始畸变图采样坐标）')
-
     fwd = mask_out_of_range(undistorted_grid(K, D, Knew, size), size)
-    write_map_pair(out_dir / 'forward', fwd[:, 0].reshape(h, w), fwd[:, 1].reshape(h, w),
-                   'undistort_forward', '去畸变 正向表（原始畸变图像素 -> 去畸变图落点）')
+
+    # 先加工成最终交付的那一份，再序列化：写盘与后续测试同源
+    rev_pair = prepare_map_pair(rev[:, 0].reshape(h, w), rev[:, 1].reshape(h, w), size)
+    fwd_pair = prepare_map_pair(fwd[:, 0].reshape(h, w), fwd[:, 1].reshape(h, w), size)
+    serialize_map_pair(rev_pair, out_dir / 'reverse', 'undistort_reverse',
+                       '去畸变 反向表（去畸变图像素 -> 原始畸变图采样坐标）')
+    serialize_map_pair(fwd_pair, out_dir / 'forward', 'undistort_forward',
+                       '去畸变 正向表（原始畸变图像素 -> 去畸变图落点）')
+
     print('去畸变表已写入:', out_dir)
-    report_table_size(out_dir, shape)
+    report_table_size(out_dir, rev_pair.size)
+    return rev_pair
 
 
 def build_composite_reverse_map(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
@@ -1569,57 +1729,127 @@ def build_composite_reverse_map(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
 
 def export_composite_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                             H: np.ndarray, H0: np.ndarray, sign: float,
-                            size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
-    """原图 <-> 去畸变逆透视图，正反两套表。返回反向表供批量测试复用。"""
-    out_dir = DIR_TABLE / 'undistort_ipm'
+                            size: Tuple[int, int],
+                            table_root: Optional[Path] = None) -> MapPair:
+    """原图 <-> 去畸变逆透视图，正反两套表。返回反向表的最终交付版本。"""
+    out_dir = (Path(table_root) if table_root is not None else DIR_TABLE) / 'undistort_ipm'
     w, h = size
 
     map_x, map_y = build_composite_reverse_map(K, D, Knew, H, H0, sign, size)
-    shape = write_map_pair(out_dir / 'reverse', map_x, map_y, 'undistort_ipm_reverse',
-                           '逆透视 反向表（BirdView 输出像素 -> 原始畸变图采样坐标）')
-
     und = undistorted_grid(K, D, Knew, size)
     # 与反向表同一判据：地平线另一侧的源图像素经 H 会得到符号翻转的镜像落点，
     # 地平线附近则得到 1e15 量级的坐标，两者都必须标成无效而不是原样写出去。
     valid = np.isfinite(und).all(axis=1)
     valid &= sign * homography_denominator(H0, und) >= DEN_EPS
     fwd = mask_out_of_range(apply_homography(H, und), size, valid)
-    write_map_pair(out_dir / 'forward', fwd[:, 0].reshape(h, w), fwd[:, 1].reshape(h, w),
-                   'undistort_ipm_forward',
-                   '逆透视 正向表（原始畸变图像素 -> BirdView 落点）')
+
+    rev_pair = prepare_map_pair(map_x, map_y, size)
+    fwd_pair = prepare_map_pair(fwd[:, 0].reshape(h, w), fwd[:, 1].reshape(h, w), size)
+    serialize_map_pair(rev_pair, out_dir / 'reverse', 'undistort_ipm_reverse',
+                       '逆透视 反向表（BirdView 输出像素 -> 原始畸变图采样坐标）')
+    serialize_map_pair(fwd_pair, out_dir / 'forward', 'undistort_ipm_forward',
+                       '逆透视 正向表（原始畸变图像素 -> BirdView 落点）')
 
     print('去畸变逆透视表已写入:', out_dir)
-    report_table_size(out_dir, shape)
-    return map_x, map_y
+    report_table_size(out_dir, rev_pair.size)
+    return rev_pair
+
+
+def export_all(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
+               H: np.ndarray, H0: np.ndarray, sign: float, extra: dict,
+               size: Tuple[int, int]) -> MapPair:
+    """事务式导出：六矩阵 + 两套表，全部成功才落到正式目录。
+
+    原先的顺序是"先写 matrix/，再写两套表"。中间任何一步失败（打表溢出、
+    磁盘满、被 Ctrl+C）都会留下"新矩阵配旧表"的组合，而两边的文件单看都正常，
+    几乎无法察觉。这里改成先全部写进 *.staging/，成功后再整体替换：
+    失败时正式目录保持原样，不会出现半套产物。
+    """
+    table_stage = DIR_TABLE.with_name(DIR_TABLE.name + '.staging')
+    matrix_stage = DIR_MATRIX.with_name(DIR_MATRIX.name + '.staging')
+    for stage, target in ((table_stage, DIR_TABLE), (matrix_stage, DIR_MATRIX)):
+        shutil.rmtree(stage, ignore_errors=True)
+        # 先把正式目录里已有的文件带进暂存区。本轮导出不负责生成的东西——
+        # ipm_state.json、用户自己放进去的参考资料——必须原样保留，
+        # 否则"整体替换"会连它们一起删掉（这一步曾经真的丢过 ipm_state.json）。
+        if target.is_dir():
+            shutil.copytree(target, stage, dirs_exist_ok=True)
+
+    try:
+        export_matrices(K, D, Knew, H, extra, matrix_root=matrix_stage)
+        export_undistort_tables(K, D, Knew, size, table_root=table_stage)
+        pair = export_composite_tables(K, D, Knew, H, H0, sign, size,
+                                       table_root=table_stage)
+    except BaseException:
+        # 任何一步出问题：丢掉暂存区，正式目录一个字节都没动过
+        shutil.rmtree(table_stage, ignore_errors=True)
+        shutil.rmtree(matrix_stage, ignore_errors=True)
+        raise
+
+    for stage, target in ((table_stage, DIR_TABLE), (matrix_stage, DIR_MATRIX)):
+        _swap_dir(stage, target)
+    print(f'导出完成: {DIR_MATRIX} 与 {DIR_TABLE}')
+    return pair
+
+
+def _swap_dir(stage: Path, target: Path) -> None:
+    """把暂存目录换成正式目录，中途失败则回滚。"""
+    backup = target.with_name(target.name + '.old')
+    shutil.rmtree(backup, ignore_errors=True)
+    if target.exists():
+        target.rename(backup)
+    try:
+        stage.rename(target)
+    except OSError:
+        if backup.exists() and not target.exists():
+            backup.rename(target)     # 换装失败，把旧的原样放回去
+        raise
+    shutil.rmtree(backup, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- 7. 批量测试
 
-def batch_test(map_x: np.ndarray, map_y: np.ndarray, size: Tuple[int, int]) -> None:
-    """用导出的反向表批量处理 test_input/ 的图片，结果写入 test_output/。
+def batch_test(pair: MapPair) -> None:
+    """用一份"最终交付"的映射表批量处理 test_input/ 的图片，结果写入 test_output/。
 
-    走表而不是重算，这样测试同时验证了表本身；无效点按 C 端语义显式置黑。
+    关键点是入参 MapPair：它已经过重采样与量化，与落盘的字节同源。走表而不是
+    重算，测试才真正验证了导出的那份表；无效点按 C 端语义显式置黑。
     """
     files = list_images(DIR_TEST_IN)
     if not files:
         print(f'{DIR_TEST_IN} 中没有测试图，跳过批量测试。')
         return
     DIR_TEST_OUT.mkdir(parents=True, exist_ok=True)
-    mx32 = map_x.astype(np.float32)
-    my32 = map_y.astype(np.float32)
-    invalid = (map_x < 0) | (map_y < 0)
+
+    mx32 = pair.x.astype(np.float32)
+    my32 = pair.y.astype(np.float32)
+    invalid = pair.invalid
+    sw, sh = pair.source_size
+    ow, oh = pair.size
 
     for path in files:
-        img = cv2.imread(str(path))
+        img = safe_imread(path)
         if img is None:
             print(f'跳过无法读取的文件: {path.name}')
             continue
-        if (img.shape[1], img.shape[0]) != size:
-            img = cv2.resize(img, size)
+        if (img.shape[1], img.shape[0]) != pair.source_size:
+            if not _same_aspect((img.shape[1], img.shape[0]), pair.source_size):
+                print(f'跳过 {path.name}: 分辨率 {img.shape[1]}x{img.shape[0]} 与标定时的 '
+                      f'{sw}x{sh} 宽高比不同，直接缩放会让几何失真，'
+                      '请换同比例的图片或重做标定。')
+                continue
+            print(f'提示: {path.name} 是 {img.shape[1]}x{img.shape[0]}，'
+                  f'按同比例缩放到标定分辨率 {sw}x{sh} 后再打表（几何等价）。')
+            img = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
         out = cv2.remap(img, mx32, my32, cv2.INTER_LINEAR, borderValue=(0, 0, 0))
         out[invalid] = 0
         safe_imwrite(DIR_TEST_OUT / f'{path.stem}_birdview.jpg', out)
-    print(f'批量测试完成（走的是导出的反向表）: {DIR_TEST_OUT}')
+    print(f'批量测试完成（网格 {ow}x{oh}，来源是导出后的表）: {DIR_TEST_OUT}')
+
+
+def _same_aspect(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
+    """两个分辨率是否同宽高比（1% 容差，容忍编码器把奇数边裁掉一个像素）。"""
+    return abs(a[0] / a[1] - b[0] / b[1]) <= 0.01 * (b[0] / b[1])
 
 
 # ---------------------------------------------------------------- 8. 命令行与素材管理
@@ -1829,7 +2059,7 @@ def import_dataset(src_dir: Path, move: bool = False,
           f'共 {len(files)} 张，模式 {mode}，{"移动" if move else "复制"}到工程目录\n')
     calib_n = ipm_n = skip_n = dup_n = partial_n = 0
     for path in files:
-        img = cv2.imread(str(path))
+        img = safe_imread(path)
         if img is None:
             print(f'  [跳过] {path.name}（无法读取）')
             skip_n += 1
@@ -2109,9 +2339,8 @@ def run_ipm_calibration(src: np.ndarray, img_size: Tuple[int, int],
 
 
 def rebuild_reverse_map_from_state(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
-                                   img_size: Tuple[int, int]
-                                   ) -> Tuple[np.ndarray, np.ndarray]:
-    """从 ipm_state.json 重建 BirdView 反向表，供 --stage test 单独使用。"""
+                                   img_size: Tuple[int, int]) -> MapPair:
+    """从 ipm_state.json 重建 BirdView 反向表（已加工成最终交付形态）。"""
     state = load_ipm_state()
     if state is None:
         raise SystemExit(f'未找到 {ipm_state_path()}。'
@@ -2123,7 +2352,26 @@ def rebuild_reverse_map_from_state(K: np.ndarray, D: np.ndarray, Knew: np.ndarra
     H = np.asarray(state['H'], dtype=np.float64).reshape(3, 3)
     H0 = np.asarray(state['H0'], dtype=np.float64).reshape(3, 3)
     sign = float(state.get('horizon_sign', 1.0))
-    return build_composite_reverse_map(K, D, Knew, H, H0, sign, img_size)
+    map_x, map_y = build_composite_reverse_map(K, D, Knew, H, H0, sign, img_size)
+    return prepare_map_pair(map_x, map_y, img_size)
+
+
+def load_exported_reverse_pair(img_size: Tuple[int, int]) -> MapPair:
+    """读回已经导出的 BirdView 反向表。
+
+    批量测试优先走这条路：验证的是真正落盘、将来要烧进车里的那份表，
+    而不是重算出来的数学结果。
+    """
+    folder = DIR_TABLE / 'undistort_ipm' / 'reverse'
+    grid = None
+    if MATRIX_JSON.is_file():
+        try:
+            meta = json.loads(MATRIX_JSON.read_text(encoding='utf-8'))
+            size = meta.get('table_size_wh')
+            grid = (int(size[0]), int(size[1])) if size else None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            grid = None
+    return load_map_pair(folder, img_size, grid)
 
 
 def load_or_run_calibration() -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]:
@@ -2174,8 +2422,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     K, D, Knew, img_size = load_or_run_calibration()
 
     if stage == 'test':
-        map_x, map_y = rebuild_reverse_map_from_state(K, D, Knew, img_size)
-        batch_test(map_x, map_y, img_size)
+        # 优先用真正落盘的那份表；表不在（或被删了）才退回按状态重算
+        try:
+            pair = load_exported_reverse_pair(img_size)
+            print(f'批量测试使用已导出的表: {DIR_TABLE / "undistort_ipm" / "reverse"}')
+        except SystemExit as exc:
+            print(f'未找到可用的导出表（{exc}），改为按 ipm_state.json 重算。')
+            pair = rebuild_reverse_map_from_state(K, D, Knew, img_size)
+        batch_test(pair)
         print('\n批量测试完成。')
         return
 
@@ -2198,12 +2452,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if over_crop:
             print(f'警告: scale={scale:.3f} 超过不裁切视野的上限 {max_scale:.3f} px/cm，'
                   '导出的表已裁掉部分有效视野。')
-        export_matrices(K, D, Knew, H, dict(state, over_crop=bool(over_crop),
-                                            max_range_cm=MAX_RANGE_CM,
-                                            max_lateral_cm=MAX_LATERAL_CM))
-        export_undistort_tables(K, D, Knew, img_size)
-        map_x, map_y = export_composite_tables(K, D, Knew, H, H0, sign, img_size)
-        batch_test(map_x, map_y, img_size)
+        pair = export_all(K, D, Knew, H, H0, sign,
+                          dict(state, over_crop=bool(over_crop),
+                               max_range_cm=MAX_RANGE_CM,
+                               max_lateral_cm=MAX_LATERAL_CM),
+                          img_size)
+        batch_test(pair)
         print('\n全部完成（复用已有逆透视标定）。')
         return
 
@@ -2213,7 +2467,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             raise SystemExit('--stage tables 需要 --quad，或先跑一次 --stage ipm。')
         raise SystemExit('未找到逆透视标定原图。把地面标定照放进 ipm_input/，'
                          '或用 --ipm-source 指定。')
-    src = cv2.imread(str(src_path))
+    src = safe_imread(src_path)
     if src is None:
         raise SystemExit(f'无法读取逆透视标定原图: {src_path}')
     print('逆透视标定原图:', src_path)
@@ -2247,7 +2501,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print('\n逆透视标定阶段完成。运行 --stage tables 可继续导出矩阵与查找表。')
         return
 
-    export_matrices(K, D, Knew, H, {
+    pair = export_all(K, D, Knew, H, calibrator.H0, calibrator.sign, {
         'H0': calibrator.H0.tolist(),
         'phys_w_cm': phys_w,
         'phys_h_cm': phys_h,
@@ -2261,12 +2515,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         'horizon_sign': calibrator.sign,
         'max_range_cm': MAX_RANGE_CM,
         'max_lateral_cm': MAX_LATERAL_CM,
-    })
-
-    export_undistort_tables(K, D, Knew, img_size)
-    map_x, map_y = export_composite_tables(K, D, Knew, H, calibrator.H0,
-                                           calibrator.sign, img_size)
-    batch_test(map_x, map_y, img_size)
+    }, img_size)
+    batch_test(pair)
 
     print('\n全部完成。')
 

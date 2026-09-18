@@ -3,14 +3,15 @@
 交付给嵌入式 C 端的是一堆映射表。表一旦内部不一致（方向搞反、无效点没标、精度不够），
 在车上是极难排查的。这个脚本把每条约定都独立验一遍：
 
-  1. H 把源四点映射成轴对齐矩形，尺寸等于物理尺寸乘 scale
+  1. H 把源四点映射成矩形，且尺寸/邻边垂直/旋转角/锚点四项不变量成立
   2. undistort/reverse 表 remap 的结果 == cv2.undistort
   3. undistort_ipm/reverse 表 remap 的结果 == cv2.warpPerspective(去畸变图, H)
   4. undistort_ipm 的 forward 与 reverse 互为逆映射
   5. 无效哨兵只出现在合法区域之外，且有效区连通
 
 落盘格式自动识别：逗号分隔文本（MapW.txt）、int16 定点二进制（MapW.bin）、
-C 头文件（Map.h）。三种格式的无效哨兵不同，脚本内部统一归一成 -1 再比较。
+C 头文件（Map.h）。读取统一走主脚本的 core.load_map_pair，这样"脚本怎么读表"
+与"程序怎么读表"永远是同一套语义。
 
 用法:
     python tools/verify_outputs.py [工程根目录]
@@ -19,20 +20,26 @@ C 头文件（Map.h）。三种格式的无效哨兵不同，脚本内部统一�
 from __future__ import annotations
 
 import json
-import re
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+# 本脚本位于 <工程根>/tools/，主脚本在 <工程根>/src/，先把 src 挂到 sys.path
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT / 'src') not in sys.path:
+    sys.path.insert(0, str(_ROOT / 'src'))
+
+import neuq_vision_calib as core  # noqa: E402
+
 TOL_INV_PX = 3.0      # forward/reverse 互逆的容差（表按 %.2f 量化，留足余量）
 VISIBLE_FRAC = 0.005  # 允许的"肉眼可见差异"像素占比（灰度差 > 8）
 
-BIN_SENTINEL = -32768  # 与主脚本 neuq_vision_calib.BIN_SENTINEL 保持一致
+BIN_SENTINEL = core.BIN_SENTINEL
 
 # 由 matrices.json 填入，bin/c 还原坐标时要用
-FIXED_POINT = 4
+FIXED_POINT = core.TABLE_FIXED_POINT
 
 # bin 是裸数组，文件里没有维度信息，必须靠 matrices.json 与标定分辨率还原
 TABLE_SHAPE: tuple[int, int] | None = None   # (W, H)
@@ -40,68 +47,15 @@ IMAGE_SIZE: tuple[int, int] = (0, 0)         # 源图尺寸，来自 calib.json
 SKIPPED = 0                                  # 因降采样而跳过的检查条数
 
 
-def dequantize(raw: np.ndarray, shift: int) -> np.ndarray:
-    """int16 定点还原成 float64 像素坐标，无效哨兵归一成 -1。
-
-    三种落盘格式对无效点用了不同哨兵（txt 是 -1，bin/c 是 int16 最小值）。
-    这里统一归一，后面的检查逻辑就不必关心文件格式。
-    """
-    out = raw.astype(np.float64)
-    ok = raw != BIN_SENTINEL
-    out[ok] = raw[ok] / float(1 << shift)
-    out[~ok] = -1.0
-    return out
-
-
-def load_c_header(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """从生成的 C 头文件里把两张定点表抠出来。"""
-    text = path.read_text(encoding='utf-8')
-
-    def define(name: str) -> int:
-        m = re.search(rf'#define\s+\w+_{name}\s+\(?(-?\d+)\)?', text)
-        if not m:
-            raise SystemExit(f'{path} 里找不到 {name} 宏。')
-        return int(m.group(1))
-
-    shift = define('SHIFT')
-    w, h = define('W'), define('H')
-
-    def array(suffix: str) -> np.ndarray:
-        m = re.search(rf'_{suffix}\[[^\]]*\]\s*=\s*\{{(.*?)\}};', text, re.S)
-        if not m:
-            raise SystemExit(f'{path} 里找不到 {suffix} 数组。')
-        vals = [int(v) for v in m.group(1).replace('\n', ' ').split(',') if v.strip()]
-        if len(vals) != w * h:
-            raise SystemExit(f'{path} 的 {suffix} 数组长度 {len(vals)} 与 {w}x{h} 不符。')
-        return dequantize(np.asarray(vals, dtype=np.int64), shift)
-
-    return array('mapW').reshape(h, w), array('mapH').reshape(h, w)
-
-
-def load_map_file(path: Path) -> np.ndarray:
-    """读一张映射表，返回 (H, W) 的 float64 数组，无效点统一为 -1。"""
-    if path.suffix == '.bin':
-        if TABLE_SHAPE is None:
-            raise SystemExit('未能确定 bin 表的网格尺寸（matrices.json 里缺 table_size_wh '
-                             '且标定分辨率不可用）。')
-        w, h = TABLE_SHAPE
-        raw = np.fromfile(path, dtype='<i2').astype(np.int64)
-        if raw.size != w * h:
-            raise SystemExit(f'{path} 有 {raw.size} 个值，与网格 {w}x{h} 不符。')
-        return dequantize(raw, FIXED_POINT).reshape(h, w)
-    return np.loadtxt(path, delimiter=',', dtype=np.float64)
-
 
 def load_pair(folder: Path) -> tuple[np.ndarray, np.ndarray]:
-    """读取一个方向的 MapW/MapH，自动识别 txt / bin / C 头文件三种落盘格式。"""
-    for suffix in ('.txt', '.bin'):
-        wx, wy = folder / f'MapW{suffix}', folder / f'MapH{suffix}'
-        if wx.is_file() and wy.is_file():
-            return load_map_file(wx), load_map_file(wy)
-    header = folder / 'Map.h'
-    if header.is_file():
-        return load_c_header(header)
-    raise SystemExit(f'{folder} 下没有可识别的查找表（MapW.txt / MapW.bin / Map.h）。')
+    """读取一个方向的 MapW/MapH。
+
+    直接复用主脚本的读取实现（core.load_map_pair），这样"脚本怎么读这张表"
+    与"程序怎么读这张表"永远是一套语义，不会各自漂移。
+    """
+    pair = core.load_map_pair(folder, IMAGE_SIZE, TABLE_SHAPE, FIXED_POINT)
+    return pair.x, pair.y
 
 
 def describe_pair(folder: Path) -> str:
@@ -159,13 +113,8 @@ def check_export_fidelity(root: Path, calib: dict, matrices: dict) -> bool:
     覆盖重采样与定点量化两步。检查 2/3 验证的是数学（只有全分辨率下才可比），
     这一项验证的是"算出来的东西有没有原样写进文件"，任何网格、任何格式都成立。
     """
-    # 本脚本以 tools/verify_outputs.py 的方式运行，sys.path[0] 是 tools/ 而不是工程根，
-    # 直接 import 主模块会失败，得先把 src/ 挂上去（主脚本位于 <工程根>/src/）。
-    src = root / 'src'
-    if str(src) not in sys.path:
-        sys.path.insert(0, str(src))
-    import neuq_vision_calib as core
-
+    # core 已在模块顶部导入（那时就把 src/ 挂上了 sys.path），这里只需按用户给的
+    # 工程根重绑定路径常量，并把表格格式同步过去，好让 core.load_map_pair 读得对。
     core.configure_paths(root=root)
     core.TABLE_SIZE = TABLE_SHAPE
     core.TABLE_FIXED_POINT = FIXED_POINT
@@ -278,27 +227,57 @@ def compare_images(a: np.ndarray, b: np.ndarray,
 
 
 def check_homography(matrices: dict) -> bool:
-    """检查 1: H 把源四点映射成轴对齐矩形，且尺寸等于物理尺寸乘 scale。"""
+    """检查 1: H 把源四点映射成矩形，且尺寸、旋转、锚点都与标定参数一致。
+
+    H = T(anchor) @ S(scale) @ R(heading) @ H0，所以只要 heading != 0，输出矩形
+    本来就是旋转的——用"轴对齐"当判据在非零 heading 下必然误判（本项目实测
+    heading=-1.6°，旧判据一直报失败）。这里改为验证四个对任意旋转都成立的不变量：
+
+      1. 中心 == anchor（归一化锚点换算到像素）
+      2. |TL->TR| == 物理宽 × scale，|TL->BL| == 物理高 × scale
+      3. 邻边垂直：(TL->TR) · (TL->BL) == 0
+      4. atan2(TR-TL) == heading（矩形对边平行，角度在模 180° 意义下比较）
+    """
     H = np.asarray(matrices['H'], dtype=np.float64).reshape(3, 3)
     quad = np.asarray(matrices['src_quad_tl_tr_bl_br'], dtype=np.float64).reshape(4, 2)
     scale = float(matrices['scale_px_per_cm'])
     phys_w = float(matrices['phys_w_cm'])
     phys_h = float(matrices['phys_h_cm'])
+    heading = float(matrices.get('heading_deg') or 0.0)
+    anchor_x = float(matrices.get('anchor_x') if matrices.get('anchor_x') is not None else 0.5)
+    anchor_y = float(matrices.get('anchor_y') if matrices.get('anchor_y') is not None else 0.5)
 
     out = apply_homography(H, quad)
-    w = out[1, 0] - out[0, 0]
-    h = out[2, 1] - out[0, 1]
+    tl, tr, bl = out[0], out[1], out[2]
+
+    w_px = float(np.linalg.norm(tr - tl))
+    h_px = float(np.linalg.norm(bl - tl))
     expect_w, expect_h = phys_w * scale, phys_h * scale
+    size_ok = abs(w_px - expect_w) < 0.5 and abs(h_px - expect_h) < 0.5
 
-    axis_aligned = (abs(out[0, 1] - out[1, 1]) < 1e-3      # TL.y == TR.y
-                    and abs(out[0, 0] - out[2, 0]) < 1e-3   # TL.x == BL.x
-                    and abs(out[2, 1] - out[3, 1]) < 1e-3   # BL.y == BR.y
-                    and abs(out[1, 0] - out[3, 0]) < 1e-3)  # TR.x == BR.x
-    size_ok = abs(w - expect_w) < 0.5 and abs(h - expect_h) < 0.5
+    e1, e2 = tr - tl, bl - tl
+    cos = float(np.dot(e1, e2) / (np.linalg.norm(e1) * np.linalg.norm(e2)))
+    ortho_ok = abs(cos) < 1e-3
 
-    return report('H 映射源四点为轴对齐矩形', axis_aligned and size_ok,
-                  f'输出矩形 {w:.1f}x{h:.1f} px，期望 {expect_w:.1f}x{expect_h:.1f} px，'
-                  f'轴对齐{"是" if axis_aligned else "否"}')
+    rot_deg = float(np.degrees(np.arctan2(e1[1], e1[0])))
+    delta = (rot_deg - heading + 90.0) % 180.0 - 90.0
+    rot_ok = abs(delta) < 0.05
+
+    canvas_w, canvas_h = IMAGE_SIZE
+    want_cx, want_cy = anchor_x * (canvas_w - 1), anchor_y * (canvas_h - 1)
+    cx, cy = out.mean(axis=0)
+    anchor_ok = abs(cx - want_cx) < 0.5 and abs(cy - want_cy) < 0.5
+
+    return report(
+        'H 映射源四点成矩形（尺寸/垂直/旋转/锚点）',
+        size_ok and ortho_ok and rot_ok and anchor_ok,
+        f'尺寸 {w_px:.1f}x{h_px:.1f} 期望 {expect_w:.1f}x{expect_h:.1f} '
+        f'{"OK" if size_ok else "不符"}；'
+        f'邻边 |cos|={abs(cos):.2e} {"OK" if ortho_ok else "不垂直"}；'
+        f'旋转 {rot_deg:.2f}° 期望 {heading:.2f}°（偏差 {delta:+.3f}°）'
+        f'{"OK" if rot_ok else "不符"}；'
+        f'中心 ({cx:.1f},{cy:.1f}) 期望 ({want_cx:.1f},{want_cy:.1f})'
+        f'{"OK" if anchor_ok else "不符"}')
 
 
 def check_undistort_tables(root: Path, calib: dict) -> bool:
