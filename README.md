@@ -103,16 +103,42 @@ python src/neuq_vision_calib.py --stage tables --quad "<四点>"   # 无 GUI 跑
 
 ---
 
+## 标定板规格
+
+导入素材的第一步就是判断"这张是棋盘照还是地面照"，而这一步用的正是棋盘规格。
+所以规格属于**当前标定工程的前置配置**，必须在导入之前设好。
+
+界面（以及命令行）只问**方格数**，内角点数由程序换算——"我打印的是 12×9，
+程序为什么让我填 11×8"是这一环最经典的填错来源。默认是仓库自带的 12×9 / 20 mm。
+
+```bash
+# 命令行（推荐用方格数）
+python src/neuq_vision_calib.py --board-squares 12 9 --square-size-mm 20
+python src/neuq_vision_calib.py --board-corners 11 8      # 兼容用法，与上面互斥
+
+# 扫描素材用的也是同一套参数与同一份检测实现
+python tools/scan_dataset.py <图片目录> --board-squares 12 9
+```
+
+在线拍摄的预览窗口顶部会一直显示当前规格——换了棋盘却忘了改参数时，
+画面会持续 `detected=False`，用户很容易去怀疑相机或代码，其实只是规格没切过来。
+
+规格会完整写进 `calib.json` 的 `board` 段，事后能追溯"这份内参是哪块棋盘算出来的"；
+旧版只写了 `chessboard_corners` 的文件仍可读，会自动换算回方格数。
+
+---
+
 ## 测试
 
 ```bash
 python tests/run_all.py              # 跑全部
+python tests/test_board_spec.py      # 标定板规格：换算、校验、检测判别、calib.json 往返
 python tests/test_lut_roundtrip.py   # 打表链路，60 组参数组合
-python tests/test_export_transaction.py   # 导出事务与回滚
+python tests/test_export_transaction.py   # 导出事务、回滚、重启后读表
 ```
 
-零依赖，不需要 pytest——只要有 cv2 和 numpy 就行。两组测试都只用**合成数据**
-（合成相机参数 + 合成单应），不需要任何真实照片。
+零依赖，不需要 pytest——只要有 cv2 和 numpy 就行。三组测试都只用**合成数据**
+（合成相机参数、合成单应、程序画出来的棋盘），不需要任何真实照片。
 
 `test_lut_roundtrip` 的参数矩阵是刻意铺开的，因为本项目的缺陷几乎都藏在组合里：
 

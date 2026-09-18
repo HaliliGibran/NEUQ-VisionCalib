@@ -24,6 +24,30 @@
   <section class="col col-steps">
     <h2>流程</h2>
 
+    <article class="card" id="step-board">
+      <div class="card-head"><span class="num">0</span><h3>标定板规格</h3></div>
+      <p class="hint">填你手上那块棋盘的<strong>方格数</strong>（数格子），不是内角点数——
+        程序会自动换算成 OpenCV 需要的角点数。导入素材时靠它判断"这张是棋盘照还是地面照"，
+        所以必须在导入<strong>之前</strong>设对。</p>
+      <div class="row board-row">
+        <label>横向方格数
+          <input id="in-board-x" type="number" min="5" max="60" step="1" value="12">
+        </label>
+        <label>纵向方格数
+          <input id="in-board-y" type="number" min="4" max="60" step="1" value="9">
+        </label>
+        <label>单格边长 mm
+          <input id="in-board-mm" type="number" min="1" step="0.1" value="20">
+        </label>
+      </div>
+      <div class="row">
+        <button id="btn-board-apply" class="primary">应用规格</button>
+        <button id="btn-board-reset" class="ghost">用仓库自带 12×9 / 20 mm</button>
+      </div>
+      <p class="hint inline">OpenCV 内角点：<code id="board-corners">11 × 8</code></p>
+      <div id="board-active" class="hint mono"></div>
+    </article>
+
     <article class="card" id="step-import">
       <div class="card-head"><span class="num">1</span><h3>导入素材</h3></div>
       <p class="hint">把棋盘照和地面照混在一起的目录丢进来，按"能否检出棋盘"自动分拣。</p>

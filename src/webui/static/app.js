@@ -264,6 +264,21 @@ async function refreshStatus() {
   setChip($('chip-tables'), st.tables_ready ? '查找表已生成' : '查找表未生成',
     st.tables_ready ? 'ok' : '');
 
+  // 标定板规格：当前生效值回填到输入框，并显示"这份 calib.json 是哪块棋盘算的"
+  if (st.board) {
+    $('in-board-x').value = st.board.squares_x;
+    $('in-board-y').value = st.board.squares_y;
+    $('in-board-mm').value = st.board.square_size_mm;
+    updateBoardHint();
+    $('board-active').textContent = '当前生效：' + st.board.label;
+  }
+  if (st.calib_board) {
+    const b = st.calib_board;
+    $('board-active').textContent +=
+      `\n本次标定使用：${b.squares_x}×${b.squares_y} 方格 / ` +
+      `${b.square_size_mm} mm / 内角点 ${b.corners_x}×${b.corners_y}`;
+  }
+
   const badge = $('gallery-badge');
   if (badge) {
     badge.textContent = st.preview_count ? `（${st.preview_count} 张）` : '（暂无）';
@@ -1054,6 +1069,7 @@ async function runCalibration({ force = false, threshold } = {}) {
   const payload = {
     force,
     max_reproj_err: threshold === undefined ? $('in-reproj').value : (threshold ?? ''),
+    board: boardPayload(),
   };
   const data = await api('/api/calibrate', payload);
   log(data.log);
@@ -1096,6 +1112,24 @@ async function refreshBackups() {
 // 浏览器选中、等待上传的素材文件（见 bindActions 里的文件夹选择）
 let pendingImportFiles = [];
 
+function updateBoardHint() {
+  const x = parseInt($('in-board-x').value, 10);
+  const y = parseInt($('in-board-y').value, 10);
+  const ok = x >= 5 && y >= 4;
+  $('board-corners').textContent = ok ? `${x - 1} × ${y - 1}` : '方格数至少 5 × 4';
+  $('board-corners').style.color = ok ? '' : 'var(--danger)';
+}
+
+// 规格是"一张图算棋盘照还是地面照"的依据，所以导入/标定请求都带上它，
+// 免得用户改了网页却没生效（服务端会以请求里的值为准）。
+function boardPayload() {
+  return {
+    squares_x: parseInt($('in-board-x').value, 10),
+    squares_y: parseInt($('in-board-y').value, 10),
+    square_size_mm: parseFloat($('in-board-mm').value),
+  };
+}
+
 function bindActions() {
   $('btn-refresh').onclick = () => withBusy($('btn-refresh'), async () => {
     try { await refreshStatus(); } catch (e) { log('扫描失败: ' + e.message, 'err'); }
@@ -1115,6 +1149,32 @@ function bindActions() {
     }
   };
 
+  $('btn-board-apply').onclick = () => withBusy($('btn-board-apply'), async () => {
+    try {
+      const b = await api('/api/board', boardPayload());
+      $('board-active').textContent = '当前生效：' + b.label;
+      log(`标定板规格已设为 ${b.label}（OpenCV 内角点 ${b.corners_x}×${b.corners_y}）`, 'ok');
+    } catch (e) { log('规格设置失败: ' + e.message, 'err'); }
+  });
+
+  $('btn-board-reset').onclick = () => withBusy($('btn-board-reset'), async () => {
+    try {
+      const b = await api('/api/board',
+        { squares_x: 12, squares_y: 9, square_size_mm: 20 });
+      $('in-board-x').value = b.squares_x;
+      $('in-board-y').value = b.squares_y;
+      $('in-board-mm').value = b.square_size_mm;
+      updateBoardHint();
+      $('board-active').textContent = '当前生效：' + b.label;
+      log('已恢复为仓库自带棋盘 12×9 / 20 mm', 'ok');
+    } catch (e) { log('恢复失败: ' + e.message, 'err'); }
+  });
+
+  ['in-board-x', 'in-board-y', 'in-board-mm'].forEach((id) => {
+    const el = $(id);
+    if (el) el.addEventListener('input', updateBoardHint);
+  });
+
   $('btn-import').onclick = () => withBusy($('btn-import'), async () => {
     try {
       const mode = document.querySelector('input[name="import-mode"]:checked').value;
@@ -1123,6 +1183,10 @@ function bindActions() {
       if (pendingImportFiles && pendingImportFiles.length) {
         const fd = new FormData();
         fd.append('name', $('in-import-dir').value.trim());
+        // 规格随请求一起送，服务端以它为准
+        fd.append('squares_x', $('in-board-x').value);
+        fd.append('squares_y', $('in-board-y').value);
+        fd.append('square_size_mm', $('in-board-mm').value);
         pendingImportFiles.forEach(f => {
           fd.append('files', f, f.webkitRelativePath || f.name);
         });
@@ -1133,6 +1197,7 @@ function bindActions() {
           dir: $('in-import-dir').value,
           mode,
           move: $('in-import-move').checked,
+          board: boardPayload(),
         });
       }
       log(data.log);

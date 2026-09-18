@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-TESTS = ('test_lut_roundtrip.py', 'test_export_transaction.py')
+TESTS = ('test_board_spec.py', 'test_lut_roundtrip.py', 'test_export_transaction.py')
 
 
 def main() -> int:

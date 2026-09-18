@@ -19,6 +19,7 @@ C 头文件（Map.h）。读取统一走主脚本的 core.load_map_pair，这样
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -45,6 +46,7 @@ FIXED_POINT = core.TABLE_FIXED_POINT
 TABLE_SHAPE: tuple[int, int] | None = None   # (W, H)
 IMAGE_SIZE: tuple[int, int] = (0, 0)         # 源图尺寸，来自 calib.json
 KNEW: np.ndarray | None = None               # 去畸变输出矩阵，来自 matrices.json
+IS_TEXT_TABLE = True                         # 表格式是否为 %.2f 文本，影响量化容差
 SKIPPED = 0                                  # 因降采样而跳过的检查条数
 
 
@@ -157,13 +159,23 @@ def check_export_fidelity(root: Path, calib: dict, matrices: dict) -> bool:
     good = ~(bad_ex | bad_ey)
     err = np.hypot(ax[good] - fx[good], ay[good] - fy[good])
     max_err = float(err.max()) if err.size else 0.0
-    step = 1.0 / (1 << FIXED_POINT)
-    tol = 0.01 + step      # 文本是 %.2f，定点是 1/2^N，各留一点浮点余量
+    tol = quant_tolerance()
 
     ok = mismatch == 0 and max_err <= tol
     return report('落盘表 == 流水线重算', ok,
                   f'最大差 {max_err:.4f} px（容差 {tol:.4f}），'
                   f'有效点 {int(good.sum())}，无效判定不一致 {mismatch} 个')
+
+
+def quant_tolerance() -> float:
+    """落盘量化的理论最大误差。
+
+    单轴最多差半个量化步长（文本是 %.2f 即 0.005，定点是 0.5/2^N）；
+    两轴合成后是二维欧氏距离，最大 sqrt(2) 倍。以前写成 `0.01 + step`，
+    对文本表偏松约 7 倍、对 Q0 偏松到 1.01 px，几乎没有判别力。
+    """
+    half_axis = 0.005 if IS_TEXT_TABLE else 0.5 / (1 << FIXED_POINT)
+    return float(np.sqrt(2.0) * half_axis + 1e-6)
 
 
 _REF_CACHE: dict = {}
@@ -175,50 +187,84 @@ def load_reference_image(root: Path, size: tuple[int, int]) -> np.ndarray:
     必须是标定时用的同一张。ipm_input/ 里通常躺着多张候选，随手挑一张会让
     "表重建 vs 参考实现"的比较彻底失去意义——两张不同的图本来就该不一样，
     差异率会直接飙到几十个百分点，看起来像表坏了。
-    优先读 ipm_state.json 记录的原图，其次才退到约定名和目录首张。
+
+    判定顺序（越往下越弱）：
+      1. ipm_state.json 记的相对路径 + src_sha256 都对上  → 这就是当时那张
+      2. 路径失效但同名图哈希能对上                        → 依然是当时那张
+      3. 只有老状态文件（没记哈希）                        → 按路径/文件名取，并明确警告
+      4. 都找不到                                          → 报错退出，不猜
     """
     key = (str(root), size)
     if key in _REF_CACHE:
         return _REF_CACHE[key]
 
     candidates: list[Path] = []
+    recorded: str | None = None
+    want_sha: str | None = None
     state_path = root / 'matrix' / 'ipm_state.json'
     if state_path.is_file():
         try:
-            recorded = json.loads(state_path.read_text(encoding='utf-8')).get('src_image')
+            state = json.loads(state_path.read_text(encoding='utf-8'))
         except json.JSONDecodeError:
-            recorded = None
-        if recorded:
-            p = Path(recorded)
-            if p.is_file():
-                candidates.append(p)
-            else:
-                # 工程被搬过家、或目录结构调整过：记录的绝对路径失效，
-                # 但同名图多半还在 ipm_input/ 下。
-                # 先按文件名捞一次——直接退回"目录里第一张"会挑到另一张图，
-                # 让后面的逐像素比对彻底失去意义。
-                by_name = root / 'ipm_input' / p.name
-                if by_name.is_file():
-                    print(f'  提示: 记录的原图路径已失效，改用同名图 {by_name.name}。')
-                    candidates.append(by_name)
-                else:
-                    print(f'  提示: ipm_state.json 记录的原图已不在 {p}，退回目录内查找。')
+            state = {}
+        recorded = state.get('src_image')
+        want_sha = state.get('src_sha256')
+
+    if recorded:
+        p = Path(recorded)
+        recorded_path = p if p.is_absolute() else (root / p)
+        if recorded_path.is_file():
+            candidates.append(recorded_path)
+        by_name = root / 'ipm_input' / p.name
+        if by_name.is_file() and by_name not in candidates:
+            candidates.append(by_name)
+
     preferred = root / 'ipm_input' / 'UnInverseImage.jpg'
-    if preferred.is_file():
+    if preferred.is_file() and preferred not in candidates:
         candidates.append(preferred)
-    if not candidates:
-        candidates = sorted((root / 'ipm_input').glob('*.jpg'))
+    for extra in sorted((root / 'ipm_input').glob('*.jpg')):
+        if extra not in candidates:
+            candidates.append(extra)
+
     if not candidates:
         raise SystemExit(f'{root / "ipm_input"} 下没有可用于比对的图片。')
 
-    src = core.safe_imread(candidates[0])
+    chosen = None
+    if want_sha:
+        # 有哈希就认哈希：只有内容完全一致的才算"当时那张"
+        for c in candidates:
+            if _sha256(c) == want_sha:
+                chosen = c
+                break
+        if chosen is None:
+            raise SystemExit(
+                '找不到与 ipm_state.json 记录的内容哈希一致的原图，无法做有意义的比对。\n'
+                f'  期望 sha256 = {want_sha}\n'
+                f'  已试过: {", ".join(c.name for c in candidates)}\n'
+                '把标定时用的那张原图放回 ipm_input/ 再跑，或重做逆透视标定。')
+        if chosen.name != Path(recorded).name:
+            print(f'  提示: 记录的路径已失效，按内容哈希找到同一张图 {chosen.name}。')
+    else:
+        chosen = candidates[0]
+        print('  警告: ipm_state.json 里没有内容哈希（旧版本写的），'
+              f'只能按路径/文件名取 {chosen.name}，无法证明是当时那张。')
+
+    src = core.safe_imread(chosen)
     if src is None:
-        raise SystemExit(f'无法读取 {candidates[0]}')
-    print(f'  比对源图: {candidates[0].name}')
-    if (src.shape[1], src.shape[0]) != size:
-        src = cv2.resize(src, size)
+        raise SystemExit(f'无法读取 {chosen}')
+    print(f'  比对源图: {chosen.name}')
+    src = core.normalize_camera_image(src, size, f'验证参考图 {chosen.name}')
     _REF_CACHE[key] = src
     return src
+
+
+def _sha256(path: Path) -> str:
+    """文件的 SHA-256，用于确认"是不是当时那张原图"。"""
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for block in iter(lambda: fh.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
 
 
 def compare_images(a: np.ndarray, b: np.ndarray,
@@ -432,7 +478,7 @@ def print_table_inventory(root: Path) -> None:
 
 def main() -> int:
     """入口。"""
-    global FIXED_POINT, TABLE_SHAPE, IMAGE_SIZE, SKIPPED
+    global FIXED_POINT, TABLE_SHAPE, IMAGE_SIZE, SKIPPED, IS_TEXT_TABLE
 
     root = (Path(sys.argv[1]).resolve() if len(sys.argv) > 1
             else Path(__file__).resolve().parent.parent)
@@ -450,6 +496,7 @@ def main() -> int:
     # Q0 是合法配置，不能用 `or 4` 兜底——0 在这里会被当成假值，静默变成 Q4
     _fp = matrices.get('table_fixed_point')
     FIXED_POINT = 4 if _fp is None else int(_fp)
+    IS_TEXT_TABLE = fmt == 'txt'
 
     # 表被重采样过就用重采样后的网格，否则与标定分辨率同尺寸
     IMAGE_SIZE = (int(calib['image_width']), int(calib['image_height']))

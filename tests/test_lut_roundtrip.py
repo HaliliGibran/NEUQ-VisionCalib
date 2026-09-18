@@ -55,6 +55,21 @@ def synth_camera(size=SRC_SIZE):
     return K, D
 
 
+def new_camera_matrix(K, D, alpha, size=SRC_SIZE):
+    """算出生产代码真正会用的 Knew。
+
+    resolve_new_camera_matrix() 的第三个参数是 img_size，而 alpha 读的是模块
+    全局 UNDIST_ALPHA——所以必须真的把全局设过去，否则 alpha=None 与 alpha=0.5
+    两组会拿到完全相同的 Knew，Knew 这一维等于没测。
+    """
+    old = core.UNDIST_ALPHA
+    try:
+        core.UNDIST_ALPHA = alpha
+        return np.asarray(core.resolve_new_camera_matrix(K, D, size), dtype=np.float64)
+    finally:
+        core.UNDIST_ALPHA = old
+
+
 def synth_ipm(K, D, Knew, heading, size=SRC_SIZE):
     """合成一组自洽的逆透视标定：H = T(anchor) @ S(scale) @ R(heading) @ H0。"""
     w, h = size
@@ -88,10 +103,13 @@ def run_case(fmt, table_size, fp, heading, alpha, tmp: Path) -> bool:
         core.TABLE_FIXED_POINT = fp
 
     K, D = synth_camera()
-    Knew = np.asarray(core.resolve_new_camera_matrix(K, D, alpha), dtype=np.float64)
+    Knew = new_camera_matrix(K, D, alpha)
     H, H0, sign, quad, phys_w, phys_h, anchor = synth_ipm(K, D, Knew, heading)
 
     ok = True
+    ok &= check(np.array_equal(Knew, K) == (alpha is None),
+                'Knew 维度真的生效（alpha 非 None 时 Knew != K）',
+                f'alpha={alpha}')
     table_root = tmp / 'tables'
     pair = core.export_composite_tables(K, D, Knew, H, H0, sign, SRC_SIZE,
                                         table_root=table_root)

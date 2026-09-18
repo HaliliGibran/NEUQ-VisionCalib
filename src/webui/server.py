@@ -267,6 +267,8 @@ def api_status() -> dict:
         'root': str(core.SCRIPT_DIR),
         'dirs': dirs,
         'calib': calib,
+        'calib_board': core.calib_board_meta(),
+        'board': board_payload(),
         'ipm_state': core.load_ipm_state(),
         'ipm_candidates': [p.name for p in core.list_images(core.DIR_IPM_IN)],
         'ipm_source': safe_rel(STATE['src_path']) if STATE['src_path'] else None,
@@ -322,6 +324,7 @@ def api_upload_import(fields: dict, files: list) -> dict:
     "选了文件夹"这件事只能靠把文件真的传上来完成——让服务端拿一个文件夹名
     去磁盘上猜位置，改个名、挪个地方就必然失败。
     """
+    _apply_board_if_given(fields)
     if not files:
         raise ValueError('没有选中任何文件。')
 
@@ -360,8 +363,52 @@ def api_upload_import(fields: dict, files: list) -> dict:
             'summary': summary, 'folder': folder, 'uploaded': written}
 
 
+def board_payload() -> dict:
+    """当前生效的标定板规格，供界面回显。"""
+    b = core.BOARD
+    return {
+        'squares_x': b.squares_x,
+        'squares_y': b.squares_y,
+        'square_size_mm': b.square_size_mm,
+        'corners_x': b.corners[0],
+        'corners_y': b.corners[1],
+        'label': b.label,
+        'is_default': b == core.DEFAULT_BOARD,
+    }
+
+
+def apply_board(body: dict) -> dict:
+    """设置标定板规格。
+
+    规格决定"一张图算棋盘照还是地面照"，所以必须能在导入之前设定；
+    导入/标定接口也会带上它，避免用户改了网页却没生效。
+    """
+    if 'squares_x' not in body or 'squares_y' not in body:
+        raise ValueError('需要给出 squares_x 与 squares_y。')
+    try:
+        spec = core.CheckerboardSpec(
+            int(body['squares_x']), int(body['squares_y']),
+            float(body.get('square_size_mm') or core.DEFAULT_BOARD.square_size_mm))
+    except ValueError as exc:
+        raise ValueError(str(exc))
+    core.configure_board(spec)
+    return board_payload()
+
+
+def api_board(body: dict) -> dict:
+    """设置规格的接口包装。"""
+    return apply_board(body)
+
+
+def _apply_board_if_given(body: dict) -> None:
+    """导入/标定请求里带了 board 就先应用，保证该轮操作用的是同一份规格。"""
+    if body.get('board'):
+        apply_board(body['board'])
+
+
 def api_import(body: dict) -> dict:
     """导入混合素材目录。"""
+    _apply_board_if_given(body)
     raw = (body.get('dir') or '').strip()
     if not raw:
         raise ValueError('请填写素材目录。')
@@ -572,6 +619,7 @@ def api_calibrate(body: dict) -> dict:
 
     返回 fit_result 是给前端画柱状图用的——逐帧误差、接受/被剔除的清单、整体 RMS。
     """
+    _apply_board_if_given(body)
     err = body.get('max_reproj_err')
     core.MAX_REPROJ_ERR = float(err) if err not in (None, '') else None
 
@@ -725,16 +773,13 @@ def api_commit(body: dict) -> dict:
 
     buf = io.StringIO()
     with redirect_stdout(buf):
-        core.safe_imwrite(core.IPM_RESULT, cal.birdview)
-        print('去畸变逆透视结果图已保存:', core.IPM_RESULT)
-
         over_crop = cal.is_over_crop()
         if over_crop:
             print(f'警告: scale={cal.scale:.3f} 超过不裁切视野的上限 '
                   f'{cal.max_scale:.3f} px/cm，导出的表已裁掉部分有效视野。')
 
-        # 状态文件不单独保存，交给 export_all 随事务一起提交，
-        # 免得导出失败后留下"新状态 + 旧矩阵"。
+        # 状态文件与结果图都不单独保存，随 export_all 的事务一起提交，
+        # 免得导出失败后留下"新状态/新结果图 + 旧矩阵"。
         ipm_state = core.build_ipm_state(cal, p['phys_w'], p['phys_h'],
                                          img_size, STATE['src_path'])
 
@@ -754,6 +799,9 @@ def api_commit(body: dict) -> dict:
             'max_range_cm': core.MAX_RANGE_CM,
             'max_lateral_cm': core.MAX_LATERAL_CM,
         }, img_size, ipm_state=ipm_state)
+        # 导出已成功，这时才写结果图（与矩阵、查找表同属一批产物）
+        core.safe_imwrite(core.IPM_RESULT, cal.birdview)
+        print('去畸变逆透视结果图已保存:', core.IPM_RESULT)
         core.batch_test(pair)
         print('\n全部完成。')
     log = buf.getvalue()
@@ -863,6 +911,7 @@ class Handler(BaseHTTPRequestHandler):
             '/api/batch': lambda b: api_batch(),
             '/api/backup_clear': lambda b: api_backup_clear(b),
             '/api/clear_all': lambda b: api_clear_all(b),
+            '/api/board': lambda b: api_board(b),
             '/api/shutdown': lambda b: api_shutdown(),
         }
         handler = routes.get(parsed.path)

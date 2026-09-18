@@ -142,6 +142,66 @@ def main() -> int:
             check((tree_hash(core.DIR_TABLE), tree_hash(core.DIR_MATRIX)) == hashes,
                   '两个目录一起回到原样（没有新 LUT + 旧 matrix）')
             check(leftovers(root) == [], '无 .staging/.old 残留', str(leftovers(root)))
+        # ---------- D. 模拟"昨天导出、关程序、今天打开直接批量测试"
+        # 这一条专治"重启后读表"这一类缺陷：bin 的 Q 位数、网格尺寸、
+        # 源图分辨率都必须从落盘产物里恢复出来，而不是靠进程内的残留全局值。
+        print('\n[D] 重启后读回并批量测试（bin + Q2 + 320x240）')
+        core.TABLE_FORMAT = 'bin'
+        core.TABLE_FIXED_POINT = 2
+        core.TABLE_SIZE = (320, 240)
+        core.export_all(K, D, Knew, H, H0, sign, extra, SRC_SIZE,
+                        ipm_state=ipm_state)
+        hashes = (tree_hash(core.DIR_TABLE), tree_hash(core.DIR_MATRIX))
+
+        # 模拟程序重启：全局回到默认值，进程里不保留任何上一轮的信息
+        core.TABLE_FORMAT = 'txt'
+        core.TABLE_FIXED_POINT = 4
+        core.TABLE_SIZE = None
+
+        pair = core.load_exported_reverse_pair(SRC_SIZE)
+        check(pair.size == (320, 240), '读回的输出网格 == 导出时的网格',
+              f'{pair.size}')
+        check(pair.fixed_point == 2, '读回的定点位数 == 导出时的 Q2',
+              f'{pair.fixed_point}')
+        check(pair.source_size == SRC_SIZE, '读回的源图分辨率 == 标定分辨率',
+              f'{pair.source_size}')
+
+        test_in, test_out = root / 'test_input', root / 'test_output'
+        test_in.mkdir(parents=True, exist_ok=True)
+        rng = np.random.default_rng(11)
+        core.safe_imwrite(test_in / 'r.jpg',
+                          rng.integers(0, 255, (SRC_SIZE[1], SRC_SIZE[0], 3),
+                                       dtype=np.uint8))
+        core.DIR_TEST_IN, core.DIR_TEST_OUT = test_in, test_out
+        core.batch_test(pair)
+        outs = sorted(test_out.glob('*.jpg'))
+        check(len(outs) == 1, '批量测试产出 1 张')
+        if outs:
+            got = core.safe_imread(outs[0])
+            check((got.shape[1], got.shape[0]) == (320, 240),
+                  '输出网格 == 最终表网格 320x240',
+                  f'{got.shape[1]}x{got.shape[0]}')
+        check(leftovers(root) == [], '无 .staging/.old 残留', str(leftovers(root)))
+
+        # ---------- E. metadata 自描述：把 matrices.json 拿掉也要能读
+        print('\n[E] 删掉 matrices.json 后仍能读 bin 表（靠 metadata.json 自描述）')
+        (core.DIR_MATRIX / 'matrices.json').rename(root / 'matrices.json.bak')
+        try:
+            pair2 = core.load_exported_reverse_pair(SRC_SIZE)
+            check(pair2.size == (320, 240) and pair2.fixed_point == 2,
+                  '无 matrices.json 也能正确解码',
+                  f'{pair2.size} Q{pair2.fixed_point}')
+        except SystemExit as exc:
+            check(False, '无 matrices.json 也能正确解码', str(exc))
+        finally:
+            (root / 'matrices.json.bak').rename(core.DIR_MATRIX / 'matrices.json')
+
+        # 收尾：把这轮改过的全局还原，免得影响后续段落
+        core.TABLE_FORMAT = 'txt'
+        core.TABLE_FIXED_POINT = 4
+        core.TABLE_SIZE = None
+        core.DIR_TEST_IN = core.SCRIPT_DIR / 'test_input'
+        core.DIR_TEST_OUT = core.SCRIPT_DIR / 'test_output'
     except Exception:  # noqa: BLE001
         print(traceback.format_exc())
         FAILED.append('未捕获异常')

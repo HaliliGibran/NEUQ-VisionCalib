@@ -375,8 +375,12 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   .gallery-viewer { height: 64%; }
 }
 
-/* 退出后整页替换成的收尾提示 */
-.quit-screen {
+/* 标定板规格的三个数字并排 */
+.board-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.board-row label { flex: 1 1 30%; margin: 0; }
+.board-row input { width: 100%; }
+
+/* 退出后整页替换成的收尾提示 */.quit-screen {
   margin: auto;
   padding: 40px 48px;
   text-align: center;

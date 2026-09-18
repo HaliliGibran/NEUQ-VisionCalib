@@ -41,6 +41,7 @@ T/S/R 第三行均为 [0,0,1]，故 H[2,:] 恒等于 H0[2,:]，地平线只随�
 """
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -54,14 +55,122 @@ import numpy as np
 
 # ---------------------------------------------------------------- 配置
 
-# 棋盘格：assets/checkerboard/ 里是 12x9 方格、20mm。
-# OpenCV 需要的是内角点数，即 (12-1, 9-1)。
-CHESSBOARD_CORNERS = (11, 8)
-SQUARE_SIZE_MM = 20.0
+TOOL_VERSION = '0.1.0'
+# 落盘 JSON（calib.json / matrices.json / ipm_state.json / 查找表 metadata.json）的
+# 结构版本。改字段语义时 +1，别让后人拿着旧文件跑新程序、字段都在但含义变了。
+SCHEMA_VERSION = 1
 
-# 子网格搜索用的内角点阵，从大到小试。棋盘被裁切时完整板检不出，但局部往往仍是
-# 一个规则子网格——用它区分"拍不全的棋盘照"和"根本没有棋盘的地面照"。
-PARTIAL_GRID_SIZES = ((9, 6), (7, 5), (6, 4), (5, 3))
+
+@dataclass(frozen=True)
+class CheckerboardSpec:
+    """标定板规格。
+
+    入口刻意用"方格数"而不是"内角点数"：用户手上拿的是 12x9 个方格的棋盘，
+    而 OpenCV 要的是 11x8 个内角点。"我明明打印的是 12x9，程序为什么让我填 11x8"
+    是这一环最经典的填错来源，所以界面上只问方格数，内角点数由程序换算并显示。
+
+    这个规格不只用于相机标定：素材导入时区分"棋盘照 / 地面照"用的也是它，
+    所以它属于**当前标定工程的前置配置**，必须在导入之前就确定下来。
+    """
+
+    squares_x: int = 12
+    squares_y: int = 9
+    square_size_mm: float = 20.0
+
+    def __post_init__(self) -> None:
+        # 内角点至少 4x3 才有稳定的标定意义；低于这个数不做限制，
+        # 而是一开始就拦住——否则要等到标定跑完才发现检测不到。
+        if self.squares_x < 5 or self.squares_y < 4:
+            raise ValueError(
+                f'方格数至少 5x4（对应内角点 4x3），收到 '
+                f'{self.squares_x}x{self.squares_y}。')
+        if not self.square_size_mm > 0:
+            raise ValueError(f'单格边长必须为正数，收到 {self.square_size_mm}。')
+
+    @property
+    def corners(self) -> Tuple[int, int]:
+        """OpenCV 需要的内角点数 (cols, rows)。"""
+        return self.squares_x - 1, self.squares_y - 1
+
+    @property
+    def label(self) -> str:
+        """给人和日志看的一行描述。"""
+        return (f'{self.squares_x}x{self.squares_y} 方格'
+                f'（内角点 {self.corners[0]}x{self.corners[1]}），'
+                f'单格 {self.square_size_mm:g} mm')
+
+    def to_dict(self) -> dict:
+        """完整写进 calib.json，好让日后能追溯"这份内参是哪块棋盘算出来的"。"""
+        return {
+            'type': 'checkerboard',
+            'squares_x': int(self.squares_x),
+            'squares_y': int(self.squares_y),
+            'corners_x': int(self.corners[0]),
+            'corners_y': int(self.corners[1]),
+            'square_size_mm': float(self.square_size_mm),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'CheckerboardSpec':
+        """从 calib.json 的 board 段还原；缺字段时按默认规格补齐。"""
+        corners = data.get('corners')
+        if data.get('squares_x') is not None:
+            return cls(int(data['squares_x']), int(data['squares_y']),
+                       float(data.get('square_size_mm') or 20.0))
+        if corners:                       # 只记了内角点的老文件
+            return cls(int(corners[0]) + 1, int(corners[1]) + 1,
+                       float(data.get('square_size_mm') or 20.0))
+        return cls()
+
+    @property
+    def partial_grids(self) -> Tuple[Tuple[int, int], ...]:
+        """子网格搜索用的内角点阵，从大到小。
+
+        棋盘被裁切时完整板检不出，但局部往往仍是一个规则子网格——用它区分
+        "拍不全的棋盘照"和"根本没有棋盘的地面照"。候选必须随规格走：
+        固定写死 (9,6)(7,5)... 只对 11x8 内角点成立，换块小棋盘就全不合理了。
+        """
+        cols, rows = self.corners
+        out: List[Tuple[int, int]] = []
+        for dx, dy in ((2, 2), (4, 3), (5, 4), (6, 5)):
+            g = (cols - dx, rows - dy)
+            if g[0] >= 4 and g[1] >= 3 and g not in out and g != self.corners:
+                out.append(g)
+        return tuple(out)
+
+
+DEFAULT_BOARD = CheckerboardSpec()
+
+# 当前工程的标定板规格。命令行 --board-squares / 网页上的规格卡片都会改它，
+# 之后素材导入、在线拍摄、相机标定、结果落盘全部读这一份，不再各留一套常量。
+BOARD: CheckerboardSpec = DEFAULT_BOARD
+
+
+def configure_board(spec: CheckerboardSpec) -> CheckerboardSpec:
+    """设置当前工程的标定板规格，返回生效后的对象。"""
+    global BOARD
+    BOARD = spec
+    return BOARD
+
+
+def resolve_board(squares: Optional[Sequence[int]] = None,
+                  corners: Optional[Sequence[int]] = None,
+                  square_size_mm: Optional[float] = None) -> CheckerboardSpec:
+    """把命令行上的棋盘参数解析成规格对象。
+
+    --board-squares 是推荐的入口（和用户数棋盘的方式一致）；
+    --board-corners 只作为兼容通道保留。两者同时给直接报错，不猜。
+    """
+    if squares is not None and corners is not None:
+        raise SystemExit('--board-squares 与 --board-corners 只能给一个（两者语义相同，'
+                         '同时给会互相矛盾）。')
+    size = (square_size_mm if square_size_mm is not None
+            else DEFAULT_BOARD.square_size_mm)
+    if corners is not None:
+        return CheckerboardSpec(int(corners[0]) + 1, int(corners[1]) + 1, size)
+    if squares is not None:
+        return CheckerboardSpec(int(squares[0]), int(squares[1]), size)
+    return CheckerboardSpec(DEFAULT_BOARD.squares_x, DEFAULT_BOARD.squares_y, size)
 
 # 拍不全的棋盘照的归置目录（calib_input/ 的子目录）。放在子目录里是因为
 # list_images 不递归，这样它们既不会被误当成地面照，也不会进标定数据集被反复剔除。
@@ -301,7 +410,8 @@ def safe_imwrite(path: Path, img: np.ndarray, quality: int = 95) -> None:
 SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
 
 
-def detect_chessboard(gray: np.ndarray, fast: bool = False
+def detect_chessboard(gray: np.ndarray, fast: bool = False,
+                      board: Optional[CheckerboardSpec] = None
                       ) -> Tuple[bool, Optional[np.ndarray]]:
     """检出棋盘内角点，全部检出才算成功。
 
@@ -314,17 +424,19 @@ def detect_chessboard(gray: np.ndarray, fast: bool = False
     必须换成 ChArUco 板——每个格子有唯一编码，才能把局部角点对上正确的物理坐标。
 
     fast=True 用于实时预览，跳过耗时的 EXHAUSTIVE/ACCURACY 搜索。
+    board 不给时用当前工程的规格（core.BOARD）。
     """
+    spec = BOARD if board is None else board
     if hasattr(cv2, 'findChessboardCornersSB'):
         flags = cv2.CALIB_CB_NORMALIZE_IMAGE
         if not fast:
             flags |= cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
-        found, corners = cv2.findChessboardCornersSB(gray, CHESSBOARD_CORNERS, flags)
+        found, corners = cv2.findChessboardCornersSB(gray, spec.corners, flags)
         if found:
             return True, corners
 
     found, corners = cv2.findChessboardCorners(
-        gray, CHESSBOARD_CORNERS,
+        gray, spec.corners,
         flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
     if not found:
         return False, None
@@ -332,7 +444,9 @@ def detect_chessboard(gray: np.ndarray, fast: bool = False
     return True, corners
 
 
-def detect_chessboard_partial(gray: np.ndarray) -> Optional[Tuple[int, int]]:
+def detect_chessboard_partial(gray: np.ndarray,
+                              board: Optional[CheckerboardSpec] = None
+                              ) -> Optional[Tuple[int, int]]:
     """用更小的内角点阵去匹配画面里的局部棋盘，返回命中的尺寸，全不中返回 None。
 
     用途是把"棋盘没拍全的照片"和"压根没有棋盘的地面照"分开。完整棋盘要求整块可见，
@@ -340,14 +454,18 @@ def detect_chessboard_partial(gray: np.ndarray) -> Optional[Tuple[int, int]]:
     后者才是真正的逆透视候选。只靠"完整板检没检出"这一个二值判断，会把拍不全的
     棋盘照误当成地面照塞进 ipm_input/，让用户在挑原图时莫名其妙看到一张棋盘。
 
+    候选尺寸由 board.partial_grids 按当前规格动态生成（见 CheckerboardSpec），
+    不能写死：换一块小棋盘之后，固定候选就全不合理了。
+
     实测（38 张现场素材）：8 张地面照连 5x3 子网格都检不出，唯一那张拍不全的棋盘照
     稳定命中 5x3，区分度是干净的。
     """
+    spec = BOARD if board is None else board
     if not hasattr(cv2, 'findChessboardCornersSB'):
         return None
     flags = (cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_EXHAUSTIVE
              | cv2.CALIB_CB_ACCURACY)
-    for size in PARTIAL_GRID_SIZES:
+    for size in spec.partial_grids:
         found, _corners = cv2.findChessboardCornersSB(gray, size, flags)
         if found:
             return size
@@ -396,8 +514,12 @@ def capture_calibration_images() -> None:
             found, corners = detect_chessboard(to_gray(frame), fast=True)
             view = frame.copy()
             if corners is not None:
-                cv2.drawChessboardCorners(view, CHESSBOARD_CORNERS, corners, found)
+                cv2.drawChessboardCorners(view, BOARD.corners, corners, found)
             tip = f'detected={found}  saved={saved}  [space]save [enter]done'
+            # 把当前规格显示出来：换了棋盘却忘了改参数时，画面会一直 detected=False，
+            # 用户很容易去怀疑相机或代码，其实只是规格没切过来。
+            cv2.putText(view, f'board {BOARD.squares_x}x{BOARD.squares_y} squares',
+                        (8, 34), cv2.FONT_HERSHEY_PLAIN, 1.0, (255, 255, 0), 1)
             cv2.putText(view, tip, (8, 18), cv2.FONT_HERSHEY_PLAIN, 1.0,
                         (0, 255, 0) if found else (0, 0, 255), 1)
             cv2.imshow(win, view)
@@ -487,11 +609,11 @@ def calibrate_camera() -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
         raise SystemExit(f'{DIR_CALIB_IN} 中标定图不足（当前 {len(files)} 张），'
                          '至少需要 3 张，建议 15 张以上。')
 
-    cols, rows = CHESSBOARD_CORNERS
+    cols, rows = board.corners
     # OpenCV 的 calibrateCamera 要求 objectPoints 为 Point3f，必须是 float32。
     objp = np.zeros((rows * cols, 3), dtype=np.float32)
     objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
-    objp *= SQUARE_SIZE_MM
+    objp *= board.square_size_mm
 
     obj_points: List[np.ndarray] = []
     img_points: List[np.ndarray] = []
@@ -534,8 +656,8 @@ def calibrate_camera() -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
 
         found, corners = detect_chessboard(gray)
         if not found or corners is None:
-            failed.append(f'{path.name}（未检出完整 {CHESSBOARD_CORNERS[0]}x'
-                          f'{CHESSBOARD_CORNERS[1]} 内角点）')
+            failed.append(f'{path.name}（未检出完整 {BOARD.corners[0]}x'
+                          f'{BOARD.corners[1]} 内角点，当前规格 {BOARD.label}）')
             continue
         obj_points.append(objp.copy())
         img_points.append(np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2))
@@ -546,10 +668,10 @@ def calibrate_camera() -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
         for item in failed:
             print('  ', item)
         if len(failed) > len(files) // 2:
-            px_per_square = min(img_size[0] / (CHESSBOARD_CORNERS[0] + 1),
-                                img_size[1] / (CHESSBOARD_CORNERS[1] + 1))
+            px_per_square = min(img_size[0] / (BOARD.corners[0] + 1),
+                                img_size[1] / (BOARD.corners[1] + 1))
             print(f'  过半图片检出失败。当前 {img_size[0]}x{img_size[1]} 下 '
-                  f'{CHESSBOARD_CORNERS[0]}x{CHESSBOARD_CORNERS[1]} 内角点，'
+                  f'{BOARD.corners[0]}x{BOARD.corners[1]} 内角点，'
                   f'每格满屏时也只有约 {px_per_square:.0f} px；'
                   '低于 20 px 就很难稳定检出，建议换更粗的棋盘（更少角点、更大方格）重拍。')
 
@@ -644,11 +766,43 @@ def save_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int]) ->
         'image_height': int(img_size[1]),
         'camera_matrix': K.tolist(),
         'dist_coeffs': D.tolist(),
-        'chessboard_corners': list(CHESSBOARD_CORNERS),
-        'square_size_mm': SQUARE_SIZE_MM,
+        'schema_version': SCHEMA_VERSION,
+        'tool_version': TOOL_VERSION,
+        'board': BOARD.to_dict(),
+        # 老字段保留一轮：外部脚本或旧版网页可能还在读这两个键
+        'chessboard_corners': list(BOARD.corners),
+        'square_size_mm': BOARD.square_size_mm,
     }
     CALIB_JSON.write_text(json.dumps(payload, indent=2), encoding='utf-8')
     print('标定数据已保存:', CALIB_JSON)
+
+
+def calib_board_meta() -> Optional[dict]:
+    """读 calib.json 里记录的标定板规格，供界面回显。
+
+    没有它的话，过一阵子看到一份 calib.json 就只能猜"这是哪块棋盘算出来的"。
+    老文件只存了内角点，这里顺手换算成方格数，界面不必分两种格式显示。
+    """
+    if not CALIB_JSON.is_file():
+        return None
+    try:
+        data = json.loads(CALIB_JSON.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, OSError):
+        return None
+    board = data.get('board')
+    if board:
+        return board
+    corners = data.get('chessboard_corners')
+    if isinstance(corners, (list, tuple)) and len(corners) == 2:
+        return {
+            'type': 'checkerboard',
+            'squares_x': int(corners[0]) + 1,
+            'squares_y': int(corners[1]) + 1,
+            'corners_x': int(corners[0]),
+            'corners_y': int(corners[1]),
+            'square_size_mm': data.get('square_size_mm'),
+        }
+    return None
 
 
 def load_calibration() -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int]]]:
@@ -1288,6 +1442,9 @@ def export_matrices(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
     out_dir = Path(matrix_root) if matrix_root is not None else DIR_MATRIX
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
+        'schema_version': SCHEMA_VERSION,
+        'tool_version': TOOL_VERSION,
+        'board': BOARD.to_dict(),          # 这份矩阵是哪块棋盘标出来的
         'note': (
             '去畸变的非线性部分由 dist_coeffs 承载，无法写成矩阵；'
             f'因此原图->BirdView 的复合变换只以查表形式给出，见 {DIR_TABLE.name}/undistort/ '
@@ -1558,7 +1715,15 @@ def prepare_map_pair(map_x: np.ndarray, map_y: np.ndarray,
 
 
 def serialize_map_pair(pair: MapPair, out_dir: Path, tag: str, desc: str) -> None:
-    """把 MapPair 写成文件。只做序列化，不再改动任何数值。"""
+    """把 MapPair 写成文件，并附一份自描述的 metadata.json。
+
+    只做序列化，不再改动任何数值。
+
+    metadata.json 的意义在于让每套表**自带解释**：bin 是裸二进制，文件里既没有
+    网格也没有 Q 位数，只能反过来依赖 matrices.json——那份元数据一旦损坏或没跟着
+    搬走，同一串字节就会被按错误的方式解读（而且不报错）。自描述之后，
+    交付给 C 端也说得清楚。
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     clear_stale_tables(out_dir)
 
@@ -1570,6 +1735,22 @@ def serialize_map_pair(pair: MapPair, out_dir: Path, tag: str, desc: str) -> Non
     else:
         write_table_txt(out_dir / 'MapW.txt', pair.x)
         write_table_txt(out_dir / 'MapH.txt', pair.y)
+
+    meta = {
+        'schema_version': SCHEMA_VERSION,
+        'tool_version': TOOL_VERSION,
+        'format': TABLE_FORMAT,
+        'tag': tag,
+        'description': desc,
+        'direction': 'dst_to_src' if tag.endswith('reverse') else 'src_to_dst',
+        'grid_size': list(pair.size),
+        'source_size': list(pair.source_size),
+        'fixed_point': pair.fixed_point,
+        'invalid_sentinel': (-1.0 if TABLE_FORMAT == 'txt' else BIN_SENTINEL),
+        'coordinate_space': 'raw_distorted_px',
+    }
+    (out_dir / 'metadata.json').write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False), encoding='utf-8')
 
 
 def load_table(path: Path, fixed_point: Optional[int] = None,
@@ -1633,10 +1814,31 @@ def load_map_pair(folder: Path, source_size: Tuple[int, int],
                   fixed_point: Optional[int] = None) -> MapPair:
     """读回一组已落盘的表，还原成 MapPair（按 txt / bin / C 三种格式自动识别）。
 
+    优先用同目录的 metadata.json：它是和表一起写的自描述，网格与 Q 位数直接写在
+    里面，比调用方从别处推断可靠得多。老表没有 metadata 时才回退到传入参数。
+
     批量测试与校验脚本都走这条路，验证的就是"真正交出去的那一份"，
     而不是重算出来的数学结果。
     """
     folder = Path(folder)
+    meta: dict = {}
+    meta_path = folder / 'metadata.json'
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError):
+            meta = {}
+    if meta.get('grid_size'):
+        grid = tuple(int(v) for v in meta['grid_size'])
+    if meta.get('fixed_point') is not None:
+        fixed_point = int(meta['fixed_point'])
+    if meta.get('source_size'):
+        meta_src = tuple(int(v) for v in meta['source_size'])
+        if meta_src != tuple(source_size):
+            print(f'注意: {folder} 记录的原图分辨率 {meta_src} 与当前标定的 '
+                  f'{tuple(source_size)} 不一致，按表里记录的为准。')
+        source_size = meta_src
+
     fp = TABLE_FIXED_POINT if fixed_point is None else int(fixed_point)
     for suffix in ('.txt', '.bin'):
         wx, wy = folder / f'MapW{suffix}', folder / f'MapH{suffix}'
@@ -1872,8 +2074,13 @@ def _commit_dirs(pairs: Sequence[Tuple[Path, Path]]) -> None:
 # ---------------------------------------------------------------- 7. 批量测试
 
 def same_aspect(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
-    """两个分辨率是否同宽高比（1% 容差，容忍编码器把奇数边裁掉一个像素）。"""
-    return abs(a[0] / a[1] - b[0] / b[1]) <= 0.01 * (b[0] / b[1])
+    """两个分辨率是否同宽高比。
+
+    容差 0.2%：只够容纳"编码器把奇数边裁掉一两个像素"这类差别
+    （720p 上约 2~3 px）。放到 1% 就能容忍好几像素的裁剪甚至换了个 FOV，
+    那就失去把关的意义了。
+    """
+    return abs(a[0] / a[1] - b[0] / b[1]) <= 0.002 * (b[0] / b[1])
 
 
 def normalize_camera_image(img: np.ndarray, want_size: Tuple[int, int],
@@ -1977,6 +2184,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     path_g.add_argument('--test-dir', type=Path, help='批量测试输入目录')
     path_g.add_argument('--ipm-source', type=Path, help='直接指定逆透视标定原图')
 
+    board_g = ap.add_argument_group('标定板规格')
+    board_g.add_argument('--board-squares', nargs=2, type=int, metavar=('X', 'Y'),
+                         help='棋盘方格数，例如 12 9；默认 12 9。'
+                              '内角点数由程序换算（11x8），不用自己减 1')
+    board_g.add_argument('--board-corners', nargs=2, type=int, metavar=('X', 'Y'),
+                         help='兼容用法：直接给内角点数（如 11 8）。'
+                              '与 --board-squares 只能给一个')
+    board_g.add_argument('--square-size-mm', type=float, metavar='MM',
+                         help=f'单格边长毫米，默认 {DEFAULT_BOARD.square_size_mm:g}')
+
     cal_g = ap.add_argument_group('标定参数')
     cal_g.add_argument('--undist-alpha', type=float,
                        help='去畸变输出视角 0~1；不给等价 MATLAB 的 OutputView=same（Knew=K）')
@@ -2020,6 +2237,16 @@ def apply_options(args: argparse.Namespace) -> None:
     global UNDIST_ALPHA, MAX_RANGE_CM, MAX_LATERAL_CM, MAX_REPROJ_ERR
     global ANCHOR_X, ANCHOR_Y, HEADING_DEG, CAPTURE_SIZE, CAPTURE_ONLINE
     global TABLE_FORMAT, TABLE_SIZE, TABLE_FIXED_POINT
+
+    # 棋盘规格要在最前面定下来：素材导入是否把一张图判成棋盘照，用的就是它。
+    try:
+        board = resolve_board(args.board_squares, args.board_corners,
+                              args.square_size_mm)
+    except ValueError as exc:
+        raise SystemExit(f'标定板规格不合法: {exc}')
+    configure_board(board)
+    if board != DEFAULT_BOARD:
+        print(f'标定板规格: {board.label}')
 
     if args.undist_alpha is not None:
         UNDIST_ALPHA = args.undist_alpha
@@ -2142,7 +2369,7 @@ def import_dataset(src_dir: Path, move: bool = False,
     action = shutil.move if move else shutil.copy2
 
     print(f'导入 {src}')
-    print(f'  棋盘内角点 {CHESSBOARD_CORNERS[0]}x{CHESSBOARD_CORNERS[1]}，'
+    print(f'  标定板 {BOARD.label}，'
           f'共 {len(files)} 张，模式 {mode}，{"移动" if move else "复制"}到工程目录\n')
     calib_n = ipm_n = skip_n = dup_n = partial_n = 0
     for path in files:
@@ -2195,7 +2422,7 @@ def import_dataset(src_dir: Path, move: bool = False,
     parts.append('移动完成' if move else '复制完成')
     print(f'\n完成: ' + '，'.join(parts) + '。')
     if partial_n:
-        print(f'  「棋盘不全」指检不出完整 {CHESSBOARD_CORNERS[0]}x{CHESSBOARD_CORNERS[1]} '
+        print(f'  「棋盘不全」指检不出完整 {BOARD.corners[0]}x{BOARD.corners[1]} '
               f'但能匹配到局部子网格的照片，已归到 '
               f'{(DIR_CALIB_IN / INCOMPLETE_SUBDIR).relative_to(SCRIPT_DIR)}/。'
               '它们无法参与标定（标定要求整块棋盘可见），只是从地面候选里摘出来。')
@@ -2259,6 +2486,42 @@ def ipm_state_path() -> Path:
     return DIR_MATRIX / 'ipm_state.json'
 
 
+def file_sha256(path: Path, chunk: int = 1 << 20) -> str:
+    """算文件的 SHA-256。用来证明"就是当时那张原图"，而不是"名字碰巧一样"。"""
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        while True:
+            block = fh.read(chunk)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
+def recorded_source(path: Path) -> dict:
+    """把原图记成"工程内相对路径 + 内容哈希"。
+
+    不记绝对路径的原因有三：工程一搬家就失效；备份压缩包会把
+    C:\\Users\\某人\\... 一起带走；发给别人等于顺手泄漏本机目录结构。
+    哈希则让校验方能够**证明**用的是同一张图，而不是靠文件名猜。
+    """
+    p = Path(path).resolve()
+    rel = None
+    try:
+        rel = p.relative_to(SCRIPT_DIR).as_posix()
+    except ValueError:
+        rel = None                      # 不在工程内，只能靠名字 + 哈希
+    out = {'src_image': rel or p.name,
+           'src_image_in_project': rel is not None}
+    try:
+        out['src_sha256'] = file_sha256(p)
+    except OSError:
+        out['src_sha256'] = None
+    if rel is None:
+        out['src_image_external'] = True
+    return out
+
+
 def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
                     img_size: Tuple[int, int],
                     src_path: Optional[Path] = None) -> dict:
@@ -2268,6 +2531,8 @@ def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
     换成新的，要么一起保持旧的。否则导出中途失败会留下"新状态配旧矩阵"。
     """
     payload = {
+        'schema_version': SCHEMA_VERSION,
+        'tool_version': TOOL_VERSION,
         'H': cal.H.tolist(),
         'H0': cal.H0.tolist(),
         'horizon_sign': cal.sign,
@@ -2283,7 +2548,7 @@ def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
         'src_image_height': int(img_size[1]),
     }
     if src_path is not None:
-        payload['src_image'] = str(Path(src_path).resolve())
+        payload.update(recorded_source(src_path))
     return payload
 
 
@@ -2593,12 +2858,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     H = calibrator.H
     assert_invertible('H', H)
 
-    safe_imwrite(IPM_RESULT, calibrator.birdview)
-    print('去畸变逆透视结果图已保存:', IPM_RESULT)
-
-    # 状态文件不在这里写：它要和矩阵、查找表一起由 export_all 提交，
-    # 否则导出失败会留下"新状态配旧矩阵"。只有 --stage ipm 这种不导出的
-    # 情况才需要单独落盘。
+    # 结果图与状态都不在这里写：它们是这一轮产物的一部分，要和矩阵、查找表
+    # 一起在导出成功后落盘，否则导出失败会留下"新结果图配旧矩阵"的组合——
+    # 不影响 C 端，但会让人以为导出成了。只有 --stage ipm 不导出时才就地写。
     ipm_state = build_ipm_state(calibrator, phys_w, phys_h, img_size, src_path)
 
     over_crop = calibrator.is_over_crop()
@@ -2608,6 +2870,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
               '如需保留完整视野，重跑并按 f 吸附到 max_scale。')
 
     if stage == 'ipm':
+        safe_imwrite(IPM_RESULT, calibrator.birdview)
+        print('去畸变逆透视结果图已保存:', IPM_RESULT)
         save_ipm_state(calibrator, phys_w, phys_h, img_size, src_path)
         print('\n逆透视标定阶段完成。运行 --stage tables 可继续导出矩阵与查找表。')
         return
@@ -2627,6 +2891,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         'max_range_cm': MAX_RANGE_CM,
         'max_lateral_cm': MAX_LATERAL_CM,
     }, img_size, ipm_state=ipm_state)
+
+    # 导出已经成功，这时才写结果图：它和矩阵、查找表属于同一批产物
+    safe_imwrite(IPM_RESULT, calibrator.birdview)
+    print('去畸变逆透视结果图已保存:', IPM_RESULT)
     batch_test(pair)
 
     print('\n全部完成。')
