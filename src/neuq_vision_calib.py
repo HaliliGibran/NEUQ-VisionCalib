@@ -78,12 +78,14 @@ class CheckerboardSpec:
     square_size_mm: float = 20.0
 
     def __post_init__(self) -> None:
-        # 内角点至少 4x3 才有稳定的标定意义；低于这个数不做限制，
-        # 而是一开始就拦住——否则要等到标定跑完才发现检测不到。
-        if self.squares_x < 5 or self.squares_y < 4:
+        # 内角点短边至少 3、长边至少 4 才有稳定的标定意义。
+        # 刻意不假设"横向一定多于纵向"：4x5 与 5x4 方格只是转了 90°，
+        # 前者内角点 3x4、后者 4x3，应当一视同仁地接受或拒绝。
+        cx, cy = self.squares_x - 1, self.squares_y - 1
+        if min(cx, cy) < 3 or max(cx, cy) < 4:
             raise ValueError(
-                f'方格数至少 5x4（对应内角点 4x3），收到 '
-                f'{self.squares_x}x{self.squares_y}。')
+                f'内角点至少 3x4（即方格至少 4x5），收到 '
+                f'{self.squares_x}x{self.squares_y}（内角点 {cx}x{cy}）。')
         if not self.square_size_mm > 0:
             raise ValueError(f'单格边长必须为正数，收到 {self.square_size_mm}。')
 
@@ -112,14 +114,20 @@ class CheckerboardSpec:
 
     @classmethod
     def from_dict(cls, data: dict) -> 'CheckerboardSpec':
-        """从 calib.json 的 board 段还原；缺字段时按默认规格补齐。"""
-        corners = data.get('corners')
+        """从 calib.json 的 board 段还原；三种历史写法都能认。
+
+        注意边长不能用 `x or 20` 兜底：那样写下去，显式记录的 0 会被静默换成 20，
+        错误就被吞掉了。这里让 0 正常进入校验并明确报错。
+        """
+        raw = data.get('square_size_mm')
+        size = DEFAULT_BOARD.square_size_mm if raw is None else float(raw)
         if data.get('squares_x') is not None:
-            return cls(int(data['squares_x']), int(data['squares_y']),
-                       float(data.get('square_size_mm') or 20.0))
-        if corners:                       # 只记了内角点的老文件
-            return cls(int(corners[0]) + 1, int(corners[1]) + 1,
-                       float(data.get('square_size_mm') or 20.0))
+            return cls(int(data['squares_x']), int(data['squares_y']), size)
+        corners = data.get('corners')
+        if corners:
+            return cls(int(corners[0]) + 1, int(corners[1]) + 1, size)
+        if data.get('corners_x') is not None:
+            return cls(int(data['corners_x']) + 1, int(data['corners_y']) + 1, size)
         return cls()
 
     @property
@@ -129,12 +137,14 @@ class CheckerboardSpec:
         棋盘被裁切时完整板检不出，但局部往往仍是一个规则子网格——用它区分
         "拍不全的棋盘照"和"根本没有棋盘的地面照"。候选必须随规格走：
         固定写死 (9,6)(7,5)... 只对 11x8 内角点成立，换块小棋盘就全不合理了。
+        判据同样不假设方向，与 __post_init__ 的校验保持一致。
         """
         cols, rows = self.corners
         out: List[Tuple[int, int]] = []
         for dx, dy in ((2, 2), (4, 3), (5, 4), (6, 5)):
             g = (cols - dx, rows - dy)
-            if g[0] >= 4 and g[1] >= 3 and g not in out and g != self.corners:
+            if (min(g) >= 3 and max(g) >= 4
+                    and g not in out and g != self.corners):
                 out.append(g)
         return tuple(out)
 
@@ -602,18 +612,23 @@ def fit_camera(obj_points, img_points, used, img_size):
             obj_points, img_points, used, dropped, first_pass)
 
 
-def calibrate_camera() -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
-    """棋盘标定，返回 (K, D, (W, H))，并把每张图的重投影误差与去畸变预览一并输出。"""
+def calibrate_camera(board: Optional[CheckerboardSpec] = None
+                     ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], dict]:
+    """棋盘标定，返回 (K, D, (W, H), fit_result)，并把每张图的重投影误差与去畸变预览一并输出。
+
+    board 不给时用当前工程的规格（core.BOARD）；显式传入便于测试与将来拆分。
+    """
+    spec = BOARD if board is None else board
     files = list_images(DIR_CALIB_IN)
     if len(files) < 3:
         raise SystemExit(f'{DIR_CALIB_IN} 中标定图不足（当前 {len(files)} 张），'
                          '至少需要 3 张，建议 15 张以上。')
 
-    cols, rows = board.corners
+    cols, rows = spec.corners
     # OpenCV 的 calibrateCamera 要求 objectPoints 为 Point3f，必须是 float32。
     objp = np.zeros((rows * cols, 3), dtype=np.float32)
     objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
-    objp *= board.square_size_mm
+    objp *= spec.square_size_mm
 
     obj_points: List[np.ndarray] = []
     img_points: List[np.ndarray] = []
@@ -654,10 +669,10 @@ def calibrate_camera() -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
                           f'与 {img_size[0]}x{img_size[1]} 不一致）')
             continue
 
-        found, corners = detect_chessboard(gray)
+        found, corners = detect_chessboard(gray, board=spec)
         if not found or corners is None:
-            failed.append(f'{path.name}（未检出完整 {BOARD.corners[0]}x'
-                          f'{BOARD.corners[1]} 内角点，当前规格 {BOARD.label}）')
+            failed.append(f'{path.name}（未检出完整 {spec.corners[0]}x'
+                          f'{spec.corners[1]} 内角点，当前规格 {spec.label}）')
             continue
         obj_points.append(objp.copy())
         img_points.append(np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2))
@@ -668,10 +683,10 @@ def calibrate_camera() -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
         for item in failed:
             print('  ', item)
         if len(failed) > len(files) // 2:
-            px_per_square = min(img_size[0] / (BOARD.corners[0] + 1),
-                                img_size[1] / (BOARD.corners[1] + 1))
+            px_per_square = min(img_size[0] / (spec.corners[0] + 1),
+                                img_size[1] / (spec.corners[1] + 1))
             print(f'  过半图片检出失败。当前 {img_size[0]}x{img_size[1]} 下 '
-                  f'{BOARD.corners[0]}x{BOARD.corners[1]} 内角点，'
+                  f'{spec.corners[0]}x{spec.corners[1]} 内角点，'
                   f'每格满屏时也只有约 {px_per_square:.0f} px；'
                   '低于 20 px 就很难稳定检出，建议换更粗的棋盘（更少角点、更大方格）重拍。')
 
@@ -824,6 +839,7 @@ def load_calibration() -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int]
         raise SystemExit(f'{CALIB_JSON} 不是合法 JSON: {exc}')
     if not isinstance(data, dict):
         raise SystemExit(f'{CALIB_JSON} 顶层应为 JSON 对象。')
+    check_schema(data, str(CALIB_JSON))
 
     required = ('camera_matrix', 'dist_coeffs', 'image_width', 'image_height')
     missing = [k for k in required if k not in data]
@@ -1601,18 +1617,25 @@ def write_table_c(out_dir: Path, tag: str, desc: str,
     safe = ''.join(c if c.isalnum() else '_' for c in tag).upper()
     guard = f'NEUQ_MAP_{safe}_H'
     unit = 1 << TABLE_FIXED_POINT
+    sp = table_spaces(tag)
+    # forward 表的取值不是"去哪张源图采样"，而是"落到目标图哪里"。
+    # 注释不分方向地写"源图 W/H"，拿 forward 表的人一定会理解反。
+    use_note = (f'index {sp["index_desc"]}\n'
+                f' * value {sp["value_desc"]}\n'
+                f' * 用法: int16_t v = {safe}_mapW[y * {safe}_GRID_W + x];\n'
+                f' *       if (v == {safe}_INVALID) 丢弃该点，'
+                f'否则取坐标 = v / {unit}.0f（{sp["value_desc"]}）')
 
     body = f"""/* NEUQ 视觉标定工具自动生成，请勿手工修改。
  *
  * 映射: {desc}
+ * 方向: {sp['mapping_direction']}
  * 网格: {tw} x {th}（宽 x 高），按行优先，索引 = y * {tw} + x
- * 源图: {sw} x {sh} —— 表里的采样坐标是这张图上的像素坐标
- * 定点: Q{TABLE_FIXED_POINT}，实际像素坐标 = 表值 / {unit}.0f
- * 无效: {BIN_SENTINEL}，表示该输出点映射到无穷远、地平线另一侧或超出图像范围
+ * 完整图尺寸: {sw} x {sh}
+ * 定点: Q{TABLE_FIXED_POINT}，实际坐标 = 表值 / {unit}.0f
+ * 无效: {BIN_SENTINEL}，表示该点映射到无穷远、地平线另一侧或超出图像范围
  *
- * 用法: int16_t w = {safe}_mapW[y * {safe}_GRID_W + x];
- *       if (w == {safe}_INVALID) 填黑，否则采样坐标 = w / {unit}.0f
- *       （采样的是 {safe}_SRC_W x {safe}_SRC_H 的原图，不是网格尺寸）
+ * {use_note}
  */
 #ifndef {guard}
 #define {guard}
@@ -1742,13 +1765,15 @@ def serialize_map_pair(pair: MapPair, out_dir: Path, tag: str, desc: str) -> Non
         'format': TABLE_FORMAT,
         'tag': tag,
         'description': desc,
-        'direction': 'dst_to_src' if tag.endswith('reverse') else 'src_to_dst',
         'grid_size': list(pair.size),
         'source_size': list(pair.source_size),
         'fixed_point': pair.fixed_point,
         'invalid_sentinel': (-1.0 if TABLE_FORMAT == 'txt' else BIN_SENTINEL),
-        'coordinate_space': 'raw_distorted_px',
     }
+    meta.update(table_spaces(tag))
+    # 索引网格可能被 --table-size 降采样，但两侧的完整图像尺寸仍是标定分辨率
+    meta['index_full_size'] = list(pair.source_size)
+    meta['value_full_size'] = list(pair.source_size)
     (out_dir / 'metadata.json').write_text(
         json.dumps(meta, indent=2, ensure_ascii=False), encoding='utf-8')
 
@@ -1809,6 +1834,53 @@ def _load_c_header(path: Path, source_size: Tuple[int, int]) -> MapPair:
                    source_size=real_src, fixed_point=shift, qx=qs[0], qy=qs[1])
 
 
+def check_schema(data: dict, what: str) -> None:
+    """落盘文件的结构版本比本程序新时直接拒绝。
+
+    只写一个 schema_version 字段而没有这道闸，它就只是"文件里有个数字"；
+    它真正的用途是防止新版格式被旧程序误读（字段都在、含义已经变了，
+    比报错难查得多）。老文件没有这个字段则放行，按当前格式尽力读。
+    """
+    version = data.get('schema_version')
+    if version is None:
+        return
+    try:
+        version = int(version)
+    except (TypeError, ValueError):
+        raise SystemExit(f'{what} 的 schema_version 不是整数: {version!r}')
+    if version > SCHEMA_VERSION:
+        raise SystemExit(
+            f'{what} 的结构版本是 {version}，本程序只认到 {SCHEMA_VERSION}。\n'
+            '这份文件是更新版本的程序生成的，请升级后再读，'
+            '不要用旧版强行解析——字段可能都在，但含义已经变了。')
+
+
+def table_spaces(tag: str) -> dict:
+    """一套表的索引空间与取值空间。
+
+    四种表的语义各不相同，不能统一写一个 coordinate_space：
+      undistort reverse    : 索引 = 去畸变图像素，取值 = 原图采样坐标
+      undistort forward    : 索引 = 原图像素，    取值 = 去畸变图落点
+      undistort_ipm reverse: 索引 = BirdView 像素，取值 = 原图采样坐标
+      undistort_ipm forward: 索引 = 原图像素，    取值 = BirdView 落点
+    把 forward 表也标成 raw_distorted_px 会让 C 端直接理解反。
+    """
+    is_ipm = tag.startswith('undistort_ipm')
+    is_reverse = tag.endswith('reverse')
+    out_space = 'birdview_px' if is_ipm else 'undistorted_px'
+    if is_reverse:
+        return {'mapping_direction': 'dst_to_src',
+                'index_space': out_space,
+                'value_space': 'raw_distorted_px',
+                'index_desc': f'{out_space}（输出图像素）',
+                'value_desc': '原始畸变图上的采样坐标'}
+    return {'mapping_direction': 'src_to_dst',
+            'index_space': 'raw_distorted_px',
+            'value_space': out_space,
+            'index_desc': '原始畸变图像素',
+            'value_desc': f'{out_space}（输出图上的落点）'}
+
+
 def load_map_pair(folder: Path, source_size: Tuple[int, int],
                   grid: Optional[Tuple[int, int]] = None,
                   fixed_point: Optional[int] = None) -> MapPair:
@@ -1828,6 +1900,8 @@ def load_map_pair(folder: Path, source_size: Tuple[int, int],
             meta = json.loads(meta_path.read_text(encoding='utf-8'))
         except (json.JSONDecodeError, OSError):
             meta = {}
+    if meta:
+        check_schema(meta, str(meta_path))
     if meta.get('grid_size'):
         grid = tuple(int(v) for v in meta['grid_size'])
     if meta.get('fixed_point') is not None:
@@ -2195,6 +2269,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          help=f'单格边长毫米，默认 {DEFAULT_BOARD.square_size_mm:g}')
 
     cal_g = ap.add_argument_group('标定参数')
+    cal_g.add_argument('--force-calib', action='store_true',
+                       help='忽略已有的 calib.json，重新标定（换了标定板时必须）')
     cal_g.add_argument('--undist-alpha', type=float,
                        help='去畸变输出视角 0~1；不给等价 MATLAB 的 OutputView=same（Knew=K）')
     cal_g.add_argument('--max-reproj-err', type=float, metavar='PX',
@@ -2522,6 +2598,34 @@ def recorded_source(path: Path) -> dict:
     return out
 
 
+def spec_from_meta(meta: Optional[dict]) -> Optional[CheckerboardSpec]:
+    """把 calib.json 里的 board 段还原成规格对象；读不出来返回 None。"""
+    if not meta:
+        return None
+    try:
+        return CheckerboardSpec.from_dict(meta)
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def board_conflict(meta: Optional[dict],
+                   spec: Optional[CheckerboardSpec] = None) -> Optional[str]:
+    """已有 calib.json 与当前规格不一致时，返回一句给人看的说明；一致返回 None。
+
+    为什么要拦：复用旧 calib.json 时，K/D 来自当时那块棋盘，而界面/命令行上显示的
+    是现在这块。不拦的话会出现"界面写着 12x9、运行标定成功"，实际复用的却是
+    9x7 的旧参数——数学没变，但 provenance 被写错了，事后完全说不清。
+    """
+    saved = spec_from_meta(meta)
+    now = BOARD if spec is None else spec
+    if saved is None or saved == now:
+        return None
+    return (f'当前标定板规格与已有 calib.json 不一致：\n'
+            f'  当前：{now.label}\n'
+            f'  已有：{saved.label}\n'
+            '请改回已有规格，或勾选"强制重新标定"（命令行加 --force-calib）重标一次。')
+
+
 def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
                     img_size: Tuple[int, int],
                     src_path: Optional[Path] = None) -> dict:
@@ -2581,7 +2685,10 @@ def load_ipm_state() -> Optional[dict]:
         data = json.loads(p.read_text(encoding='utf-8'))
     except json.JSONDecodeError as exc:
         raise SystemExit(f'{p} 不是合法 JSON: {exc}')
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    check_schema(data, str(p))
+    return data
 
 
 def make_calibrator_from_quad(img: np.ndarray, quad: np.ndarray, phys_w: float,
@@ -2748,15 +2855,27 @@ def load_exported_reverse_pair(img_size: Tuple[int, int]) -> MapPair:
     return load_map_pair(folder, img_size, grid, fixed_point)
 
 
-def load_or_run_calibration() -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]:
-    """取得 (K, D, Knew, img_size)：有 calib.json 就直接用，没有则现场标定并落盘。"""
-    calib = load_calibration()
-    if calib is None:
-        print('未找到 calib.json，开始从标定照片重新标定。')
+def load_or_run_calibration(force: bool = False
+                            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]:
+    """取得 (K, D, Knew, img_size)：有 calib.json 就直接用，没有则现场标定并落盘。
+
+    复用之前会先核对标定板规格：已有 calib.json 若是用另一块棋盘标的，
+    直接复用会让后面写出的 matrices.json 记上错误的 provenance
+    （K/D 来自旧棋盘，board 段却写着新棋盘）。这种情况一律要求显式重标。
+    """
+    calib = None if force else load_calibration()
+    if calib is not None:
+        conflict = board_conflict(calib_board_meta())
+        if conflict:
+            raise SystemExit(conflict)
+        K, D, img_size = calib
+    else:
+        if force:
+            print('按要求忽略已有 calib.json，重新标定。')
+        else:
+            print('未找到 calib.json，开始从标定照片重新标定。')
         K, D, img_size, _fit = calibrate_camera()
         save_calibration(K, D, img_size)
-    else:
-        K, D, img_size = calib
     Knew = resolve_new_camera_matrix(K, D, img_size)
     assert_invertible('K', K)
     assert_invertible('Knew', Knew)
@@ -2793,7 +2912,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if CAPTURE_ONLINE:
         capture_calibration_images()
 
-    K, D, Knew, img_size = load_or_run_calibration()
+    K, D, Knew, img_size = load_or_run_calibration(force=args.force_calib)
 
     if stage == 'test':
         # 优先用真正落盘的那份表；表不在（或被删了）才退回按状态重算

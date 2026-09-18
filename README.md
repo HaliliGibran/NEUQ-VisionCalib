@@ -126,19 +126,32 @@ python tools/scan_dataset.py <图片目录> --board-squares 12 9
 规格会完整写进 `calib.json` 的 `board` 段，事后能追溯"这份内参是哪块棋盘算出来的"；
 旧版只写了 `chessboard_corners` 的文件仍可读，会自动换算回方格数。
 
+**换了棋盘必须重标**：复用已有 `calib.json` 前会先核对规格，不一致时直接拒绝并说明
+（否则会出现"界面写着 12×9、运行标定成功"，实际复用 9×7 旧参数，
+provenance 被写错且事后说不清）。确实要换板就用 `--force-calib`，
+或在网页上勾选"强制重新标定"。
+
 ---
 
 ## 测试
 
 ```bash
 python tests/run_all.py              # 跑全部
-python tests/test_board_spec.py      # 标定板规格：换算、校验、检测判别、calib.json 往返
+python tests/test_static_names.py    # 静态检查：不允许出现未定义的名字
+python tests/test_board_spec.py      # 标定板规格 + 真的跑一次相机标定
 python tests/test_lut_roundtrip.py   # 打表链路，60 组参数组合
 python tests/test_export_transaction.py   # 导出事务、回滚、重启后读表
 ```
 
-零依赖，不需要 pytest——只要有 cv2 和 numpy 就行。三组测试都只用**合成数据**
+零依赖，不需要 pytest——只要有 cv2 和 numpy 就行。四组测试都只用**合成数据**
 （合成相机参数、合成单应、程序画出来的棋盘），不需要任何真实照片。
+
+`test_static_names.py` 值得单独说一句：本项目真的出过一次
+"把常量批量替换成 `board.corners`，而那个函数里没有 `board`，
+于是运行相机标定直接 NameError"的事故——`compileall` 只查语法不查名字，
+单元测试又恰好没调用那个函数，两个都拦不住。这个检查用标准库 `ast`
+按作用域链解析每个名字的来源，把这类问题在提交前就拦下来。
+它上线时立刻又抓出第二处：校验脚本里 `re` 被误删了导入却仍在使用。
 
 `test_lut_roundtrip` 的参数矩阵是刻意铺开的，因为本项目的缺陷几乎都藏在组合里：
 

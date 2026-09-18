@@ -50,6 +50,76 @@ def synth_board_image(spec, margin=60, px=45):
     return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
 
+def synth_pose(base, seed):
+    """把棋盘图做一点透视扰动，模拟"换角度多拍几张"。"""
+    h, w = base.shape[:2]
+    rng = np.random.default_rng(seed)
+    src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    dst = src + (rng.uniform(-0.05, 0.05, size=(4, 2)) * np.float32([w, h])).astype(np.float32)
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(base, M, (w, h), borderValue=(255, 255, 255))
+
+
+def scenario_calibration() -> None:
+    """端到端真的跑一次相机标定。
+
+    这一条是补课：上一轮把 CHESSBOARD_CORNERS 换成 board.corners 时，
+    calibrate_camera() 里根本没有 board 这个变量，"运行相机标定"直接 NameError。
+    当时测试把规格对象、检测、JSON 都测了，唯独没按下那个按钮。
+    """
+    import shutil
+    tmp = Path(tempfile.mkdtemp(prefix='neuq_calib_'))
+    old_root = core.SCRIPT_DIR
+    old_board = core.BOARD
+    try:
+        spec = core.CheckerboardSpec(12, 9, 20.0)
+        core.configure_paths(root=tmp)
+        core.configure_board(spec)
+        core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+        base = synth_board_image(spec, margin=50)
+        for i in range(6):
+            core.safe_imwrite(core.DIR_CALIB_IN / f'view_{i:02d}.jpg',
+                              synth_pose(base, i))
+        K, D, size, fit = core.calibrate_camera()
+        check(K.shape == (3, 3), '标定返回 3x3 内参矩阵', f'{K.shape}')
+        check(size == (base.shape[1], base.shape[0]),
+              '标定分辨率等于图片分辨率', f'{size}')
+        check(float(K[0, 0]) > 0 and float(K[1, 1]) > 0,
+              '焦距为正', f'fx={float(K[0, 0]):.1f}')
+        rms = float(fit.get('rms', -1)) if isinstance(fit, dict) else -1.0
+        check(0 <= rms < 3.0, '重投影 RMS 在合理范围', f'{rms:.3f} px')
+
+        # 规格不对时必须明确失败，而不是"标定成功但参数没意义"
+        core.configure_board(core.CheckerboardSpec(8, 6, 20.0))
+        try:
+            core.calibrate_camera()
+            check(False, '规格与照片不符时报错而不是硬标')
+        except SystemExit:
+            check(True, '规格与照片不符时报错而不是硬标')
+        core.configure_board(spec)
+
+        # provenance：已有 calib.json 的规格与当前不一致时要拦住复用
+        core.save_calibration(K, D, size)
+        core.configure_board(core.CheckerboardSpec(9, 7, 25.0))
+        conflict = core.board_conflict(core.calib_board_meta())
+        check(conflict is not None and '不一致' in conflict,
+              '规格与已有 calib.json 不符时给出明确冲突说明',
+              (conflict or '').splitlines()[0] if conflict else '')
+        try:
+            core.load_or_run_calibration(force=False)
+            check(False, '规格冲突时拒绝静默复用旧标定')
+        except SystemExit as exc:
+            check('不一致' in str(exc), '规格冲突时拒绝静默复用旧标定')
+        K2, _D2, _Knew2, size2 = core.load_or_run_calibration(force=True)
+        check(K2.shape == (3, 3) and size2 == size,
+              'force=True 时重新标定并可继续', f'{size2}')
+    finally:
+        core.configure_paths(root=old_root)
+        core.configure_board(old_board)
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     print('[A] 规格对象')
     d = core.DEFAULT_BOARD
@@ -59,12 +129,18 @@ def main() -> int:
     check(d.partial_grids == ((9, 6), (7, 5), (6, 4), (5, 3)),
           '默认规格的局部子网格候选与改造前一致', f'{d.partial_grids}')
     small = core.CheckerboardSpec(8, 6, 25.0)
-    check(all(g[0] < 7 and g[1] < 5 and g[0] >= 4 and g[1] >= 3
-              for g in small.partial_grids),
-          '小棋盘的候选随之缩小且不小于 4x3', f'{small.partial_grids}')
+    check(all(min(g) >= 3 and max(g) >= 4 for g in small.partial_grids),
+          '小棋盘的候选随之缩小且不小于 3x4', f'{small.partial_grids}')
     check(small.partial_grids != d.partial_grids, '候选不再写死，随规格变化')
-    for bad, why in (((4, 9, 20.0), '方格数太小'), ((12, 9, 0.0), '边长为 0'),
-                     ((12, 9, -1.0), '边长为负')):
+    # 校验不假设方向：4x5 与 5x4 只是转了 90°，应当一视同仁地接受
+    for sq, why in (((4, 5, 20.0), '4x5 方格'), ((5, 4, 20.0), '5x4 方格')):
+        try:
+            core.CheckerboardSpec(*sq)
+            check(True, f'接受 {why}（内角点 3x4 / 4x3 等价）')
+        except ValueError as exc:
+            check(False, f'接受 {why}', str(exc))
+    for bad, why in (((4, 4, 20.0), '内角点长边不足 4'), ((3, 8, 20.0), '内角点短边不足 3'),
+                     ((12, 9, 0.0), '边长为 0'), ((12, 9, -1.0), '边长为负')):
         try:
             core.CheckerboardSpec(*bad)
             check(False, f'拒绝非法规格（{why}）')
@@ -148,6 +224,9 @@ def main() -> int:
         core.configure_board(core.DEFAULT_BOARD)
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
+
+    print('\n[E] 端到端：真的调用一次相机标定')
+    scenario_calibration()
 
     print()
     if FAILED:

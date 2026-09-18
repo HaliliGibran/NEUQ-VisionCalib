@@ -1183,10 +1183,12 @@ function bindActions() {
       if (pendingImportFiles && pendingImportFiles.length) {
         const fd = new FormData();
         fd.append('name', $('in-import-dir').value.trim());
-        // 规格随请求一起送，服务端以它为准
+        // 规格与模式都必须跟着走：漏掉 mode 会让"覆盖整个素材库"
+        // 只对填路径导入生效，走上传时静默变回增量添加。
         fd.append('squares_x', $('in-board-x').value);
         fd.append('squares_y', $('in-board-y').value);
         fd.append('square_size_mm', $('in-board-mm').value);
+        fd.append('mode', mode);
         pendingImportFiles.forEach(f => {
           fd.append('files', f, f.webkitRelativePath || f.name);
         });

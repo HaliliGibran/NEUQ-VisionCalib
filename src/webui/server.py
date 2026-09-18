@@ -356,10 +356,17 @@ def api_upload_import(fields: dict, files: list) -> dict:
     if not written:
         raise ValueError('没有可写入的图片文件（只支持 jpg/jpeg/png/bmp）。')
 
-    summary, log = capture(core.import_dataset, dest, False, 'add')
+    # mode 必须跟着走：之前上传分支固定写死 'add'，于是"覆盖整个素材库"
+    # 只在填路径导入时生效，走上传时静默变回增量添加，界面和实际行为不一致。
+    mode = (fields.get('mode') or 'add').strip()
+    if mode not in ('add', 'replace'):
+        raise ValueError(f'导入模式需为 add 或 replace，收到 {mode!r}')
+
+    summary, log = capture(core.import_dataset, dest, False, mode)
     if not isinstance(summary, dict):
         summary = {}
-    return {'log': f'已上传 {written} 个文件 → data/import/{folder}/\n' + log,
+    return {'log': f'已上传 {written} 个文件 → data/import/{folder}/'
+                   f'（模式 {mode}）\n' + log,
             'summary': summary, 'folder': folder, 'uploaded': written}
 
 
@@ -377,18 +384,37 @@ def board_payload() -> dict:
     }
 
 
+def board_from_request(body: dict) -> dict | None:
+    """从请求里取出标定板规格，两种形状都认。
+
+    JSON 接口传 {"board": {...}}，而 multipart 上传没法嵌套，只能扁平传
+    squares_x/squares_y。不归一的话就会出现"填路径导入时规格生效、点上传时
+    静默用旧规格"——这条漂移真的太隐蔽了，所以在入口处一次性抹平。
+    """
+    nested = body.get('board')
+    if nested:
+        return nested
+    if body.get('squares_x') is not None and body.get('squares_y') is not None:
+        return body
+    return None
+
+
 def apply_board(body: dict) -> dict:
     """设置标定板规格。
 
     规格决定"一张图算棋盘照还是地面照"，所以必须能在导入之前设定；
     导入/标定接口也会带上它，避免用户改了网页却没生效。
     """
-    if 'squares_x' not in body or 'squares_y' not in body:
+    if body.get('squares_x') in (None, '') or body.get('squares_y') in (None, ''):
         raise ValueError('需要给出 squares_x 与 squares_y。')
+    # 边长不能用 `or 默认值` 兜底：显式传 0 会被静默换成 20，
+    # 错误就被吞了。让 0 走到规格校验里去，报明确的错。
+    raw_mm = body.get('square_size_mm')
+    size_mm = (core.DEFAULT_BOARD.square_size_mm
+               if raw_mm in (None, '') else float(raw_mm))
     try:
-        spec = core.CheckerboardSpec(
-            int(body['squares_x']), int(body['squares_y']),
-            float(body.get('square_size_mm') or core.DEFAULT_BOARD.square_size_mm))
+        spec = core.CheckerboardSpec(int(body['squares_x']),
+                                     int(body['squares_y']), size_mm)
     except ValueError as exc:
         raise ValueError(str(exc))
     core.configure_board(spec)
@@ -402,8 +428,9 @@ def api_board(body: dict) -> dict:
 
 def _apply_board_if_given(body: dict) -> None:
     """导入/标定请求里带了 board 就先应用，保证该轮操作用的是同一份规格。"""
-    if body.get('board'):
-        apply_board(body['board'])
+    spec = board_from_request(body)
+    if spec:
+        apply_board(spec)
 
 
 def api_import(body: dict) -> dict:
@@ -622,6 +649,14 @@ def api_calibrate(body: dict) -> dict:
     _apply_board_if_given(body)
     err = body.get('max_reproj_err')
     core.MAX_REPROJ_ERR = float(err) if err not in (None, '') else None
+
+    # 复用旧标定前先对规格：已有 calib.json 是用另一块棋盘标的话，界面会显示
+    # "当前 12x9、运行标定成功"，实际却复用了 9x7 的旧参数。数学没错，
+    # 但 provenance 被写错，事后完全说不清。这里明确拒绝，不静默复用。
+    if not body.get('force') and core.CALIB_JSON.is_file():
+        conflict = core.board_conflict(core.calib_board_meta())
+        if conflict:
+            raise ValueError(conflict)
 
     fit = None
     buf = io.StringIO()
