@@ -123,7 +123,6 @@ class ScopeChecker:
                 self.visit(child, scopes, globals_)
             else:
                 self.visit(child, scopes, globals_)
-                self.visit(child, scopes, globals_)
 
     @staticmethod
     def resolvable(name: str, scopes: list[set[str]], globals_: set[str]) -> bool:
@@ -138,51 +137,41 @@ class ScopeChecker:
 
 # 这个检查器本身也需要被验证：给几个"故意写坏"的片段，确认它真的会报。
 # 否则它可能悄悄退化成"什么都不报"，而没人发现。
-SELF_CASES: list[tuple[str, str, bool]] = [
-    ('直接引用不存在的名字', 'def f():\n    return undefined_name\n', True),
+#
+# 第三项是**期望的报告条数**，不是布尔。用布尔的话"报 1 次"和"报 32 次"都是 True，
+# 恰好盖不住这个检查器自己犯过的错：visit() 的 else 分支曾把同一子树递归两遍，
+# 于是每下探一层报告数翻倍。钉死条数，这类回归下一次就会让自检直接失败。
+SELF_CASES: list[tuple[str, str, int]] = [
+    ('直接引用不存在的名字', 'def f():\n    return undefined_name\n', 1),
     ('参数漏写（本项目真实事故的形态）',
-     'def f():\n    a = board.corners\n', True),
+     'def f():\n    a = board.corners\n', 1),
     ('嵌套函数的局部变量不得算作外层绑定',
-     'def outer():\n    print(x)\n    def inner():\n        x = 1\n', True),
+     'def outer():\n    print(x)\n    def inner():\n        x = 1\n', 1),
+    ('每个未定义引用只报告一次（同时钉住不漏报与不重复报）',
+     'def f():\n    return missing_a + missing_b\n', 2),
     ('模块全局应当可见',
-     'G = 1\ndef f():\n    return G\n', False),
+     'G = 1\ndef f():\n    return G\n', 0),
     ('参数与局部正常',
-     'def f(a):\n    b = a + 1\n    return b\n', False),
+     'def f(a):\n    b = a + 1\n    return b\n', 0),
     ('for / with / except 的绑定',
-     'def f(xs):\n    for i in xs:\n        pass\n    return i\n', False),
-    ('内建函数正常', 'def f():\n    return len([1])\n', False),
-]
-
-
-# 这个检查器本身也需要被验证：给几个"故意写坏"的片段，确认它真的会报。
-# 否则它可能悄悄退化成"什么都不报"，而没人发现。
-SELF_CASES: list[tuple[str, str, bool]] = [
-    ('直接引用不存在的名字', 'def f():\n    return undefined_name\n', True),
-    ('参数漏写（本项目真实事故的形态）',
-     'def f():\n    a = board.corners\n', True),
-    ('嵌套函数的局部变量不得算作外层绑定',
-     'def outer():\n    print(x)\n    def inner():\n        x = 1\n', True),
-    ('模块全局应当可见',
-     'G = 1\ndef f():\n    return G\n', False),
-    ('参数与局部正常',
-     'def f(a):\n    b = a + 1\n    return b\n', False),
-    ('for / with / except 的绑定',
-     'def f(xs):\n    for i in xs:\n        pass\n    return i\n', False),
-    ('内建函数正常', 'def f():\n    return len([1])\n', False),
+     'def f(xs):\n    for i in xs:\n        pass\n    return i\n', 0),
+    ('内建函数正常', 'def f():\n    return len([1])\n', 0),
 ]
 
 
 def self_check() -> int:
     bad = 0
-    for label, src, should_report in SELF_CASES:
+    for label, src, expected in SELF_CASES:
         checker = ScopeChecker.__new__(ScopeChecker)
         tree = ast.parse(src)
         checker.path = Path('<self-check>')
         checker.problems = []
         checker.visit(tree, [set()], checker.bound_names(tree))
-        reported = bool(checker.problems)
-        if reported != should_report:
-            print(f'  [!!] 自检失败: {label}  期望报告={should_report} 实际={reported}')
+        actual = len(checker.problems)
+        if actual != expected:
+            print(f'  [!!] 自检失败: {label}  期望报告 {expected} 条，实际 {actual} 条')
+            for p in checker.problems:
+                print(f'         {p}')
             bad += 1
         else:
             print(f'  [OK] 自检: {label}')
