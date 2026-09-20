@@ -1,7 +1,8 @@
 """配置与工程状态：标定板规格、project.json、素材库的分类依据。
 
 从 neuq_vision_calib.py 原样搬来，函数体逐字未改。依赖方向是单向的：
-neuq_vision_calib.py 导入本模块，本模块不导入它。
+neuq_vision_calib.py 导入本模块，本模块不导入它；本模块只向下依赖
+neuq_core.fs_transaction（目录换装的机械动作），那一层不知道 project.json 的存在。
 """
 
 import json
@@ -9,6 +10,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
+
+from neuq_core.fs_transaction import BACKUP_SUFFIX, DirectorySwapTransaction
 
 IMAGE_SUFFIXES = ('.jpg', '.jpeg', '.png', '.bmp')
 
@@ -29,9 +32,14 @@ INCOMPLETE_SUBDIR = '_incomplete'
 # 覆盖导入的暂存目录后缀，与导出事务同一套路：新素材全部就位后一次性换装。
 STAGING_SUFFIX = '.staging'
 
-# 换装时旧正式目录的暂时落脚点。和 STAGING_SUFFIX 一样必须是常量：
-# 事务残留检查要和 _commit_dirs 看同一组路径，写死两份字面量迟早对不上。
-BACKUP_SUFFIX = '.old'
+# 换装时旧正式目录的暂时落脚点（BACKUP_SUFFIX）定义在 neuq_core.fs_transaction：
+# 事务残留检查要和换装看同一组路径，写死两份字面量迟早对不上。
+
+# 覆盖导入进行中的标记。写在 project.json 里，含义是"目录可能正处于中间态"：
+# 素材换装与 material_set / last_import 的落盘不可能是同一个原子操作，所以先
+# 声明"有事务正在进行"，全部成功后再删掉它。它还在，就说明上一次导入没走完。
+MATERIAL_PENDING_KEY = 'material_import_pending'
+
 
 
 def list_images(folder: Path) -> List[Path]:
@@ -261,6 +269,26 @@ def update_project_config(**sections) -> dict:
     return data
 
 
+def write_project_config_strict(data: dict) -> None:
+    """把一份**完整的** project.json 内容写下去，写不成功就抛出来。
+
+    与 update_project_config 的区别只有一条：不吞 OSError。普通设置（棋盘规格之类）
+    写失败只是"这次设置重启后不保留"，打个警告继续是合理的；但事务提交不行——
+    "磁盘上已经是新素材库、配置里还是旧的" 是没人能事后分辨的脏状态，必须让调用方
+    知道写失败了、好去回滚目录。
+
+    刻意不给 update_project_config 加 strict= 参数：那个开关会被几十个普通调用点
+    误传，而它们本来就该宽容。两条路分开，误用不了。
+    """
+    payload = dict(data)
+    payload['schema_version'] = SCHEMA_VERSION
+    payload['tool_version'] = TOOL_VERSION
+    p = project_config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(p, payload)
+
+
+
 def resolve_board(squares: Optional[Sequence[int]] = None,
                   corners: Optional[Sequence[int]] = None,
                   square_size_mm: Optional[float] = None) -> CheckerboardSpec:
@@ -342,6 +370,21 @@ def clear_material_board() -> None:
     update_project_config(material_set=None)
 
 
+def material_import_pending() -> Optional[dict]:
+    """有没有一次没走完的覆盖导入；没有则 None。
+
+    返回的记录形如
+      {'operation': 'replace', 'board': {...}, 'last_import': {...}}
+    也就是"事务打算提交成什么样"。刻意不改写同一份配置里的 material_set：
+    最终提交之前，project.json 始终仍然描述**旧的**正式库，这条记录只是额外
+    声明"目录可能正处于中间态"。这样读配置的其它代码不需要认识 pending 也不会
+    被误导，而下一次覆盖导入据它 fail closed。
+    """
+    value = load_project_config().get(MATERIAL_PENDING_KEY)
+    return value if isinstance(value, dict) else None
+
+
+
 def material_stale_reason(spec: Optional[CheckerboardSpec] = None) -> Optional[str]:
     """素材是否是按「另一块棋盘」分类的；是则返回说明，否则 None。
 
@@ -408,6 +451,9 @@ def material_transaction_residue() -> List[Path]:
     这些目录只会在换装失败时留下，而 --move 导入的暂存区里可能是用户照片的
     **唯一副本**（原位置已经没有了）。所以新的覆盖导入必须先让路：
     不猜"这是 copy 模式留下的、删了也没事"，一律要求人工确认。
+
+    只列**文件系统上的**残留；project.json 里的 pending 标记同样算残留，但它
+    不是一个路径，由 require_no_material_residue() 和它一起判。
     """
     found: List[Path] = []
     for stage, target in material_stage_pairs():
@@ -418,14 +464,102 @@ def material_transaction_residue() -> List[Path]:
 
 
 def require_no_material_residue() -> None:
-    """有事务残留就拒绝启动新的覆盖导入。"""
+    """有事务残留就拒绝启动新的覆盖导入。
+
+    残留有两种：磁盘上的 *.staging / *.old，和 project.json 里没被清掉的 pending
+    标记。后者是进程被杀 / 断电 / 回滚本身失败时唯一留下的线索，所以它也要拦——
+    否则一次崩溃之后的重试会直接在一个中间态上再做一次破坏性换装。
+    """
     residue = material_transaction_residue()
-    if not residue:
+    pending = material_import_pending()
+    if not residue and pending is None:
         return
-    lines = '\n'.join(f'  - {p}' for p in residue)
+    items = [f'  - {p}' for p in residue]
+    extra = ''
+    if pending is not None:
+        items.append(f'  - {project_config_path()} 里的 {MATERIAL_PENDING_KEY} 标记'
+                     '（上次覆盖导入没有走完）')
+        extra = ('上次导入未完成，素材库可能处于中间态：目录可能已经换成新的，'
+                 '也可能还是旧的。\n'
+                 '程序不自动猜恢复方向——两种猜法都可能把用户仅存的原件删掉。\n')
+    lines = '\n'.join(items)
     raise SystemExit(
         '检测到上一次未完成的素材导入残留：\n'
         f'{lines}\n'
+        + extra +
         '这些目录可能包含通过 --move 搬入、已经不在原位置的唯一原件。\n'
         '为避免数据丢失，本次不会自动删除或覆盖它们。\n'
         '请先检查并恢复/备份其中内容，手工删除残留目录后再重试。')
+
+
+class MaterialImportTransaction:
+    """覆盖导入的事务闭环：pending → 换装（保留 .old）→ 最终配置 → 删 .old。
+
+    要堵的洞：老实现是"换装成功立刻删 .old，然后才写 material_set / last_import"。
+    后两步写 project.json 失败就变成「磁盘=新素材库、旧素材库已删、配置仍描述旧的」，
+    而且再也回不去了。
+
+    状态机：
+      install()  严格写 pending（失败：正式目录一个字节都没动）
+                 → 目录换装但保留 .old（失败：用 .old 回滚，--move 的新素材回到
+                   *.staging，再把 project.json 恢复成事务开始前的样子）
+      commit()   严格写最终 project.json：material_set=新规格 + last_import=本次记录，
+                 pending 随之消失（失败：.old 还在，目录一并回滚，配置留在旧
+                 material_set）
+                 → 成功才删 .old
+
+    两次写都基于构造时读到的同一份 base 算出**完整** dict，所以"最终 JSON 里
+    material_set 与 last_import 同时出现"是天然成立的，不存在两次独立写之间的窗口。
+    """
+
+    def __init__(self, pairs: Sequence[Tuple[Path, Path]],
+                 spec: CheckerboardSpec, last_import: dict) -> None:
+        self.base = {k: v for k, v in load_project_config().items()
+                     if k != MATERIAL_PENDING_KEY}
+        self.spec = spec
+        self.last_import = last_import
+        self.tx = DirectorySwapTransaction(pairs, what='calib_input 与 ipm_input',
+                                           keep_staging=True)
+
+    def install(self) -> None:
+        """声明事务开始，然后换装目录；.old 保留着，随时还能回滚。"""
+        write_project_config_strict({
+            **self.base,
+            MATERIAL_PENDING_KEY: {'operation': 'replace',
+                                   'board': self.spec.to_dict(),
+                                   'last_import': self.last_import},
+        })
+        try:
+            self.tx.install()
+        except BaseException:
+            self.tx.rollback()
+            self._revert_config()
+            raise
+
+    def commit(self) -> None:
+        """一次写完新的分类依据与导入记录，成功后才删 .old。"""
+        try:
+            write_project_config_strict({
+                **self.base,
+                'material_set': {'board': self.spec.to_dict()},
+                'last_import': self.last_import,
+            })
+        except BaseException:
+            self.tx.rollback()
+            self._revert_config()
+            raise
+        self.tx.finalize()
+
+    def _revert_config(self) -> None:
+        """尽力把 project.json 恢复成事务开始前的样子（pending 随之消失）。
+
+        这一步也失败就让 pending 留着：它是 fail closed 的凭据，下一次覆盖导入
+        会据此拒绝，而不是在一个说不清的状态上继续做破坏性换装。
+        """
+        try:
+            write_project_config_strict(self.base)
+        except OSError as exc:
+            print(f'警告: 无法清除 {project_config_path()} 里的 {MATERIAL_PENDING_KEY} '
+                  f'标记（{exc}）。目录已回滚，但下一次覆盖导入会因这条标记被拒绝，'
+                  '请确认素材库无误后手工删掉它。')
+

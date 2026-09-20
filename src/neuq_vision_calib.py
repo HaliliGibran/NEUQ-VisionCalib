@@ -67,11 +67,13 @@ from neuq_core.config import (  # noqa: F401
     DEFAULT_BOARD,
     IMAGE_SUFFIXES,
     INCOMPLETE_SUBDIR,
+    MATERIAL_PENDING_KEY,
     PROJECT_JSON_NAME,
     SCHEMA_VERSION,
     STAGING_SUFFIX,
     TOOL_VERSION,
     CheckerboardSpec,
+    MaterialImportTransaction,
     check_schema,
     clear_material_board,
     in_material_library,
@@ -80,6 +82,7 @@ from neuq_core.config import (  # noqa: F401
     material_basis_unknown_reason,
     material_board,
     material_has_images,
+    material_import_pending,
     material_stage_pairs,
     material_stale_reason,
     material_transaction_residue,
@@ -91,7 +94,9 @@ from neuq_core.config import (  # noqa: F401
     spec_from_meta,
     update_project_config,
     write_json_atomic,
+    write_project_config_strict,
 )
+from neuq_core.fs_transaction import commit_dirs
 from neuq_core.geometry import (  # noqa: F401
     DEGENERATE_EPS,
     DEN_EPS,
@@ -1608,72 +1613,13 @@ def _commit_dirs(pairs: Sequence[Tuple[Path, Path]], what: str = 'matrix 与 loo
                  keep_staging: bool = False) -> None:
     """把一批暂存目录整体换成正式目录；任何一步失败则全部回滚。
 
-    先统一"挪走旧的"，再统一"放上新的"。这样一旦中途出错，两个目录都还躺在
-    .old 里，可以一起复原——不会留下"一个已是新版、另一个还是旧版"的中间态。
-
-    keep_staging=True 时失败后保留暂存目录：素材导入的暂存目录里可能是用 --move
-    从用户目录搬过来的原件，删了就等于把源文件也删了。
-
-    "保留"必须覆盖到**已经就位**的那几个目录。它们的 stage 已经 rename 成正式
-    目录，stage 本身不复存在；此时若按"撤掉新目录"去 rmtree，删掉的正是那批
-    原件——用户目录里已经没有了，暂存区也没有了。所以已就位的要先搬回 stage，
-    绝不能删。
+    实现已下沉到 neuq_core.fs_transaction：那里的 DirectorySwapTransaction 把
+    install / finalize 拆开，好让"换装完、元数据还没落盘"这段窗口仍然可以回滚
+    （素材覆盖导入要的就是这个）。这里保留名字，转发给一次性的 commit_dirs，
+    既有调用点与外部引用的行为一个字不变。
     """
-    moved: List[Tuple[Path, Path, Path]] = []      # (target, backup, stage)
-    installed: List[Tuple[Path, Path]] = []        # (target, stage)，rename 真的成功过
-    try:
-        for stage, target in pairs:
-            backup = target.with_name(target.name + BACKUP_SUFFIX)
-            if keep_staging and backup.exists():
-                # 素材事务：.old 已经存在说明上一轮换装留下了残留，里面可能是
-                # 用户仅存的旧素材。宁可什么都不做，也不能顺手删掉它腾地方。
-                raise SystemExit(
-                    f'检测到上一次未完成的素材换装残留: {backup}\n'
-                    '它可能是上一轮特意保住的旧素材库。为避免覆盖，本次不做任何改动。\n'
-                    '请先确认其中内容并手工处置，再重试。')
-            shutil.rmtree(backup, ignore_errors=True)
-            if target.exists():
-                target.rename(backup)
-            moved.append((target, backup, stage))
-        for target, _backup, stage in moved:
-            stage.rename(target)
-            installed.append((target, stage))
-    except BaseException:
-        stranded: List[Path] = []
-        # 撤掉已经就位的新目录。keep_staging 时搬回暂存区而不是删除
-        for target, stage in reversed(installed):
-            if not keep_staging:
-                shutil.rmtree(target, ignore_errors=True)
-                continue
-            try:
-                shutil.rmtree(stage, ignore_errors=True)
-                target.rename(stage)
-            except OSError as exc:
-                # 搬不回去也绝不删：宁可留一个占位的正式目录要人工处置，
-                # 也不能让 --move 进来的原件在这里消失
-                stranded.append(target)
-                print(f'  警告: {target} 里是本轮的新内容（--move 导入时可能是仅存的原件），'
-                      f'无法搬回 {stage}（{exc}），已原样保留，请手工处置后重试。')
-        # 再把 .old 放回正式位置
-        for target, backup, _stage in moved:
-            if target in stranded:
-                print(f'  {target} 仍被新内容占用，改动前的内容保留在 {backup}。')
-                continue
-            shutil.rmtree(target, ignore_errors=True)
-            if backup.exists():
-                backup.rename(target)
-        for stage, _target in pairs:
-            if not stage.exists():
-                continue                  # 已就位又搬不回来的，上面已单独提示过
-            if keep_staging:
-                print(f'  未能就位的新内容仍留在 {stage}，确认后可自行删除。')
-            else:
-                # 暂存区里是这一轮没能提交的新内容：留着只会让人误以为已经生成了
-                shutil.rmtree(stage, ignore_errors=True)
-        print(f'换装失败，已回滚到改动前的状态（{what} 一并复原）。')
-        raise
-    for _target, backup, _stage in moved:
-        shutil.rmtree(backup, ignore_errors=True)
+    commit_dirs(pairs, what=what, keep_staging=keep_staging)
+
 
 
 # ---------------------------------------------------------------- 7. 批量测试
@@ -1942,6 +1888,9 @@ def import_dataset(src_dir: Path, move: bool = False,
                   整体换装。中途失败（磁盘满、权限、坏图）时正式的素材库
                   一个文件都不会少 —— 坏图同样算失败，整批放弃（all-or-nothing），
                   否则"19 张好图 + 1 张坏图"会把旧库整套换成那 19 张。
+                  换装与"这套素材按哪块棋盘分拣"由 MaterialImportTransaction 一起
+                  成交：写 pending → 换装（留 .old）→ 一次写完 material_set 与
+                  last_import → 删 .old，任何一步失败都连目录一起回滚。
                   只有这个模式允许换棋盘规格。
 
 
@@ -2051,8 +2000,18 @@ def import_dataset(src_dir: Path, move: bool = False,
             raise SystemExit('没有一张图成功入库，已放弃覆盖，原素材库保持不变。')
         replaced = sum(1 for d in (DIR_CALIB_IN, DIR_IPM_IN) if d.is_dir()
                        for p in d.rglob('*') if p.is_file())
-        _commit_dirs(pairs, what='calib_input 与 ipm_input', keep_staging=True)
+        # 换装与"这套素材按哪块棋盘分拣"必须一起成交。事务先严格写下 pending、
+        # 再换装（保留 .old）、再一次写完 material_set + last_import，最后才删 .old；
+        # 中间任何一步失败都会连目录一起回滚，不会留下"目录是新的、配置是旧的"。
+        txn = MaterialImportTransaction(pairs, BOARD, {
+            'at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'mode': mode,
+            'counts': {'calib': calib_n, 'partial': partial_n, 'ipm': ipm_n},
+        })
+        txn.install()
+        txn.commit()
         print(f'覆盖模式：旧素材库（{replaced} 个文件）已被这一轮替换。')
+
 
     parts = [f'棋盘 {calib_n} 张']
     if partial_n:
@@ -2073,12 +2032,17 @@ def import_dataset(src_dir: Path, move: bool = False,
 
     # 这套素材现在整体是按哪块棋盘分拣的，是**工程级事实**，必须单独记：
     # 记在"最近一次导入"上的话，一次增量导入就能把混合状态洗白。
-    set_material_board(BOARD)
-    update_project_config(last_import={
-        'at': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'mode': mode,
-        'counts': {'calib': calib_n, 'partial': partial_n, 'ipm': ipm_n},
-    })
+    # replace 的这两段已经由上面的事务一次写完（它必须与换装同生共死）；
+    # add 不做破坏性换装，沿用原来的两次独立写：最坏情况是"库里有素材但依据未知"，
+    # 现有的 material_basis_unknown_reason 闸门下一次会把它挡住。
+    if mode == 'add':
+        set_material_board(BOARD)
+        update_project_config(last_import={
+            'at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'mode': mode,
+            'counts': {'calib': calib_n, 'partial': partial_n, 'ipm': ipm_n},
+        })
+
 
     return {'mode': mode, 'imported_calib': calib_n,
             'imported_partial': partial_n, 'imported_ipm': ipm_n,

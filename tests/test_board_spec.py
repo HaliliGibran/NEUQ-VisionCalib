@@ -98,6 +98,29 @@ def failing_rename_into(dest: Path):
     return lambda: setattr(pathlib.Path, 'rename', orig)
 
 
+def failing_project_write(nth: int):
+    """让 project.json 的第 nth 次原子写抛 OSError（nth=0 表示只记录、不注入）。
+
+    只挡 neuq_core.config 里那一份 write_json_atomic —— calib.json 走的是 facade
+    自己导入的同名函数，不受影响。按"第几次调用"计数而不是按内容匹配：内容一改
+    文案就失效；同时把每次写下去的键集记下来，好断言"炸掉的那一次写的确实是
+    预期的那份内容"。返回 (还原函数, 记录)。
+    """
+    from neuq_core import config as cfgmod
+    orig = cfgmod.write_json_atomic
+    calls: dict = {'n': 0, 'keys': []}
+
+    def fake(path, payload):
+        calls['n'] += 1
+        calls['keys'].append(sorted(payload) if isinstance(payload, dict) else [])
+        if calls['n'] == nth:
+            raise OSError(f'模拟第 {nth} 次 project.json 写入失败')
+        return orig(path, payload)
+
+    cfgmod.write_json_atomic = fake
+    return (lambda: setattr(cfgmod, 'write_json_atomic', orig)), calls
+
+
 def scenario_calibration() -> None:
     """端到端真的跑一次相机标定。
 
@@ -387,6 +410,9 @@ def scenario_state_guards() -> None:
       5. 显式指定库内的图不算"绕过分拣结果"，仍要过闸；只有库外文件才放行。
       6. replace --move 换装到一半失败时，被搬走的原图必须仍在暂存区 —— 这是
          唯一一条会真的丢用户原始素材的路径。
+      7. 覆盖导入的事务闭环（G 段五条）：pending / 换装 / 最终 project.json 三步
+         必须同生共死。特别是"目录全部换好、最终配置写失败"这一刻——老实现在这里
+         已经把 .old 删了，只能留下「磁盘是新库 B、配置说旧库 A」的脏状态。
     """
     import shutil
     tmp = Path(tempfile.mkdtemp(prefix='neuq_guard_'))
@@ -596,6 +622,201 @@ def scenario_state_guards() -> None:
             check('未完成的素材导入残留' in str(exc), '.old 残留时也拒绝覆盖导入',
                   str(exc).splitlines()[0])
         check((stale_old / 'rescued.jpg').is_file(), '.old 里被救下的素材没被删')
+
+        # ---- G. 覆盖导入的事务闭环：目录与 project.json 必须同生共死
+        # 老实现的时序是"换装成功 → 立刻删 .old → 再写 material_set → 再写 last_import"。
+        # 后两步写 project.json 失败就变成「磁盘=新库 B、旧库 A 已删、配置仍说 A」，
+        # 而且已经没有任何东西能自动回滚。下面五条把这条时序钉死。
+        def replace_case(name: str, n_new: int = 3):
+            """造一个"旧库按 A 分拣 + 一批待导入新素材"的工程；返回新素材目录。
+
+            新素材全是纯灰图（任何规格都检不出棋盘 → 一律进 ipm_input），所以
+            "calib_input 里那张 old_board.jpg 还在不在"就是"换装到底发生了没有"
+            的直接证据。
+            """
+            core.configure_paths(root=tmp / name)
+            core.configure_board(spec_a)
+            core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+            core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+            core.safe_imwrite(core.DIR_CALIB_IN / 'old_board.jpg', synth_board_image(spec_a))
+            core.safe_imwrite(core.DIR_IPM_IN / 'old_floor.jpg', floor)
+            core.set_material_board(spec_a)
+            src_new = tmp / f'{name}_src'
+            src_new.mkdir()
+            for i in range(n_new):
+                core.safe_imwrite(src_new / f'new_{i}.jpg', floor)
+            core.configure_board(spec_b)       # 只有 replace 允许换规格
+            return src_new
+
+        def official_names():
+            return (sorted(p.name for p in core.list_images(core.DIR_CALIB_IN)),
+                    sorted(p.name for p in core.list_images(core.DIR_IPM_IN)))
+
+        def swap_leftovers():
+            return sorted(p.name for p in (core.SCRIPT_DIR).iterdir()
+                          if p.is_dir() and (p.name.endswith(core.STAGING_SUFFIX)
+                                             or p.name.endswith(core.BACKUP_SUFFIX)))
+
+        # G1. pending 写失败：正式目录连一个字节都不许动
+        print('  -- G1 pending 落盘失败')
+        src_g = replace_case('txn_pending_fail')
+        before_fp = tree_fingerprint((core.DIR_CALIB_IN, core.DIR_IPM_IN))
+        restore, calls = failing_project_write(1)
+        try:
+            core.import_dataset(src_g, mode='replace')
+            check(False, 'pending 写失败时抛出来')
+        except OSError:
+            check(True, 'pending 写失败时抛出来（不当普通设置警告掉）')
+        finally:
+            restore()
+        check(len(calls['keys']) == 1
+              and core.MATERIAL_PENDING_KEY in calls['keys'][0]
+              and 'material_set' in calls['keys'][0]
+              and 'last_import' not in calls['keys'][0],
+              '炸掉的第 1 次写正是 pending 那一份（旧 material_set 原样带着、不含 last_import）',
+              str(calls['keys']))
+        check(tree_fingerprint((core.DIR_CALIB_IN, core.DIR_IPM_IN)) == before_fp,
+              'pending 写失败：正式目录一个字节都没动')
+        check(core.material_import_pending() is None,
+              'pending 没写进去，配置里也就没有这条标记')
+        check(core.material_board() == spec_a, '依据仍是旧 A')
+        check(len(core.material_transaction_residue()) == 2,
+              '本轮备好的新素材留在 *.staging 供人工处置',
+              str([p.name for p in core.material_transaction_residue()]))
+
+        # G2. 第二个目录换装失败 + --move：数据保全之外，还要确认没被误认成已提交
+        print('  -- G2 第二个目录 install 失败（--move）')
+        src_g = replace_case('txn_install_fail')
+        for i in range(2):                     # 再补两张，凑够"搬走就没了"的量
+            core.safe_imwrite(src_g / f'extra_{i}.jpg', synth_pose(synth_board_image(spec_a), i))
+        sent = sorted(p.name for p in core.list_images(src_g))
+        old_names = official_names()
+        stage_calib, stage_ipm = (s for s, _t in core.material_stage_pairs())
+        restore = failing_rename_into(core.DIR_IPM_IN)
+        try:
+            core.import_dataset(src_g, mode='replace', move=True)
+            check(False, 'install 中途失败时抛错')
+        except OSError:
+            check(True, 'install 中途失败时抛错并回滚')
+        finally:
+            restore()
+        check(official_names() == old_names, 'install 失败：旧 calib_input / ipm_input 全恢复',
+              str(official_names()))
+        staged = sorted(p.name for p in
+                        list(stage_calib.rglob('*')) + list(stage_ipm.rglob('*'))
+                        if p.is_file())
+        check(staged == sent, '--move 搬走的原图一张不少地留在 *.staging', str(staged))
+        check(core.material_board() == spec_a,
+              'pending 没有让工程被误认成已提交（依据仍是 A）', str(core.material_board()))
+        check(core.material_import_pending() is None, '回滚后 pending 已被清掉')
+
+        # G3. 换装全部成功、最终 project.json 写失败 —— 这次的核心回归
+        print('  -- G3 install 全成功但最终 project.json 写失败')
+        src_g = replace_case('txn_commit_fail')
+        sent = sorted(p.name for p in core.list_images(src_g))
+        old_names = official_names()
+        before_fp = tree_fingerprint((core.DIR_CALIB_IN, core.DIR_IPM_IN))
+        restore, calls = failing_project_write(2)          # 1=pending，2=最终提交
+        try:
+            core.import_dataset(src_g, mode='replace', move=True)
+            check(False, '最终 project.json 写失败时抛出来')
+        except OSError:
+            check(True, '最终 project.json 写失败时抛出来')
+        finally:
+            restore()
+        check(len(calls['keys']) == 3
+              and 'material_set' in calls['keys'][1]
+              and 'last_import' in calls['keys'][1]
+              and core.MATERIAL_PENDING_KEY not in calls['keys'][1]
+              and calls['keys'][2] == sorted(set(calls['keys'][0])
+                                            - {core.MATERIAL_PENDING_KEY}),
+              '炸掉的第 2 次写正是"material_set + last_import 一起、pending 消失"那一份，'
+              '第 3 次是把事务前的配置写回去',
+              str(calls['keys']))
+        check(official_names() == old_names and
+              tree_fingerprint((core.DIR_CALIB_IN, core.DIR_IPM_IN)) == before_fp,
+              '旧 calib_input / ipm_input 逐字节恢复（.old 还在，所以回得去）',
+              str(official_names()))
+        stage_calib, stage_ipm = (s for s, _t in core.material_stage_pairs())
+        staged = sorted(p.name for p in
+                        list(stage_calib.rglob('*')) + list(stage_ipm.rglob('*'))
+                        if p.is_file())
+        check(staged == sent, '新素材退回 *.staging，--move 的原件一张不少', str(staged))
+        check(core.material_board() == spec_a,
+              '绝不能出现"正式目录 B + metadata A"：material_set 仍是旧 A',
+              str(core.material_board()))
+        check(core.material_import_pending() is None, '回滚后 pending 已被清掉')
+        check(all(n.endswith(core.STAGING_SUFFIX) for n in swap_leftovers()),
+              '.old 已经用掉（只剩 *.staging 等人工处置）', str(swap_leftovers()))
+
+        # G4. 全程成功：material_set 与 last_import 必须出自同一次最终写
+        print('  -- G4 全部成功')
+        src_g = replace_case('txn_ok')
+        sent = sorted(p.name for p in core.list_images(src_g))
+        restore, calls = failing_project_write(0)          # 只记录，不注入故障
+        try:
+            got = core.import_dataset(src_g, mode='replace')
+        finally:
+            restore()
+        check(official_names() == ([], sent), '正式目录换成了新素材 B',
+              str(official_names()))
+        check(got['cleared'] and got['imported_ipm'] == len(sent),
+              '返回值如实报告这是一次覆盖导入', str(got))
+        raw = json.loads(core.project_config_path().read_text(encoding='utf-8'))
+        check(calls['n'] == 2, '整个 replace 只写两次 project.json（pending + 最终）',
+              str(calls['n']))
+        check('material_set' in calls['keys'][1] and 'last_import' in calls['keys'][1],
+              'material_set 与 last_import 出自同一次写', str(calls['keys'][1]))
+        check((raw.get('material_set') or {}).get('board', {}).get('squares_x')
+              == spec_b.squares_x and isinstance(raw.get('last_import'), dict),
+              '读回 project.json：新依据 B 与 last_import 同时存在',
+              str((raw.get('material_set'), raw.get('last_import'))))
+        check(core.MATERIAL_PENDING_KEY not in raw, '成功后 pending 消失')
+        check(swap_leftovers() == [], '成功后 .staging / .old 都清干净',
+              str(swap_leftovers()))
+
+        # G5. 进程被杀 / 断电的遗留：pending + .old 静态状态，下一次必须明确拒绝
+        print('  -- G5 崩溃遗留（pending + .old）')
+        core.configure_paths(root=tmp / 'txn_crashed')
+        core.configure_board(spec_a)
+        core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_IPM_IN / 'maybe_new.jpg', floor)
+        crashed_old = core.DIR_IPM_IN.with_name(core.DIR_IPM_IN.name + core.BACKUP_SUFFIX)
+        crashed_old.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(crashed_old / 'maybe_old.jpg', floor)
+        core.write_project_config_strict({
+            'board': spec_a.to_dict(),
+            'material_set': {'board': spec_a.to_dict()},
+            core.MATERIAL_PENDING_KEY: {'operation': 'replace',
+                                        'board': spec_b.to_dict(),
+                                        'last_import': {'mode': 'replace'}},
+        })
+        src_g = tmp / 'txn_crashed_src'
+        src_g.mkdir()
+        core.safe_imwrite(src_g / 'again.jpg', floor)
+        frozen = tree_fingerprint((core.DIR_IPM_IN, crashed_old))
+        try:
+            core.import_dataset(src_g, mode='replace')
+            check(False, '崩溃遗留时拒绝新的覆盖导入')
+        except SystemExit as exc:
+            check('未完成的素材导入残留' in str(exc), '崩溃遗留时拒绝新的覆盖导入',
+                  str(exc).splitlines()[0])
+            check(core.MATERIAL_PENDING_KEY in str(exc)
+                  and '不自动猜恢复方向' in str(exc),
+                  '提示里点明 pending 标记且明说不猜恢复方向')
+        check(tree_fingerprint((core.DIR_IPM_IN, crashed_old)) == frozen,
+              '被拒绝的重试没动过中间态里的任何一个字节')
+        check(core.material_import_pending() is not None,
+              'pending 留在原处（清不清由人工决定）')
+        shutil.rmtree(crashed_old)             # 人工只处置掉 .old，pending 还在
+        try:
+            core.import_dataset(src_g, mode='replace')
+            check(False, '只剩 pending（目录看不出异常）时同样拒绝')
+        except SystemExit as exc:
+            check('未完成的素材导入残留' in str(exc),
+                  '只剩 pending（目录看不出异常）时同样拒绝',
+                  str(exc).splitlines()[1][:46])
     finally:
         core.configure_paths(root=old_root)
         core.configure_board(old_board)
