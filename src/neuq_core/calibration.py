@@ -1,0 +1,136 @@
+"""相机标定的低耦合内核：棋盘检出与 calibrateCamera 的直接封装。
+
+从 neuq_vision_calib.py 原样搬来，函数体逐字未改（唯一例外见下）。依赖方向单向：
+本模块只依赖 neuq_core.config，不导入 facade，也不碰任何目录/运行时开关。
+
+刻意**没有**搬进来的：
+  fit_camera            读 facade 的 MAX_REPROJ_ERR。为它再做一份阈值镜像，或者把
+                        阈值改成参数，都属于状态模型/API 改动，不是这一刀的范围。
+  calibrate_camera      本质是"算法 + 目录读取 + 状态检查 + 日志 + preview 输出"，
+                        不是纯算法函数。
+  capture_calibration_images / export_undistort_previews /
+  save_calibration / load_calibration / calib_board_meta
+                        都直接依赖目录全局与 safe_imread/safe_imwrite。
+
+唯一的非逐字改动：detect_* 里默认规格的取法由裸全局 `BOARD` 改为 `config.BOARD`
+（同一份值，由 facade 的 configure_board() 同步过来），因为本模块不再有那个裸全局。
+"""
+
+from typing import Optional, Tuple
+
+import cv2
+import numpy as np
+
+from . import config
+
+SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
+
+
+def detect_chessboard(gray: np.ndarray, fast: bool = False,
+                      board: Optional[config.CheckerboardSpec] = None
+                      ) -> Tuple[bool, Optional[np.ndarray]]:
+    """检出棋盘内角点，全部检出才算成功。
+
+    OpenCV 的棋盘检测是全有全无的：拓扑推断要求整块棋盘完整可见，检不到就返回 False，
+    不存在"只返回一部分角点"的中间态。所以这里的策略是尽量提高检出率：
+    先用 SB（sector-based）算法，它对低分辨率、运动模糊、光照不均和大透视畸变明显更鲁棒，
+    且自带亚像素精度；失败再退回经典算法配 cornerSubPix。
+
+    真正需要「部分可见也能用」的场合（棋盘被裁切或遮挡），普通棋盘做不到，
+    必须换成 ChArUco 板——每个格子有唯一编码，才能把局部角点对上正确的物理坐标。
+
+    fast=True 用于实时预览，跳过耗时的 EXHAUSTIVE/ACCURACY 搜索。
+    board 不给时用当前工程的规格（core.BOARD）。
+    """
+    spec = config.BOARD if board is None else board
+    if hasattr(cv2, 'findChessboardCornersSB'):
+        flags = cv2.CALIB_CB_NORMALIZE_IMAGE
+        if not fast:
+            flags |= cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
+        found, corners = cv2.findChessboardCornersSB(gray, spec.corners, flags)
+        if found:
+            return True, corners
+
+    found, corners = cv2.findChessboardCorners(
+        gray, spec.corners,
+        flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
+    if not found:
+        return False, None
+    corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), SUBPIX_CRITERIA)
+    return True, corners
+
+
+def detect_chessboard_partial(gray: np.ndarray,
+                              board: Optional[config.CheckerboardSpec] = None
+                              ) -> Optional[Tuple[int, int]]:
+    """用更小的内角点阵去匹配画面里的局部棋盘，返回命中的尺寸，全不中返回 None。
+
+    用途是把"棋盘没拍全的照片"和"压根没有棋盘的地面照"分开。完整棋盘要求整块可见，
+    拍不全就一律检不出；但这两类图在流程里的去处完全不同——前者属于素材没拍好，
+    后者才是真正的逆透视候选。只靠"完整板检没检出"这一个二值判断，会把拍不全的
+    棋盘照误当成地面照塞进 ipm_input/，让用户在挑原图时莫名其妙看到一张棋盘。
+
+    候选尺寸由 board.partial_grids 按当前规格动态生成（见 CheckerboardSpec），
+    不能写死：换一块小棋盘之后，固定候选就全不合理了。
+
+    实测（38 张现场素材）：8 张地面照连 5x3 子网格都检不出，唯一那张拍不全的棋盘照
+    稳定命中 5x3，区分度是干净的。
+    """
+    spec = config.BOARD if board is None else board
+    if not hasattr(cv2, 'findChessboardCornersSB'):
+        return None
+    flags = (cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_EXHAUSTIVE
+             | cv2.CALIB_CB_ACCURACY)
+    for size in spec.partial_grids:
+        found, _corners = cv2.findChessboardCornersSB(gray, size, flags)
+        if found:
+            return size
+    return None
+
+
+def _calibrate_once(obj_points, img_points, img_size):
+    """跑一次 calibrateCamera，返回 (rms, K, D, rvecs, tvecs, std_int, per_view)。
+
+    优先用 calibrateCameraExtended 以拿到每张图的 RMS 与内参标准差；旧版 OpenCV
+    没有这个接口时退回 calibrateCamera，此时这两个量以空数组代替。
+    """
+    if hasattr(cv2, 'calibrateCameraExtended'):
+        rms, K, D, rvecs, tvecs, std_int, _std_ext, per_view = cv2.calibrateCameraExtended(
+            obj_points, img_points, img_size, None, None)
+        per_view = np.asarray(per_view, dtype=np.float64).ravel()
+        std_int = np.asarray(std_int, dtype=np.float64).ravel()
+    else:
+        rms, K, D, rvecs, tvecs = cv2.calibrateCamera(
+            obj_points, img_points, img_size, None, None)
+        per_view = np.array([], dtype=np.float64)
+        std_int = np.array([], dtype=np.float64)
+    return (rms, np.asarray(K, dtype=np.float64),
+            np.asarray(D, dtype=np.float64).ravel(),
+            rvecs, tvecs, std_int, per_view)
+
+
+def report_reprojection_error(obj_points, img_points, rvecs, tvecs,
+                              K: np.ndarray, D: np.ndarray) -> float:
+    """返回平均欧氏重投影误差（px）。
+
+    OpenCV 的 calibrateCamera 返回的是 RMS，比平均欧氏距离偏大；这里单独算一份
+    平均值，口径与 MATLAB cameraCalibrator 的 Overall Mean Error 一致，便于对比。
+    """
+    total_err = 0.0
+    total_pts = 0
+    for objp, imgp, rvec, tvec in zip(obj_points, img_points, rvecs, tvecs, strict=True):
+        proj, _ = cv2.projectPoints(objp, rvec, tvec, K, D)
+        diff = proj.reshape(-1, 2) - imgp.reshape(-1, 2)
+        total_err += float(np.sum(np.linalg.norm(diff, axis=1)))
+        total_pts += diff.shape[0]
+    return total_err / max(1, total_pts)
+
+
+__all__ = [
+    'SUBPIX_CRITERIA',
+    '_calibrate_once',
+    'detect_chessboard',
+    'detect_chessboard_partial',
+    'report_reprojection_error',
+]
+
