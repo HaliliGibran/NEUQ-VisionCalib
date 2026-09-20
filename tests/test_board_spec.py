@@ -8,9 +8,12 @@
 
 覆盖：
   A. 规格对象本身：换算、校验、局部子网格候选的推导
-  B. 命令行解析：--board-squares / --board-corners 互斥
+  B. 命令行解析：--board-squares / --board-corners 互斥、部分参数只改那一项
   C. 检测行为：同一张合成棋盘，规格对能检出、规格错检不出
   D. calib.json 往返：写入含 board 段，读取兼容老格式
+  E. 真的调用一次相机标定
+  F. project.json 跨重启、原子写
+  G. 素材库规格状态机：material_set 不被增量导入洗白、覆盖导入的事务性
 """
 from __future__ import annotations
 
@@ -125,7 +128,6 @@ def scenario_persistence() -> None:
     只放在进程全局里的话：设好 9x7 → 导入素材 → 关掉程序，
     第二天重开又变成 12x9，接着导入的新照片就会按另一套规格分类。
     """
-    import shutil
     tmp = Path(tempfile.mkdtemp(prefix='neuq_proj_'))
     old_root = core.SCRIPT_DIR
     old_board = core.BOARD
@@ -146,7 +148,7 @@ def scenario_persistence() -> None:
         # 模拟重启：清空进程状态，走启动路径重新解析工程根
         core.BOARD = core.DEFAULT_BOARD
         core.configure_paths(root=tmp)
-        check(core.BOARD == spec, '重启后规格被恢复',
+        check(spec == core.BOARD, '重启后规格被恢复',
               f'{core.BOARD.squares_x}x{core.BOARD.squares_y}/{core.BOARD.square_size_mm}')
 
         # 未显式给参数时，启动不得把 project.json 覆盖回默认值
@@ -156,12 +158,10 @@ def scenario_persistence() -> None:
               '启动不会把已保存的规格冲掉')
 
         # 素材按旧规格分类后改规格 → 必须提示
-        core.configure_paths(root=tmp)
-        import numpy as np
         core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
         core.safe_imwrite(core.DIR_CALIB_IN / 'a.jpg',
                           np.zeros((40, 40, 3), dtype=np.uint8))
-        core.update_project_config(last_import={'board': spec.to_dict()})
+        core.set_material_board(spec)
         other = core.CheckerboardSpec(12, 9, 20.0)
         stale = core.material_stale_reason(other)
         check(stale is not None and '不一致' in stale,
@@ -169,11 +169,160 @@ def scenario_persistence() -> None:
               (stale or '').splitlines()[0] if stale else '')
         check(core.material_stale_reason(spec) is None,
               '规格没变则不报警')
+
+        # project.json 原子写：不留 .tmp，读回来是完整的
+        names = [p.name for p in tmp.iterdir() if p.is_file()]
+        check(not any(n.endswith('.tmp') for n in names),
+              '写配置不留 .tmp 中间文件', str(names))
+
+        # 备份并清空会作废素材依据：否则下一次增量导入拿着一条对不上号的旧记录判 stale
+        core.clear_material_board()
+        check(core.load_project_config().get('material_set') is None,
+              '清空素材后 material_set 一并删除')
+        check(core.material_stale_reason(other) is None,
+              '没有依据时不再凭空报警')
     finally:
         core.configure_paths(root=old_root)
         core.configure_board(old_board, persist=False)
         import shutil as _sh
         _sh.rmtree(tmp, ignore_errors=True)
+
+
+def scenario_material_set() -> None:
+    """素材库的规格是"整套素材"的属性，不是"最近一次导入"的属性。
+
+    老模型把规格记在 last_import 上，于是这条路径能把脏状态洗白：
+      按 A 导入 → 改成 B → 增量导入一批 B → last_import.board = B → 系统认为
+      整个库都是 B，而磁盘上实际是「旧 A 素材 + 新 B 素材」。
+    """
+    import shutil
+    tmp = Path(tempfile.mkdtemp(prefix='neuq_matset_'))
+    old_root, old_board = core.SCRIPT_DIR, core.BOARD
+    spec_a = core.CheckerboardSpec(12, 9, 20.0)
+    spec_b = core.CheckerboardSpec(9, 7, 25.0)
+
+    def add_floors(folder: Path, n: int) -> Path:
+        """造几张纯灰图：任何规格都检不出棋盘，一律归到 ipm_input/。"""
+        folder.mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            core.safe_imwrite(folder / f'{folder.name}_{i}.jpg',
+                              np.full((80, 80, 3), 128, np.uint8))
+        return folder
+
+    try:
+        core.configure_paths(root=tmp / 'proj')
+        core.configure_board(spec_a)
+        src1 = add_floors(tmp / 'batch_a', 2)
+
+        # ---- A. 空库首次导入：任何规格都可以，并确立依据
+        got = core.import_dataset(src1, mode='add')
+        check(core.material_board() == spec_a, '首次导入确立 material_set.board',
+              str(core.material_board()))
+        check(got['imported_ipm'] == 2, '两张地面照入库', str(got['imported_ipm']))
+
+        # ---- B. 换规格 → stale，且增量导入不能洗白
+        core.configure_board(spec_b, persist=False)
+        check(core.material_stale_reason() is not None, '换规格后判为 stale')
+        src2 = add_floors(tmp / 'batch_b', 2)
+        try:
+            core.import_dataset(src2, mode='add')
+            check(False, 'stale 时拒绝增量导入')
+        except SystemExit as exc:
+            check('增量导入已中止' in str(exc), 'stale 时拒绝增量导入',
+                  str(exc).splitlines()[0])
+        check(core.material_board() == spec_a, '被拒绝的导入没有改写依据',
+              str(core.material_board()))
+        check(len(core.list_images(core.DIR_IPM_IN)) == 2, '被拒绝的导入没往库里加东西')
+        # 光警告不够：stale 时相机标定也要拦得住。旧标准挑进来的那批图，用新规格
+        # 逐张重检会悄悄剔掉一大半，剩下两三张照样标得出参数，只是没人会去怀疑。
+        try:
+            core.calibrate_camera()
+            check(False, 'stale 时拒绝相机标定')
+        except SystemExit as exc:
+            check('相机标定已中止' in str(exc), 'stale 时拒绝相机标定',
+                  str(exc).splitlines()[0])
+
+        # ---- C. 只有 replace 允许换规格，成功后才改写依据
+        core.import_dataset(src2, mode='replace')
+        check(core.material_board() == spec_b, '覆盖导入后才换依据',
+              str(core.material_board()))
+        check(core.material_stale_reason() is None, '覆盖导入后不再 stale')
+        check(not any(p.is_dir() and ('.staging' in p.name or '.old' in p.name)
+                      for p in (tmp / 'proj').iterdir()),
+              '成功后不留 .staging / .old',
+              str([p.name for p in (tmp / 'proj').iterdir() if p.is_dir()]))
+
+        # ---- D. 覆盖导入中途失败：正式素材库必须完全不动
+        before = sorted(p.name for p in core.list_images(core.DIR_IPM_IN))
+        real_copy = shutil.copy2
+        calls = {'n': 0}
+
+        def flaky_copy(a, b, *args, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 2:
+                raise OSError('模拟磁盘已满')
+            return real_copy(a, b, *args, **kwargs)
+
+        src3 = add_floors(tmp / 'batch_c', 3)
+        core.shutil.copy2 = flaky_copy
+        try:
+            core.import_dataset(src3, mode='replace')
+            check(False, '复制失败时应当抛出来')
+        except OSError:
+            check(True, '复制失败时抛出来（不静默吞掉）')
+        finally:
+            core.shutil.copy2 = real_copy
+        check(sorted(p.name for p in core.list_images(core.DIR_IPM_IN)) == before,
+              '覆盖导入中途失败：原素材库一个文件都没少',
+              f'{before} -> {[p.name for p in core.list_images(core.DIR_IPM_IN)]}')
+        check(core.material_board() == spec_b, '中途失败也不会改写依据')
+
+        # ---- E. 一张都没进来时不许覆盖：否则等于把素材库清空了
+        empty = tmp / 'unreadable'
+        empty.mkdir()
+        (empty / 'bad.jpg').write_bytes(b'not an image at all')
+        try:
+            core.import_dataset(empty, mode='replace')
+            check(False, '全部无法读取时拒绝覆盖')
+        except SystemExit as exc:
+            check('原素材库保持不变' in str(exc), '全部无法读取时拒绝覆盖',
+                  str(exc)[:40])
+        check(sorted(p.name for p in core.list_images(core.DIR_IPM_IN)) == before,
+              '上一条的拒绝确实没动素材库')
+
+        # ---- F. 老工程只有 last_import.board：认它作依据（迁移期不抓瞎）
+        legacy = tmp / 'legacy'
+        legacy.mkdir(parents=True)
+        core.configure_paths(root=legacy)
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_IPM_IN / 'floor.jpg',
+                          np.full((60, 60, 3), 128, np.uint8))
+        core.update_project_config(last_import={'board': spec_a.to_dict()})
+        check(core.material_board() == spec_a, '老配置的 last_import.board 仍当依据')
+        check(core.material_stale_reason(spec_b) is not None, '老配置也能判出 stale')
+
+        # ---- G. 库里已有素材但从没记过依据：增量导入要拦，标定不拦
+        orphan = tmp / 'orphan'
+        core.configure_paths(root=orphan)
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_IPM_IN / 'floor.jpg',
+                          np.full((60, 60, 3), 128, np.uint8))
+        check(core.material_basis_unknown_reason() is not None,
+              '素材库非空且无依据时给出说明')
+        try:
+            core.import_dataset(src1, mode='add')
+            check(False, '依据未知时拒绝增量导入')
+        except SystemExit as exc:
+            check('没记下' in str(exc), '依据未知时拒绝增量导入',
+                  str(exc).splitlines()[-1][:34])
+        core.clear_material_board()
+        core.clear_material_board()      # 幂等：重复删不报错
+        check(core.material_board() is None, 'clear 之后依据为空')
+    finally:
+        core.configure_paths(root=old_root)
+        core.configure_board(old_board)
+        shutil.rmtree(tmp, ignore_errors=True)
+
 
 
 def main() -> int:
@@ -214,6 +363,26 @@ def main() -> int:
         check(False, '同时给两种参数会报错')
     except SystemExit as exc:
         check('只能给一个' in str(exc), '同时给两种参数会报错', str(exc)[:36])
+
+    # 部分覆盖：只给一项时，没给的字段必须沿用**当前工程**的规格。
+    # 拿仓库默认值兜底的话，"只想把边长改成 30" 会顺手把方格数冲回 12x9。
+    saved = core.BOARD
+    try:
+        cases = (
+            ((None, None, 30.0), (9, 7, 30.0), '只给边长 → 方格数沿用工程的 9x7'),
+            (([10, 8], None, None), (10, 8, 25.0), '只给方格数 → 边长沿用工程的 25'),
+            (([10, 8], None, 30.0), (10, 8, 30.0), '两项都给 → 都按命令行'),
+            ((None, [8, 6], None), (9, 7, 25.0), '给内角点 8x6 → 换算成方格 9x7'),
+            ((None, None, None), (9, 7, 25.0), '一项都不给 → 原样'),
+        )
+        for given, want, why in cases:
+            core.configure_board(core.CheckerboardSpec(9, 7, 25.0))
+            r = core.resolve_board(*given)
+            check((r.squares_x, r.squares_y, r.square_size_mm) == want,
+                  f'当前工程 9x7/25 时 {why}',
+                  f'→ {r.squares_x}x{r.squares_y}/{r.square_size_mm:g}')
+    finally:
+        core.configure_board(saved)
 
     print('\n[C] 检测行为（合成棋盘，规格必须影响结果）')
     spec = core.CheckerboardSpec(12, 9, 20.0)
@@ -286,6 +455,9 @@ def main() -> int:
 
     print('\n[F] 持久化：project.json 记住项目用的棋盘')
     scenario_persistence()
+
+    print('\n[G] 素材库的规格状态机 + 覆盖导入事务')
+    scenario_material_set()
 
     print()
     if FAILED:

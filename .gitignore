@@ -8,6 +8,8 @@ __pycache__/
 # ---------------- 虚拟环境 ----------------
 .venv/
 venv/
+# README「代码检查」一节让建的独立 lint 环境（.venv-lint），别让它出现在 git status 里
+.venv-lint/
 env/
 ENV/
 

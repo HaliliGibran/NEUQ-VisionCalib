@@ -44,6 +44,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -189,15 +190,23 @@ def load_project_config() -> dict:
 
 
 def update_project_config(**sections) -> dict:
-    """合并若干段落到 project.json 并落盘，返回合并后的完整内容。"""
+    """合并若干段落到 project.json 并落盘，返回合并后的完整内容。
+
+    某个段落传 None 表示删除它 —— material_set 在素材库清空后就该消失，
+    留着一条过期的"分类依据"比没有更糟。
+    """
     data = load_project_config()
-    data.update(sections)
+    for key, value in sections.items():
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
     data['schema_version'] = SCHEMA_VERSION
     data['tool_version'] = TOOL_VERSION
     p = project_config_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
+        write_json_atomic(p, data)
     except OSError as exc:
         print(f'警告: 无法写入 {p}（{exc}），本次设置重启后不会保留。')
     return data
@@ -209,11 +218,19 @@ def restore_board() -> CheckerboardSpec:
     顺序不能反。project.json 是用户显式设过的；calib.json 只是"上次标定时用的"，
     作为迁移来源；都没有才退回仓库自带的 12x9/20mm。
     """
-    saved = spec_from_meta(load_project_config().get('board'))
+    cfg = load_project_config()
+    saved = spec_from_meta(cfg.get('board'))
     if saved is not None:
         return saved
     from_calib = spec_from_meta(calib_board_meta())
     if from_calib is not None:
+        # 只在 project.json 没有 board 段时补写一次，不去覆盖用户显式设过的规格。
+        # 缺了这一步，calib.json 就只是个"临时 fallback"：用户点一次「备份并清空」
+        # 把它删掉，规格便无声退回仓库默认的 12x9/20mm，而素材库还留在原地。
+        if 'board' not in cfg:
+            update_project_config(board=from_calib.to_dict())
+            print(f'标定板规格已从 calib.json 迁移进 {PROJECT_JSON_NAME}: '
+                  f'{from_calib.label}')
         return from_calib
     return DEFAULT_BOARD
 
@@ -237,6 +254,37 @@ def configure_board(spec: CheckerboardSpec,
     return BOARD
 
 
+def material_has_images() -> bool:
+    """素材库里是否已经有内容（只看两个分拣结果目录，不含暂存与备份）。"""
+    return any(list_images(d) for d in (DIR_CALIB_IN, DIR_IPM_IN))
+
+
+def material_board() -> Optional[CheckerboardSpec]:
+    """当前这套素材是按哪块棋盘分拣出来的；未知时 None。
+
+    刻意不记在"最近一次导入"上：那样一次增量导入就能把它改写掉，于是
+    「旧规格导的一批 + 新规格导的一批」会被认成整套都是新规格 —— 混合状态
+    被洗白，而它恰恰是最该报警的情况。
+    """
+    cfg = load_project_config()
+    set_board = spec_from_meta((cfg.get('material_set') or {}).get('board'))
+    if set_board is not None:
+        return set_board
+    # 老工程只记了 last_import：那时增量导入还没被拦住，理论上可能已经混过，
+    # 但总比"完全不知道按什么分类"强，先照搬过来当依据。
+    return spec_from_meta((cfg.get('last_import') or {}).get('board'))
+
+
+def set_material_board(spec: CheckerboardSpec) -> None:
+    """记下"现在这套素材是按 spec 分拣的"。"""
+    update_project_config(material_set={'board': spec.to_dict()})
+
+
+def clear_material_board() -> None:
+    """素材库清空了：分类依据随之作废，下一次导入重新确立。"""
+    update_project_config(material_set=None)
+
+
 def material_stale_reason(spec: Optional[CheckerboardSpec] = None) -> Optional[str]:
     """素材是否是按「另一块棋盘」分类的；是则返回说明，否则 None。
 
@@ -245,15 +293,36 @@ def material_stale_reason(spec: Optional[CheckerboardSpec] = None) -> Optional[s
     后面选逆透视原图时会莫名其妙看到混进来的棋盘照。
     """
     now = BOARD if spec is None else spec
-    cfg = load_project_config()
-    used = spec_from_meta((cfg.get('last_import') or {}).get('board'))
+    used = material_board()
     if used is None or used == now:
         return None
-    if not any(list_images(d) for d in (DIR_CALIB_IN, DIR_IPM_IN)):
+    if not material_has_images():
         return None                       # 素材库是空的，无所谓
     return (f'当前素材是按「{used.label}」分类导入的，与现在的「{now.label}」不一致。\n'
             '规格参与"棋盘照 / 地面照"的判定，请重新分类素材：'
-            '在界面上用「备份并清空」清空后按新规格重新导入。')
+            '清空素材库后按新规格重新导入，或用「覆盖整个素材库」导入。')
+
+
+def material_basis_unknown_reason() -> Optional[str]:
+    """素材库里已经有东西，但没记下它是按哪块棋盘分拣的。
+
+    这种场合不能再走增量导入：新导一批会把两套规格的产物混在一起，而系统对此
+    一无所知。相机标定倒不必拦 —— 它逐张重新检棋盘，检不出自然会被剔除并报错。
+    """
+    if material_board() is not None or not material_has_images():
+        return None
+    return (f'calib_input/ 与 ipm_input/ 里已有素材，但没记下它们是按哪块棋盘'
+            f'（当前是 {BOARD.label}）分拣的。\n'
+            '为避免混进两套规格的产物，请改用「覆盖整个素材库」导入，或先清空素材库。')
+
+
+def require_material_basis(what: str, block_unknown: bool = True) -> None:
+    """当前规格下这套素材还能不能用；不能用就中止 what 这件事。"""
+    reason = material_stale_reason()
+    if reason is None and block_unknown:
+        reason = material_basis_unknown_reason()
+    if reason is not None:
+        raise SystemExit(f'{what}已中止：\n{reason}')
 
 
 def resolve_board(squares: Optional[Sequence[int]] = None,
@@ -263,21 +332,28 @@ def resolve_board(squares: Optional[Sequence[int]] = None,
 
     --board-squares 是推荐的入口（和用户数棋盘的方式一致）；
     --board-corners 只作为兼容通道保留。两者同时给直接报错，不猜。
+
+    没给出的字段沿用**当前工程**的规格，而不是仓库默认值：项目已存 9x7/25 时
+    `--square-size-mm 30` 的含义是"只改边长"→ 9x7/30，而不是把方格数悄悄冲回
+    12x9。否则命令行上想调一项，就得先把其它几项全部抄一遍。
     """
     if squares is not None and corners is not None:
         raise SystemExit('--board-squares 与 --board-corners 只能给一个（两者语义相同，'
                          '同时给会互相矛盾）。')
     size = (square_size_mm if square_size_mm is not None
-            else DEFAULT_BOARD.square_size_mm)
+            else BOARD.square_size_mm)
     if corners is not None:
         return CheckerboardSpec(int(corners[0]) + 1, int(corners[1]) + 1, size)
     if squares is not None:
         return CheckerboardSpec(int(squares[0]), int(squares[1]), size)
-    return CheckerboardSpec(DEFAULT_BOARD.squares_x, DEFAULT_BOARD.squares_y, size)
+    return CheckerboardSpec(BOARD.squares_x, BOARD.squares_y, size)
 
 # 拍不全的棋盘照的归置目录（calib_input/ 的子目录）。放在子目录里是因为
 # list_images 不递归，这样它们既不会被误当成地面照，也不会进标定数据集被反复剔除。
 INCOMPLETE_SUBDIR = '_incomplete'
+
+# 覆盖导入的暂存目录后缀，与导出事务同一套路：新素材全部就位后一次性换装。
+STAGING_SUFFIX = '.staging'
 
 # 在线拍摄：置 True 时打开摄像头，空格存图到 calib_input/，回车结束采集。
 CAPTURE_ONLINE = False
@@ -514,6 +590,22 @@ def safe_imwrite(path: Path, img: np.ndarray, quality: int = 95) -> None:
     path.write_bytes(buf.tobytes())
 
 
+def write_json_atomic(path: Path, payload) -> None:
+    """先写同名 .tmp、fsync 落盘、再整体替换。
+
+    状态文件（project.json / calib.json）要能撑得起"重启之后照原样继续"，
+    而 `path.write_text()` 中途被打断会留下半截 JSON：下一次启动读到的是
+    JSONDecodeError，规格、素材分类依据这些事实就永久丢了。
+    """
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    tmp = path.with_name(path.name + '.tmp')
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    tmp.replace(path)
+
+
 SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
 
 
@@ -714,8 +806,13 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
     """棋盘标定，返回 (K, D, (W, H), fit_result)，并把每张图的重投影误差与去畸变预览一并输出。
 
     board 不给时用当前工程的规格（core.BOARD）；显式传入便于测试与将来拆分。
+
+    素材库是按另一块棋盘分拣的时候不允许开标：calib_input/ 里那批图是按旧规格的
+    判定标准挑进来的，用新规格逐张重检会悄悄剔掉一大半，剩下两三张也标得出参数，
+    只是精度和 provenance 都对不上。要换板子，就得按新规格重新导入。
     """
     spec = BOARD if board is None else board
+    require_material_basis('相机标定', block_unknown=False)
     files = list_images(DIR_CALIB_IN)
     if len(files) < 3:
         raise SystemExit(f'{DIR_CALIB_IN} 中标定图不足（当前 {len(files)} 张），'
@@ -892,7 +989,7 @@ def save_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
         'chessboard_corners': list(spec.corners),
         'square_size_mm': spec.square_size_mm,
     }
-    CALIB_JSON.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+    write_json_atomic(CALIB_JSON, payload)
     print('标定数据已保存:', CALIB_JSON)
 
 
@@ -2220,11 +2317,15 @@ def export_all(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
     return pair
 
 
-def _commit_dirs(pairs: Sequence[Tuple[Path, Path]]) -> None:
+def _commit_dirs(pairs: Sequence[Tuple[Path, Path]], what: str = 'matrix 与 lookup_table',
+                 keep_staging: bool = False) -> None:
     """把一批暂存目录整体换成正式目录；任何一步失败则全部回滚。
 
     先统一"挪走旧的"，再统一"放上新的"。这样一旦中途出错，两个目录都还躺在
     .old 里，可以一起复原——不会留下"一个已是新版、另一个还是旧版"的中间态。
+
+    keep_staging=True 时失败后保留暂存目录：素材导入的暂存目录里可能是用 --move
+    从用户目录搬过来的原件，删了就等于把源文件也删了。
     """
     moved: List[Tuple[Path, Path, Path]] = []      # (target, backup, stage)
     try:
@@ -2242,10 +2343,13 @@ def _commit_dirs(pairs: Sequence[Tuple[Path, Path]]) -> None:
             shutil.rmtree(target, ignore_errors=True)
             if backup.exists():
                 backup.rename(target)
-        # 暂存区里是这一轮没能提交的新内容：留着只会让人误以为导出成功了
         for stage, _target in pairs:
-            shutil.rmtree(stage, ignore_errors=True)
-        print('换装失败，已回滚到导出前的状态（matrix 与 lookup_table 一并复原）。')
+            if keep_staging:
+                print(f'  未能就位的新内容仍留在 {stage}，确认后可自行删除。')
+            else:
+                # 暂存区里是这一轮没能提交的新内容：留着只会让人误以为已经生成了
+                shutil.rmtree(stage, ignore_errors=True)
+        print(f'换装失败，已回滚到改动前的状态（{what} 一并复原）。')
         raise
     for _target, backup, _stage in moved:
         shutil.rmtree(backup, ignore_errors=True)
@@ -2353,7 +2457,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument('--import-dir', type=Path, metavar='DIR',
                     help='把混合素材目录按"能否检出棋盘"拆分进 calib_input/ 与 ipm_input/')
     ap.add_argument('--import-mode', choices=('add', 'replace'), default='add',
-                    help='增量添加（按文件名去重，默认）/ 覆盖（先清空两个目录再灌入）')
+                    help='增量添加（按文件名去重，默认，要求规格与现有素材一致）/ '
+                         '覆盖（新素材先备进暂存目录，全部成功后整体换装；换规格只能走这个）')
     ap.add_argument('--move', action='store_true',
                     help='--import-dir 时用移动代替复制')
 
@@ -2366,13 +2471,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     board_g = ap.add_argument_group('标定板规格')
     board_g.add_argument('--board-squares', nargs=2, type=int, metavar=('X', 'Y'),
-                         help='棋盘方格数，例如 12 9；默认 12 9。'
-                              '内角点数由程序换算（11x8），不用自己减 1')
+                         help='棋盘方格数，例如 12 9；不给则沿用当前工程里存的规格。'
+                              '内角点数由程序换算（12x9 → 11x8），不用自己减 1')
     board_g.add_argument('--board-corners', nargs=2, type=int, metavar=('X', 'Y'),
                          help='兼容用法：直接给内角点数（如 11 8）。'
                               '与 --board-squares 只能给一个')
     board_g.add_argument('--square-size-mm', type=float, metavar='MM',
-                         help=f'单格边长毫米，默认 {DEFAULT_BOARD.square_size_mm:g}')
+                         help='单格边长毫米；不给则沿用当前工程里存的规格')
 
     cal_g = ap.add_argument_group('标定参数')
     cal_g.add_argument('--force-calib', action='store_true',
@@ -2502,21 +2607,14 @@ def library_has(name: str) -> bool:
                (DIR_CALIB_IN, DIR_CALIB_IN / INCOMPLETE_SUBDIR, DIR_IPM_IN))
 
 
-def clear_calib_inputs() -> int:
-    """清空 calib_input/ 与 ipm_input/ 全部文件，返回被删的数量。
+def material_stage_pairs() -> List[Tuple[Path, Path]]:
+    """覆盖导入用的 (暂存目录, 正式目录) 对照。
 
-    覆盖导入的前置步骤：把现场可能积累下来的旧照片全清掉再灌新素材，
-    避免标定数据集里掺着几个不再使用的目录命名规则的图。
+    暂存目录与正式目录同级、同名加后缀，所以换装是同目录内的 rename，
+    不会跨盘。_incomplete/ 挂在 calib_input 下面，跟着父目录一起换。
     """
-    removed = 0
-    for folder in (DIR_CALIB_IN, DIR_IPM_IN):
-        if not folder.is_dir():
-            continue
-        for p in folder.rglob('*'):
-            if p.is_file():
-                p.unlink()
-                removed += 1
-    return removed
+    return [(d.with_name(d.name + STAGING_SUFFIX), d)
+            for d in (DIR_CALIB_IN, DIR_IPM_IN)]
 
 
 def import_dataset(src_dir: Path, move: bool = False,
@@ -2524,9 +2622,13 @@ def import_dataset(src_dir: Path, move: bool = False,
     """把混合素材目录按"能否检出棋盘"拆进 calib_input/ 与 ipm_input/。
 
     mode:
-      add (默认) — 增量导入，按文件名去重：目标里已有同名文件就跳过，
+      add (默认) — 增量导入，按文件名去重：素材库里已有同名文件就跳过，
                   没冲突的才复制/移入。重复点同一份素材时不会堆出 _1/_2 后缀。
-      replace — 覆盖导入，先清空 calib_input/ 与 ipm_input/ 全部文件，再灌入。
+                  要求当前规格与这套素材的分类依据一致，否则直接拒绝
+                  （两套规格的分拣结果混在一个库里，事后无从分辨）。
+      replace — 覆盖导入：先把新素材完整地准备进 *.staging/，全部成功后才
+                  整体换装。中途失败（磁盘满、权限、坏图）时正式的素材库
+                  一个文件都不会少。只有这个模式允许换棋盘规格。
 
     同名文件在 add 模式下跳过（不去重才追加 _1/_2 后缀）；move 控制是搬过来还是拷贝过来。
     返回 {"imported_calib","imported_ipm","skipped_duplicates","skipped_unreadable","cleared"}。
@@ -2537,65 +2639,92 @@ def import_dataset(src_dir: Path, move: bool = False,
     files = list_images(src)
     if not files:
         raise SystemExit(f'{src} 下没有图片。')
-
-    if mode == 'replace':
-        # 先把目标目录都建出来再清空。反过来的话，一旦后续拷贝失败，
-        # 用户会落得"旧的清掉了、新的也没进来"的空目录——这一步不能省。
-        for d in (DIR_CALIB_IN, DIR_CALIB_IN / INCOMPLETE_SUBDIR, DIR_IPM_IN):
-            d.mkdir(parents=True, exist_ok=True)
-        removed = clear_calib_inputs()
-        print(f'覆盖模式：先清空 calib_input/ 与 ipm_input/（{removed} 个旧文件）。')
-    elif mode != 'add':
+    if mode not in ('add', 'replace'):
         raise SystemExit(f'未知的 --import-mode {mode!r}，可选 add / replace。')
 
-    DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
-    DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+    # 分拣目的地：正式目录 -> 本轮实际写入的目录
+    incomplete = DIR_CALIB_IN / INCOMPLETE_SUBDIR
+    if mode == 'replace':
+        pairs = material_stage_pairs()
+        dest_of = {
+            DIR_CALIB_IN: pairs[0][0],
+            incomplete: pairs[0][0] / INCOMPLETE_SUBDIR,
+            DIR_IPM_IN: pairs[1][0],
+        }
+        for stage, _ in pairs:
+            shutil.rmtree(stage, ignore_errors=True)
+            stage.mkdir(parents=True, exist_ok=True)
+    else:
+        require_material_basis('增量导入')
+        pairs = []
+        dest_of = {DIR_CALIB_IN: DIR_CALIB_IN,
+                   incomplete: incomplete,
+                   DIR_IPM_IN: DIR_IPM_IN}
+    for folder in dest_of.values():
+        folder.mkdir(parents=True, exist_ok=True)
     action = shutil.move if move else shutil.copy2
 
     print(f'导入 {src}')
     print(f'  标定板 {BOARD.label}，'
           f'共 {len(files)} 张，模式 {mode}，{"移动" if move else "复制"}到工程目录\n')
     calib_n = ipm_n = skip_n = dup_n = partial_n = 0
-    for path in files:
-        img = safe_imread(path)
-        if img is None:
-            print(f'  [跳过] {path.name}（无法读取）')
-            skip_n += 1
-            continue
+    try:
+        for path in files:
+            img = safe_imread(path)
+            if img is None:
+                print(f'  [跳过] {path.name}（无法读取）')
+                skip_n += 1
+                continue
 
-        gray = to_gray(img)
-        found, _corners = detect_chessboard(gray)
-        partial = None
-        if found:
-            dest_dir, tag = DIR_CALIB_IN, '棋盘'
-        else:
-            # 完整板没检出，再退一步找局部子网格：命中说明是棋盘照没拍全，
-            # 而不是地面照。归到 _incomplete/ 子目录，避免污染 ipm_input/ 的候选列表。
-            partial = detect_chessboard_partial(gray)
-            if partial is not None:
-                dest_dir = DIR_CALIB_IN / INCOMPLETE_SUBDIR
-                tag = f'棋盘不全({partial[0]}x{partial[1]})'
+            gray = to_gray(img)
+            found, _corners = detect_chessboard(gray)
+            partial = None
+            if found:
+                final_dir, tag = DIR_CALIB_IN, '棋盘'
             else:
-                dest_dir, tag = DIR_IPM_IN, '地面'
+                # 完整板没检出，再退一步找局部子网格：命中说明是棋盘照没拍全，
+                # 而不是地面照。归到 _incomplete/ 子目录，避免污染 ipm_input/ 的候选列表。
+                partial = detect_chessboard_partial(gray)
+                if partial is not None:
+                    final_dir = incomplete
+                    tag = f'棋盘不全({partial[0]}x{partial[1]})'
+                else:
+                    final_dir, tag = DIR_IPM_IN, '地面'
+            dest_dir = dest_of[final_dir]
 
-        target = dest_dir / path.name
-        if mode == 'add' and library_has(path.name):
-            print(f'  [跳过] {path.name}（素材库里已存在）')
-            dup_n += 1
-            continue
-        # 目标目录可能是刚引入的子目录（_incomplete），逐次确保它存在再拷。
-        # 只在外层 mkdir 一次是不够的。
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = unique_destination(target)
-        action(str(path), str(dest))
-        print(f'  [{tag}] {path.name} -> {dest_dir.relative_to(SCRIPT_DIR)}/'
-              + ('' if dest.name == path.name else f'（重命名为 {dest.name}）'))
-        if found:
-            calib_n += 1
-        elif partial is not None:
-            partial_n += 1
-        else:
-            ipm_n += 1
+            target = dest_dir / path.name
+            if mode == 'add' and library_has(path.name):
+                print(f'  [跳过] {path.name}（素材库里已存在）')
+                dup_n += 1
+                continue
+            dest = unique_destination(target)
+            action(str(path), str(dest))
+            print(f'  [{tag}] {path.name} -> {dest_dir.relative_to(SCRIPT_DIR)}/'
+                  + ('' if dest.name == path.name else f'（重命名为 {dest.name}）'))
+            if found:
+                calib_n += 1
+            elif partial is not None:
+                partial_n += 1
+            else:
+                ipm_n += 1
+    except BaseException:
+        if mode == 'replace':
+            print('\n覆盖导入中断：正式的素材库未做任何改动，仍是原来那一套。')
+            for stage, _ in pairs:
+                print(f'  本轮已准备好的新素材停在 {stage}，确认后可自行删除。')
+        raise
+
+    if mode == 'replace':
+        if calib_n + partial_n + ipm_n == 0:
+            # 一张都没进来就不要真的去覆盖：否则换装把旧素材连同 .old 一起删了，
+            # 用户拿到的是一句"导入完成"和一个空库。
+            for stage, _ in pairs:
+                shutil.rmtree(stage, ignore_errors=True)
+            raise SystemExit('没有一张图成功入库，已放弃覆盖，原素材库保持不变。')
+        replaced = sum(1 for d in (DIR_CALIB_IN, DIR_IPM_IN) if d.is_dir()
+                       for p in d.rglob('*') if p.is_file())
+        _commit_dirs(pairs, what='calib_input 与 ipm_input', keep_staging=True)
+        print(f'覆盖模式：旧素材库（{replaced} 个文件）已被这一轮替换。')
 
     parts = [f'棋盘 {calib_n} 张']
     if partial_n:
@@ -2614,13 +2743,19 @@ def import_dataset(src_dir: Path, move: bool = False,
         print(f'{DIR_IPM_IN.name}/ 里有 {ipm_n} 张地面候选，'
               '需人工挑出真正用于逆透视标定的那一张，再用 --ipm-source 指定。')
 
-    # 记下这批素材是按哪块棋盘分类的：以后改了规格就能立刻判断出"素材已过期"，
-    # 而不是等用户在逆透视候选里看到混进来的棋盘照才发现。
+    # 这套素材现在整体是按哪块棋盘分拣的，是**工程级事实**，必须单独记：
+    # 记在"最近一次导入"上的话，一次增量导入就能把混合状态洗白。
+    set_material_board(BOARD)
     update_project_config(last_import={
-        'board': BOARD.to_dict(),
         'at': time.strftime('%Y-%m-%d %H:%M:%S'),
         'mode': mode,
+        'counts': {'calib': calib_n, 'partial': partial_n, 'ipm': ipm_n},
     })
+
+    return {'mode': mode, 'imported_calib': calib_n,
+            'imported_partial': partial_n, 'imported_ipm': ipm_n,
+            'skipped_duplicates': dup_n, 'skipped_unreadable': skip_n,
+            'cleared': mode == 'replace'}
 
     return {'mode': mode, 'imported_calib': calib_n,
             'imported_partial': partial_n, 'imported_ipm': ipm_n,
@@ -2647,6 +2782,10 @@ def print_inventory() -> None:
         ('backups', DIR_BACKUP, '备份并清空产生的归档', True),
     )
     print(f'工程根目录: {SCRIPT_DIR}\n')
+    basis = material_board()
+    print(f'  当前标定板           {BOARD.label}')
+    print('  素材库的分类依据     '
+          + (basis.label if basis is not None else '（无记录）') + '\n')
     for name, path, desc, recursive in rows:
         if not path.is_dir():
             state = '缺失'

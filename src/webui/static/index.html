@@ -46,11 +46,13 @@
       </div>
       <p class="hint inline">方格至少 4×5 或 5×4；OpenCV 内角点：<code id="board-corners">11 × 8</code></p>
       <div id="board-active" class="hint mono"></div>
+      <div id="board-stale" class="stale" hidden></div>
     </article>
 
     <article class="card" id="step-import">
       <div class="card-head"><span class="num">1</span><h3>导入素材</h3></div>
       <p class="hint">把棋盘照和地面照混在一起的目录丢进来，按"能否检出棋盘"自动分拣。</p>
+      <div id="import-stale" class="stale" hidden></div>
       <label>素材目录
         <input id="in-import-dir" type="text" placeholder="例如 WIN_20260903_17_22_10_Pro 或 D:\素材\9月">
       </label>
@@ -60,8 +62,8 @@
         <span class="hint inline">只填文件夹名即可，会依次在工程根、data/、data/import/ 下查找；也支持绝对路径。</span>
       </div>
       <div class="row mode-row">
-        <label><input type="radio" name="import-mode" value="add" checked> 增量添加（按文件名去重）</label>
-        <label><input type="radio" name="import-mode" value="replace"> 覆盖整个素材库</label>
+        <label><input type="radio" name="import-mode" value="add" checked> 增量添加（要求规格与现有素材一致）</label>
+        <label><input type="radio" name="import-mode" value="replace"> 覆盖整个素材库（换规格只能走这个）</label>
       </div>
       <label class="row"><input id="in-import-move" type="checkbox"> 移动而非复制（仅"填路径"时有效，上传时忽略）</label>
       <button id="btn-import" class="primary">开始导入</button>

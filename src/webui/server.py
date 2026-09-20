@@ -268,6 +268,9 @@ def api_status() -> dict:
         'calib': calib,
         'calib_board': core.calib_board_meta(),
         'board': board_payload(),
+        # 素材是否按旧规格分拣的，必须常驻可见：只在"应用规格"那一刻回显一次的话，
+        # 刷新页面或重启服务之后警告就消失了，而脏状态还原样留着。
+        'material_stale': material_warning(),
         'ipm_state': core.load_ipm_state(),
         'ipm_candidates': [p.name for p in core.list_images(core.DIR_IPM_IN)],
         'ipm_source': safe_rel(STATE['src_path']) if STATE['src_path'] else None,
@@ -369,6 +372,15 @@ def api_upload_import(fields: dict, files: list) -> dict:
             'summary': summary, 'folder': folder, 'uploaded': written}
 
 
+def material_warning() -> str | None:
+    """界面上要常驻显示的素材库告警：分拣依据与当前规格不符，或根本无从判断。
+
+    core 里这两条判据分别拦在 stale 检查与增量导入闸门上，界面不必区分——
+    对用户来说都是"这批素材不能再往下用了，请重新导入"。
+    """
+    return core.material_stale_reason() or core.material_basis_unknown_reason()
+
+
 def board_payload() -> dict:
     """当前生效的标定板规格，供界面回显。"""
     b = core.BOARD
@@ -420,7 +432,7 @@ def apply_board(body: dict) -> dict:
     # 接着导入的新照片就会按另一套规格分类。
     core.configure_board(spec, persist=True)
     payload = board_payload()
-    payload['material_stale'] = core.material_stale_reason()
+    payload['material_stale'] = material_warning()
     return payload
 
 
@@ -466,7 +478,14 @@ def api_import_status() -> dict:
     }
 
 
-DIR_BACKUP = core.DIR_BACKUP
+def dir_backup() -> Path:
+    """备份目录 —— 必须每次现取，不能在 import 时抄一份。
+
+    `--root` 是在模块导入**之后**才通过 core.configure_paths() 改写的，那时
+    抄下来的目录还指着工程自带的位置：备份会写进旧根，而清空的是新根的目录，
+    越界检查也跟着放行。core.DIR_IMPORT 一直是现取的，这里保持一致。
+    """
+    return core.DIR_BACKUP
 
 # 会被打包 + 清空的目录（均直接位于工程根）。
 # 刻意不含 assets/checkerboard/（参考靶标，不是产物）、tools/、src/、主脚本本身，
@@ -516,6 +535,9 @@ def _clear_project_folders() -> tuple:
     # 内存里的标定与逆透视状态一并作废，否则界面还显示着已经被清掉的标定
     STATE.update(K=None, D=None, Knew=None, img_size=None,
                  src_path=None, src_raw=None, src_undist=None)
+    # 素材库空了，"这套素材按哪块棋盘分拣"这个事实也就不存在了。
+    # 不清的话，下一次增量导入会拿一条对不上号的旧依据去判 stale。
+    core.clear_material_board()
     return removed, kept, entries
 
 
@@ -544,8 +566,9 @@ def api_backup_clear(body: dict) -> dict:
     stamp = time.strftime('%Y%m%d_%H%M%S')
     name = raw_name or stamp
 
-    target = (DIR_BACKUP / name).resolve()
-    if not target.is_relative_to(DIR_BACKUP.resolve()):
+    backup_root = dir_backup()
+    target = (backup_root / name).resolve()
+    if not target.is_relative_to(backup_root.resolve()):
         raise ValueError('备份路径越界。')
     if target.exists():
         raise ValueError(f'备份 {name} 已存在，换个名字或留空用时间戳。')
@@ -575,10 +598,14 @@ def api_backup_clear(body: dict) -> dict:
         if zf.testzip() is not None:
             raise SystemExit('打包失败：压缩包损坏，已中止，原目录未改动。')
 
+    # 必须在清空之前取：这份快照回答的是"这批素材当时是按什么规格分类的"，
+    # 而那件事只活在 project.json 里。光留着活的 project.json 不够 ——
+    # 下一轮导入会把 material_set 改写掉，这一批的依据就永久查不到了。
     manifest = {
         'name': name,
         'created': time.strftime('%Y-%m-%d %H:%M:%S'),
         'project_root': str(core.SCRIPT_DIR),
+        'project_config': core.load_project_config(),
         'archive': archive.name,
         'archive_bytes': archive.stat().st_size,
         'source_bytes': total,
@@ -599,8 +626,9 @@ def api_backup_clear(body: dict) -> dict:
 def api_backup_list() -> dict:
     """列出已有的备份，供界面回显。"""
     items = []
-    if DIR_BACKUP.is_dir():
-        for d in sorted(DIR_BACKUP.iterdir(), reverse=True):
+    backup_root = dir_backup()
+    if backup_root.is_dir():
+        for d in sorted(backup_root.iterdir(), reverse=True):
             if not d.is_dir():
                 continue
             man = d / 'manifest.json'

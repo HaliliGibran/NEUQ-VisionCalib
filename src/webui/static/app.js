@@ -246,6 +246,18 @@ async function withBusy(btn, fn) {
 
 // ---------------------------------------------------------------- 状态
 
+// 素材库的分拣依据与当前规格对不上（或压根没记过）：在「标定板规格」和「导入素材」
+// 两张卡片上常驻显示。只往日志里打一行的话，刷新一次页面警告就没了，而脏状态还原样
+// 留着 —— 用户照样会在逆透视候选里看到混进来的棋盘照。
+function renderMaterialWarning(reason) {
+  ['board-stale', 'import-stale'].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.textContent = reason ? '⚠ ' + reason : '';
+    el.hidden = !reason;
+  });
+}
+
 async function refreshStatus() {
   const st = await api('/api/status');
   const calib = st.calib;
@@ -278,6 +290,7 @@ async function refreshStatus() {
       `\n本次标定使用：${b.squares_x}×${b.squares_y} 方格 / ` +
       `${b.square_size_mm} mm / 内角点 ${b.corners_x}×${b.corners_y}`;
   }
+  renderMaterialWarning(st.material_stale);
 
   const badge = $('gallery-badge');
   if (badge) {
@@ -1161,6 +1174,7 @@ function bindActions() {
       log(`标定板规格已设为 ${b.label}（OpenCV 内角点 ${b.corners_x}×${b.corners_y}）`
         + '，已写入 project.json', 'ok');
       // 规格参与"棋盘照/地面照"的判定：改了规格，已导入的素材就是按旧标准分的
+      renderMaterialWarning(b.material_stale);
       if (b.material_stale) log('⚠ ' + b.material_stale, 'err');
     } catch (e) { log('规格设置失败: ' + e.message, 'err'); }
   });
@@ -1174,6 +1188,7 @@ function bindActions() {
       $('in-board-mm').value = b.square_size_mm;
       updateBoardHint();
       $('board-active').textContent = '当前生效：' + b.label;
+      renderMaterialWarning(b.material_stale);
       log('已恢复为仓库自带棋盘 12×9 / 20 mm', 'ok');
     } catch (e) { log('恢复失败: ' + e.message, 'err'); }
   });
@@ -1217,7 +1232,7 @@ function bindActions() {
         if (s.imported_partial) bits.push(`棋盘不全 ${s.imported_partial} 张`);
         bits.push(`地面 ${s.imported_ipm} 张`);
         if (s.skipped_duplicates) bits.push(`重复跳过 ${s.skipped_duplicates} 张`);
-        if (s.cleared) bits.push('已先清空两个目录');
+        if (s.cleared) bits.push('已整体替换原素材库');
         log('导入摘要: ' + bits.join('，'),
           (s.imported_calib || s.imported_ipm || s.imported_partial) ? 'ok' : 'err');
       }

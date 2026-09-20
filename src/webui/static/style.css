@@ -101,6 +101,17 @@ main {
 .hint.pad { padding: 0 2px; }
 .hint.inline { margin: 0; }
 
+/* 素材库的分拣依据与当前规格对不上：常驻告警，直到重新导入才消失。
+   只在"应用规格"那一刻往日志里打一行是不够的——刷新页面警告就没了，
+   而脏状态还原样留着，用户照样会在逆透视候选里看到混进来的棋盘照。 */
+.stale {
+  margin: 0 0 8px; padding: 6px 8px;
+  background: var(--warn-bg); color: var(--warn);
+  border: 1px solid #fac775; border-radius: 6px;
+  font-size: 12px; white-space: pre-wrap;
+}
+.stale[hidden] { display: none; }
+
 /* 标定柱状图占位 */
 .chart-wrap {
   margin: 4px 0 10px;
