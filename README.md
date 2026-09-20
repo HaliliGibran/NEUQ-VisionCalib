@@ -51,6 +51,40 @@
 素材导入有两种方式：在网页里用「选择文件夹…」**直接上传**（推荐，文件夹改名、
 放在哪个盘都无所谓），或在输入框里填路径让服务端按 `工程根 → data/import/` 查找。
 
+### 代码分层
+
+`neuq_core/` 是可复用底层，`neuq_vision_calib.py` 是应用编排层（CLI 入口 + 兼容
+facade）。外部调用方式始终是 `import neuq_vision_calib as core`，底层模块拆分
+不影响它——facade 把底层符号原名转发出来，`core.compute_homography`、
+`core.safe_imread` 这些名字指向的就是底层模块里的同一个函数对象，不是副本。
+
+```
+neuq_core/
+├── io.py            图像读写（绕开 OpenCV 的非 ASCII 路径坑）
+├── config.py        标定板规格、project.json、素材库状态机
+├── geometry.py      单应、多边形裁剪、有效视野尺度的纯几何运算
+├── calibration.py   棋盘检出与 calibrateCamera 的算法核
+└── lut.py           查找表的数学核（BirdView 像素 → 原图采样坐标）
+
+依赖方向（单向，无环）：
+  io / config / geometry -> 无项目内依赖
+  calibration            -> config
+  lut                    -> geometry
+  neuq_vision_calib.py   -> 以上全部
+```
+
+留在编排层的是**目录读写、运行时参数、用户交互、CLI、落盘、事务**这几类——它们
+本来就属于顶层，不是"还没拆完"。判据是"有没有粘着会被运行时改写的全局"：
+`configure_paths()` / `configure_board()` / `apply_options()` 会重新赋值 17 个路径
+全局和 13 个运行时开关（`BOARD`、`UNDIST_ALPHA`、`MAX_REPROJ_ERR`、`TABLE_FORMAT`
+等），读这些全局的函数一旦搬进底层模块，就得为它们再做一份镜像——那会把"一份
+权威状态"变成"到处都是镜像"，所以刻意停在这里。
+
+过渡期有一个已知妥协：`config.py` 持有 `SCRIPT_DIR` / `DIR_CALIB_IN` /
+`DIR_IPM_IN` / `BOARD` 的**镜像**，由 `configure_paths()` 与 `configure_board()`
+这两个唯一写入点同步过去。因此正式 API 只认这两个函数——直接 `core.BOARD = spec`
+赋值不会同步到底层模块，那是过渡形态的固有弱点，不是可依赖的用法。
+
 ---
 
 ## 环境要求
