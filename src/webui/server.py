@@ -717,7 +717,10 @@ def api_source(body: dict) -> dict:
     # 红字是不够的，用户照样能点下去一路导出。core 侧只拦了自动取图，这里
     # 连"用户点选了某一张"也一并拦住，而且拦在标定检查之前——素材本身不能用了，
     # 先补标定也没有意义。
-    core.require_material_basis('逆透视标定', block_unknown=False)
+    # block_unknown=True：这里取的图必然来自 ipm_input/，而"它在这个目录里"本身
+    # 就是过去某次分拣的结论。依据未知时无法证明它真是地面照，和 stale 一样要拦。
+    # （相机标定那边可以放行，因为它逐张重新检棋盘，检不出会被剔除并报错。）
+    core.require_material_basis('逆透视标定', block_unknown=True)
     ensure_calibration()
     name = (body.get('name') or '').strip()
 

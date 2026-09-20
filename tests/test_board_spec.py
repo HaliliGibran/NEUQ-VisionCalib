@@ -15,7 +15,8 @@
   F. project.json 跨重启、原子写
   G. 素材库规格状态机：material_set 不被增量导入洗白、覆盖导入的事务性
   H. 状态层边界：_incomplete/ 也算素材、stale 拦住逆透视取图、replace 遇坏图整批
-     放弃、project.json 读不动时 fail closed
+     放弃、project.json 读不动时 fail closed、库内显式指定仍要过闸、
+     replace --move 换装中途失败时原图一张不丢
 """
 from __future__ import annotations
 
@@ -63,6 +64,25 @@ def synth_pose(base, seed):
     dst = src + (rng.uniform(-0.05, 0.05, size=(4, 2)) * np.float32([w, h])).astype(np.float32)
     M = cv2.getPerspectiveTransform(src, dst)
     return cv2.warpPerspective(base, M, (w, h), borderValue=(255, 255, 255))
+
+
+def failing_rename_into(dest: Path):
+    """让"把某个 *.staging 换装成 dest"这一步失败，其余 rename 放行。
+
+    刻意按目标目录匹配而不是数第几次 rename：中间夹进一次 project.json 的原子写
+    就会把计数错位，而这个测试关心的恰恰是"第二个目录换装失败"这一个精确时刻。
+    返回还原函数。
+    """
+    import pathlib
+    orig = pathlib.Path.rename
+
+    def fake(self, target, *a, **kw):
+        if Path(target).name == dest.name and str(self).endswith('.staging'):
+            raise OSError(f'模拟把 {Path(self).name} 换装成 {dest.name} 时失败')
+        return orig(self, target, *a, **kw)
+
+    pathlib.Path.rename = fake
+    return lambda: setattr(pathlib.Path, 'rename', orig)
 
 
 def scenario_calibration() -> None:
@@ -292,7 +312,10 @@ def scenario_material_set() -> None:
         check(sorted(p.name for p in core.list_images(core.DIR_IPM_IN)) == before,
               '上一条的拒绝确实没动素材库')
 
-        # ---- F. 老工程只有 last_import.board：认它作依据（迁移期不抓瞎）
+        # ---- F. 老工程只有 last_import.board：刻意不采信，落到"依据未知"
+        # 早期版本允许"A 规格导一批 → 改成 B → 再增量导一批"，此时
+        # last_import.board = B 而库里其实是 A+B 混合。拿它当依据就是把最该
+        # 报警的混合状态认成 B，所以宁可判成未知，逼一次覆盖导入重建依据。
         legacy = tmp / 'legacy'
         legacy.mkdir(parents=True)
         core.configure_paths(root=legacy)
@@ -300,8 +323,14 @@ def scenario_material_set() -> None:
         core.safe_imwrite(core.DIR_IPM_IN / 'floor.jpg',
                           np.full((60, 60, 3), 128, np.uint8))
         core.update_project_config(last_import={'board': spec_a.to_dict()})
-        check(core.material_board() == spec_a, '老配置的 last_import.board 仍当依据')
-        check(core.material_stale_reason(spec_b) is not None, '老配置也能判出 stale')
+        check(core.material_board() is None,
+              '老配置的 last_import.board 不当依据', str(core.material_board()))
+        reason = core.material_basis_unknown_reason()
+        check(reason is not None and '最近一次导入' in reason,
+              '老配置落到"依据未知"并说明为何不采信',
+              (reason or '').splitlines()[-1][:36])
+        check(core.material_stale_reason(spec_b) is None,
+              '依据未知时不再谈 stale（改由 unknown 这条路拦）')
 
         # ---- G. 库里已有素材但从没记过依据：增量导入要拦，标定不拦
         orphan = tmp / 'orphan'
@@ -335,6 +364,9 @@ def scenario_state_guards() -> None:
       2. stale 时 ipm_input/ 同样不可信 —— 里面装的是"旧规格判它检不出棋盘"的照片。
       3. replace 遇坏图必须整批放弃，否则"19 张好图 + 1 张坏图"照样换掉旧库。
       4. 未来版本 / 损坏的 project.json 不许被当成空配置，更不许被覆盖降级。
+      5. 显式指定库内的图不算"绕过分拣结果"，仍要过闸；只有库外文件才放行。
+      6. replace --move 换装到一半失败时，被搬走的原图必须仍在暂存区 —— 这是
+         唯一一条会真的丢用户原始素材的路径。
     """
     import shutil
     tmp = Path(tempfile.mkdtemp(prefix='neuq_guard_'))
@@ -427,6 +459,84 @@ def scenario_state_guards() -> None:
         except SystemExit as exc:
             check('无法读取' in str(exc), '损坏的 project.json 不当空配置用',
                   str(exc).splitlines()[0][:40])
+
+        # ---- E. 显式指定"库内"的图仍要过闸，只有库外的外部图才放行
+        # 写得出文件名并不能让它重新可信：它躺在 ipm_input/ 里本身就是旧规格
+        # 分拣的结论。只放行库外文件，语义才和"不依赖分拣结果"对得上。
+        core.configure_paths(root=tmp / 'explicit')
+        core.configure_board(spec_a)
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_IPM_IN / 'ground.jpg', floor)
+        core.set_material_board(spec_a)
+        core.configure_board(spec_b)                     # 换规格 → 整库 stale
+        for label, arg in (('只写文件名', Path('ground.jpg')),
+                           ('写库内绝对路径', core.DIR_IPM_IN / 'ground.jpg')):
+            try:
+                core.discover_ipm_source(arg)
+                check(False, f'stale 时{label}指定库内图也被拦住')
+            except SystemExit as exc:
+                check('逆透视标定已中止' in str(exc),
+                      f'stale 时{label}指定库内图也被拦住', str(exc).splitlines()[0])
+        ext = tmp / 'explicit_outside.jpg'
+        core.safe_imwrite(ext, floor)
+        got_ext = core.discover_ipm_source(ext)
+        check(got_ext is not None and got_ext.name == ext.name,
+              '库外的外部图才真正放行', str(got_ext))
+        core.configure_board(spec_a)
+        core.clear_material_board()                      # 依据未知，不是 stale
+        try:
+            core.discover_ipm_source(Path('ground.jpg'))
+            check(False, '依据未知时库内图同样被拦住')
+        except SystemExit as exc:
+            check('没记下' in str(exc), '依据未知时库内图同样被拦住',
+                  str(exc).splitlines()[-1][:30])
+
+        # ---- F. replace + --move，第二个新目录换装失败：原图一张都不能丢
+        # 这是 keep_staging 最该生效的场合，而老实现恰好在这里失效：第一个 stage
+        # 已经 rename 成正式目录，回滚时按"撤掉新目录"把它 rmtree 掉，而那里面是
+        # --move 搬进来的仅存原件——用户目录和暂存区都已经没有了。
+        core.configure_paths(root=tmp / 'move_fail')
+        core.configure_board(spec_a)
+        core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_CALIB_IN / 'old_board.jpg', synth_board_image(spec_a))
+        core.safe_imwrite(core.DIR_IPM_IN / 'old_floor.jpg', floor)
+        core.set_material_board(spec_a)
+        old_calib = sorted(p.name for p in core.list_images(core.DIR_CALIB_IN))
+        old_ipm = sorted(p.name for p in core.list_images(core.DIR_IPM_IN))
+
+        user_dir = tmp / 'user_photos'                   # --move 之后这里会被清空
+        user_dir.mkdir()
+        base = synth_board_image(spec_a)
+        for i in range(3):
+            core.safe_imwrite(user_dir / f'shot_{i}.jpg', synth_pose(base, 100 + i))
+        core.safe_imwrite(user_dir / 'floor_new.jpg', floor)
+        sent = sorted(p.name for p in core.list_images(user_dir))
+
+        stage_calib, stage_ipm = (s for s, _t in core.material_stage_pairs())
+        restore = failing_rename_into(core.DIR_IPM_IN)
+        try:
+            core.import_dataset(user_dir, mode='replace', move=True)
+            check(False, 'ipm_input 换装失败时抛错回滚')
+        except OSError:
+            check(True, 'ipm_input 换装失败时抛错回滚')
+        finally:
+            restore()
+
+        check(sorted(p.name for p in core.list_images(core.DIR_CALIB_IN)) == old_calib,
+              '旧 calib_input 完整恢复',
+              str(sorted(p.name for p in core.list_images(core.DIR_CALIB_IN))))
+        check(sorted(p.name for p in core.list_images(core.DIR_IPM_IN)) == old_ipm,
+              '旧 ipm_input 完整恢复',
+              str(sorted(p.name for p in core.list_images(core.DIR_IPM_IN))))
+        staged = sorted(p.name for p in
+                        list(stage_calib.rglob('*')) + list(stage_ipm.rglob('*'))
+                        if p.is_file())
+        check(staged == sent, '被 --move 搬走的原图全部仍在 *.staging 里',
+              f'staging={staged}')
+        check(not core.list_images(user_dir),
+              '源目录确实已被 move 清空（所以 staging 是仅存的那一份）')
+        check(core.material_board() == spec_a, '失败的覆盖导入没改写依据')
     finally:
         core.configure_paths(root=old_root)
         core.configure_board(old_board)

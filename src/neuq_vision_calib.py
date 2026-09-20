@@ -277,20 +277,40 @@ def material_has_images() -> bool:
                (DIR_CALIB_IN, DIR_CALIB_IN / INCOMPLETE_SUBDIR, DIR_IPM_IN))
 
 
+def in_material_library(path: Path) -> bool:
+    """这个文件是不是素材库里的产物（而不是用户自己挑的外部图）。
+
+    用 is_relative_to 而非字符串前缀：后者会把 ipm_input2/ 之类的同名兄弟目录
+    误判成库内。
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    for d in (DIR_CALIB_IN, DIR_IPM_IN):
+        try:
+            if resolved.is_relative_to(d.resolve()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def material_board() -> Optional[CheckerboardSpec]:
     """当前这套素材是按哪块棋盘分拣出来的；未知时 None。
 
     刻意不记在"最近一次导入"上：那样一次增量导入就能把它改写掉，于是
     「旧规格导的一批 + 新规格导的一批」会被认成整套都是新规格 —— 混合状态
     被洗白，而它恰恰是最该报警的情况。
+
+    只有 material_set 算依据。老工程的 last_import.board 刻意**不**采信：
+    那时增量导入还没被拦，"A 规格导一批 → 改成 B → 再导一批"会留下
+    last_import.board = B，而库里其实是 A+B 混合。拿它当依据等于把混合状态
+    认成 B，正是最该报警的情况被洗白。宁可判成"依据未知"，逼一次覆盖导入
+    重新确立 material_set —— 老工程麻烦一次，换来干净的状态模型。
     """
     cfg = load_project_config()
-    set_board = spec_from_meta((cfg.get('material_set') or {}).get('board'))
-    if set_board is not None:
-        return set_board
-    # 老工程只记了 last_import：那时增量导入还没被拦住，理论上可能已经混过，
-    # 但总比"完全不知道按什么分类"强，先照搬过来当依据。
-    return spec_from_meta((cfg.get('last_import') or {}).get('board'))
+    return spec_from_meta((cfg.get('material_set') or {}).get('board'))
 
 
 def set_material_board(spec: CheckerboardSpec) -> None:
@@ -326,12 +346,22 @@ def material_basis_unknown_reason() -> Optional[str]:
 
     这种场合不能再走增量导入：新导一批会把两套规格的产物混在一起，而系统对此
     一无所知。相机标定倒不必拦 —— 它逐张重新检棋盘，检不出自然会被剔除并报错。
+
+    老工程（只有 last_import.board、没有 material_set）也落到这里：那个字段
+    证明不了整库的分类依据，见 material_board 的说明。
     """
     if material_board() is not None or not material_has_images():
         return None
+    legacy = spec_from_meta((load_project_config().get('last_import') or {}).get('board'))
+    hint = ''
+    if legacy is not None:
+        hint = (f'\n（工程配置里只记着"最近一次导入用的是 {legacy.label}"，'
+                '它证明不了整库都按这块棋盘分拣——早期版本允许换规格后增量导入，'
+                '所以这个值不作为依据。）')
     return (f'calib_input/（含 _incomplete/）与 ipm_input/ 里已有素材，'
             f'但没记下它们是按哪块棋盘（当前是 {BOARD.label}）分拣的。\n'
-            '为避免混进两套规格的产物，请改用「覆盖整个素材库」导入，或先清空素材库。')
+            '为避免混进两套规格的产物，请改用「覆盖整个素材库」导入，或先清空素材库。'
+            + hint)
 
 
 def require_material_basis(what: str, block_unknown: bool = True) -> None:
@@ -1016,6 +1046,10 @@ def calib_board_meta() -> Optional[dict]:
 
     没有它的话，过一阵子看到一份 calib.json 就只能猜"这是哪块棋盘算出来的"。
     老文件只存了内角点，这里顺手换算成方格数，界面不必分两种格式显示。
+
+    只读一个字段也要先过 schema 闸：restore_board() 会把这里读到的 board 迁进
+    project.json，绕过闸门等于让更新版本的 calib.json 反向污染旧工程配置——
+    而同一份文件走 load_calibration() 是会被拒绝的，两条路径必须一致。
     """
     if not CALIB_JSON.is_file():
         return None
@@ -1023,6 +1057,9 @@ def calib_board_meta() -> Optional[dict]:
         data = json.loads(CALIB_JSON.read_text(encoding='utf-8'))
     except (json.JSONDecodeError, OSError):
         return None
+    if not isinstance(data, dict):
+        return None
+    check_schema(data, str(CALIB_JSON))
     board = data.get('board')
     if board:
         return board
@@ -2344,8 +2381,14 @@ def _commit_dirs(pairs: Sequence[Tuple[Path, Path]], what: str = 'matrix 与 loo
 
     keep_staging=True 时失败后保留暂存目录：素材导入的暂存目录里可能是用 --move
     从用户目录搬过来的原件，删了就等于把源文件也删了。
+
+    "保留"必须覆盖到**已经就位**的那几个目录。它们的 stage 已经 rename 成正式
+    目录，stage 本身不复存在；此时若按"撤掉新目录"去 rmtree，删掉的正是那批
+    原件——用户目录里已经没有了，暂存区也没有了。所以已就位的要先搬回 stage，
+    绝不能删。
     """
     moved: List[Tuple[Path, Path, Path]] = []      # (target, backup, stage)
+    installed: List[Tuple[Path, Path]] = []        # (target, stage)，rename 真的成功过
     try:
         for stage, target in pairs:
             backup = target.with_name(target.name + '.old')
@@ -2355,13 +2398,34 @@ def _commit_dirs(pairs: Sequence[Tuple[Path, Path]], what: str = 'matrix 与 loo
             moved.append((target, backup, stage))
         for target, _backup, stage in moved:
             stage.rename(target)
+            installed.append((target, stage))
     except BaseException:
-        # 先撤掉可能已经就位的新目录，再把 .old 全部放回去
+        stranded: List[Path] = []
+        # 撤掉已经就位的新目录。keep_staging 时搬回暂存区而不是删除
+        for target, stage in reversed(installed):
+            if not keep_staging:
+                shutil.rmtree(target, ignore_errors=True)
+                continue
+            try:
+                shutil.rmtree(stage, ignore_errors=True)
+                target.rename(stage)
+            except OSError as exc:
+                # 搬不回去也绝不删：宁可留一个占位的正式目录要人工处置，
+                # 也不能让 --move 进来的原件在这里消失
+                stranded.append(target)
+                print(f'  警告: {target} 里是本轮的新内容（--move 导入时可能是仅存的原件），'
+                      f'无法搬回 {stage}（{exc}），已原样保留，请手工处置后重试。')
+        # 再把 .old 放回正式位置
         for target, backup, _stage in moved:
+            if target in stranded:
+                print(f'  {target} 仍被新内容占用，改动前的内容保留在 {backup}。')
+                continue
             shutil.rmtree(target, ignore_errors=True)
             if backup.exists():
                 backup.rename(target)
         for stage, _target in pairs:
+            if not stage.exists():
+                continue                  # 已就位又搬不回来的，上面已单独提示过
             if keep_staging:
                 print(f'  未能就位的新内容仍留在 {stage}，确认后可自行删除。')
             else:
@@ -3042,17 +3106,21 @@ def discover_ipm_source(explicit: Optional[Path] = None) -> Optional[Path]:
     "无法读取"结束，而目录里明明躺着可用素材。现在的顺序是
     显式指定 -> 约定名 -> 目录内唯一一张 -> 列出候选并要求显式指定。
 
-    显式指定的文件放行：它可能是用户自己挑的外部图，不依赖 ipm_input/ 的分拣结果。
-    自动取图则必须先过素材依据这一关 —— ipm_input/ 里躺着什么，恰恰是按旧规格
-    判出来的（"这张检不出棋盘，算地面照"），换了规格它就和 calib_input/ 一样不可信。
+    显式指定的文件分两种：位于 ipm_input/ 之内的，仍要过素材依据这一关——它躺在
+    那里本身就是旧规格分拣的结果（"这张检不出棋盘，算地面照"），用户写出文件名
+    并不能让它重新可信；只有素材库之外的外部图才真正绕过闸门，它不依赖任何分拣结果。
+    自动取图同理必须过闸，且依据未知时也要拦：文件被放进 ipm_input/ 就是过去分类
+    的产物，依据未知就无法证明它真是地面照。
     """
     if explicit is not None:
         p = resolve_user_path(explicit, DIR_IPM_IN)
         if not p.is_file():
             raise SystemExit(f'--ipm-source 指向的文件不存在: {p}\n'
                              f'（只写文件名时会到 {DIR_IPM_IN} 下查找）')
+        if in_material_library(p):
+            require_material_basis('逆透视标定', block_unknown=True)
         return p
-    require_material_basis('逆透视标定', block_unknown=False)
+    require_material_basis('逆透视标定', block_unknown=True)
 
     if IPM_SOURCE.is_file():
         return IPM_SOURCE
