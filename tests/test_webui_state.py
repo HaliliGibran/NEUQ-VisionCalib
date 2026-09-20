@@ -8,7 +8,7 @@
 于是"这批素材当时按什么规格分类"这个事实，备份里查不到。
 
 覆盖：
-  A. /api/status 常驻暴露 material_stale，replace 之后消失
+  A. /api/status 常驻暴露 material_stale，replace 之后消失；stale 时 api_source 被拒
   B. 备份 manifest 带 project_config 快照，且清空后素材库依据作废
   C. 备份目录跟着 --root 现取（不能停在 import 时抄下来的旧根）
 """
@@ -82,6 +82,15 @@ def main() -> int:
                   str(exc).splitlines()[0])
         check(server.api_status()['material_stale'] is not None,
               '被拒的增量导入没有把告警洗掉')
+
+        # 光看得见不够：stale 时 ipm_input/ 整体不可信（"这张检不出棋盘" 是旧规格
+        # 判的），用户照样能点一张原图一路做到导出，所以选原图这一步也要拦
+        try:
+            server.api_source({'name': 'floor_0.jpg'})
+            check(False, 'stale 时 api_source 被拒')
+        except SystemExit as exc:
+            check('逆透视标定已中止' in str(exc), 'stale 时 api_source 被拒',
+                  str(exc).splitlines()[0])
 
         # 覆盖导入才允许换规格，成功后告警消失
         server.api_import({'dir': str(tmp / 'batch_b'), 'mode': 'replace'})

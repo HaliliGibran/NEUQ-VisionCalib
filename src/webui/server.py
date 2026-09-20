@@ -712,8 +712,16 @@ def api_calibrate(body: dict) -> dict:
 
 def api_source(body: dict) -> dict:
     """选定逆透视标定原图并去畸变，返回图与一个起点四边形。"""
+    # 界面上的候选列表就是 ipm_input/ 的分拣结果，规格换了它整体不可信：
+    # 里面可能混着"新规格能认出是棋盘、旧规格认成地面"的照片。只在页面上飘一行
+    # 红字是不够的，用户照样能点下去一路导出。core 侧只拦了自动取图，这里
+    # 连"用户点选了某一张"也一并拦住，而且拦在标定检查之前——素材本身不能用了，
+    # 先补标定也没有意义。
+    core.require_material_basis('逆透视标定', block_unknown=False)
     ensure_calibration()
     name = (body.get('name') or '').strip()
+
+
     path = core.resolve_user_path(name, core.DIR_IPM_IN) if name else None
     if path is None or not path.is_file():
         path = core.discover_ipm_source()

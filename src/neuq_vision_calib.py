@@ -170,22 +170,34 @@ def project_config_path() -> Path:
 
 
 def load_project_config() -> dict:
-    """读取 project.json；不存在或损坏时返回空 dict（不阻断启动）。"""
+    """读取 project.json；不存在时返回空 dict，读不动则直接中止。
+
+    这里刻意**不吞异常**。project.json 已经不是可选缓存，它承载工程状态
+    （棋盘规格、素材库的分类依据）。一旦把"读失败"翻译成"空配置"，
+    update_project_config() 紧接着就会拿这份空配置去覆盖写：
+
+      新版程序写出 schema_version=2 → 旧版读到、报错、吞掉、返回 {}
+      → 用户点一次「应用棋盘规格」→ project.json 被降级成 schema=1，
+        material_set 等新字段全部丢失。
+
+    甚至不用点：启动时 restore_board() 从 calib.json 迁移规格也会写一次。
+    那正好与加 schema 闸门的初衷相反，所以未来版本与损坏文件都 fail closed，
+    由用户自己决定是修、是改名还是删除 —— 程序绝不自动覆盖它。
+    """
     p = project_config_path()
     if not p.is_file():
         return {}
     try:
         data = json.loads(p.read_text(encoding='utf-8'))
     except (json.JSONDecodeError, OSError) as exc:
-        print(f'注意: {p} 无法读取（{exc}），本次按默认配置运行。')
-        return {}
+        raise SystemExit(f'{p} 无法读取（{exc}）。\n'
+                         '它记录着本工程的棋盘规格与素材库的分类依据，'
+                         '为避免被覆盖，程序不会绕过它继续运行：'
+                         '请修好这个文件，或把它改名/删除后重新设置规格。') from None
     if not isinstance(data, dict):
-        return {}
-    try:
-        check_schema(data, str(p))
-    except SystemExit as exc:
-        print(f'注意: {exc}')          # 配置读不动不该让整个工具起不来
-        return {}
+        raise SystemExit(f'{p} 的内容不是一个 JSON 对象，无法当项目配置读。\n'
+                         '请修好它，或把它改名/删除后重新设置规格。')
+    check_schema(data, str(p))          # 未来版本的配置：拒绝读，更不能写回去
     return data
 
 
@@ -255,8 +267,14 @@ def configure_board(spec: CheckerboardSpec,
 
 
 def material_has_images() -> bool:
-    """素材库里是否已经有内容（只看两个分拣结果目录，不含暂存与备份）。"""
-    return any(list_images(d) for d in (DIR_CALIB_IN, DIR_IPM_IN))
+    """素材库里是否已经有内容（三个分拣结果目录，不含暂存与备份）。
+
+    `_incomplete/` 必须算进来：它同样是按规格分拣出来的产物。漏掉它就存在这条
+    洗白路径 —— 一批棋盘照全都只匹配到局部子网格，于是 calib_input/ 与 ipm_input/
+    都是空的，库被判成"空"，换规格不报 stale，增量导入直接把两套规格混进一个库。
+    """
+    return any(list_images(d) for d in
+               (DIR_CALIB_IN, DIR_CALIB_IN / INCOMPLETE_SUBDIR, DIR_IPM_IN))
 
 
 def material_board() -> Optional[CheckerboardSpec]:
@@ -311,8 +329,8 @@ def material_basis_unknown_reason() -> Optional[str]:
     """
     if material_board() is not None or not material_has_images():
         return None
-    return (f'calib_input/ 与 ipm_input/ 里已有素材，但没记下它们是按哪块棋盘'
-            f'（当前是 {BOARD.label}）分拣的。\n'
+    return (f'calib_input/（含 _incomplete/）与 ipm_input/ 里已有素材，'
+            f'但没记下它们是按哪块棋盘（当前是 {BOARD.label}）分拣的。\n'
             '为避免混进两套规格的产物，请改用「覆盖整个素材库」导入，或先清空素材库。')
 
 
@@ -2626,9 +2644,13 @@ def import_dataset(src_dir: Path, move: bool = False,
                   没冲突的才复制/移入。重复点同一份素材时不会堆出 _1/_2 后缀。
                   要求当前规格与这套素材的分类依据一致，否则直接拒绝
                   （两套规格的分拣结果混在一个库里，事后无从分辨）。
+                  遇到坏图跳过、其余照常入库（best effort：它只追加，不删东西）。
       replace — 覆盖导入：先把新素材完整地准备进 *.staging/，全部成功后才
                   整体换装。中途失败（磁盘满、权限、坏图）时正式的素材库
-                  一个文件都不会少。只有这个模式允许换棋盘规格。
+                  一个文件都不会少 —— 坏图同样算失败，整批放弃（all-or-nothing），
+                  否则"19 张好图 + 1 张坏图"会把旧库整套换成那 19 张。
+                  只有这个模式允许换棋盘规格。
+
 
     同名文件在 add 模式下跳过（不去重才追加 _1/_2 后缀）；move 控制是搬过来还是拷贝过来。
     返回 {"imported_calib","imported_ipm","skipped_duplicates","skipped_unreadable","cleared"}。
@@ -2707,7 +2729,17 @@ def import_dataset(src_dir: Path, move: bool = False,
                 partial_n += 1
             else:
                 ipm_n += 1
+
+        if mode == 'replace' and skip_n:
+            # 覆盖导入是 all-or-nothing：坏图与磁盘满、权限错一样都算失败。
+            # 放过去的话，"19 张好图 + 1 张坏图"会把旧素材库整套换成那 19 张，
+            # 而 README 承诺的是"中途失败时正式素材库一个文件都不会少"。
+            # add 模式仍是 best effort：它只往库里追加，不会删掉任何既有素材。
+            raise SystemExit(f'有 {skip_n} 张图片无法读取，已放弃覆盖，'
+                             '原素材库保持不变。\n'
+                             '请剔除坏图后重试；只想尽力导入能读的那些，用增量导入。')
     except BaseException:
+
         if mode == 'replace':
             print('\n覆盖导入中断：正式的素材库未做任何改动，仍是原来那一套。')
             for stage, _ in pairs:
@@ -2757,10 +2789,6 @@ def import_dataset(src_dir: Path, move: bool = False,
             'skipped_duplicates': dup_n, 'skipped_unreadable': skip_n,
             'cleared': mode == 'replace'}
 
-    return {'mode': mode, 'imported_calib': calib_n,
-            'imported_partial': partial_n, 'imported_ipm': ipm_n,
-            'skipped_duplicates': dup_n, 'skipped_unreadable': skip_n,
-            'cleared': mode == 'replace'}
 
 
 def print_inventory() -> None:
@@ -3013,6 +3041,10 @@ def discover_ipm_source(explicit: Optional[Path] = None) -> Optional[Path]:
     改造前这里写死 UnInverseImage.jpg：只要照片换个名字丢进 ipm_input/，流程就会以
     "无法读取"结束，而目录里明明躺着可用素材。现在的顺序是
     显式指定 -> 约定名 -> 目录内唯一一张 -> 列出候选并要求显式指定。
+
+    显式指定的文件放行：它可能是用户自己挑的外部图，不依赖 ipm_input/ 的分拣结果。
+    自动取图则必须先过素材依据这一关 —— ipm_input/ 里躺着什么，恰恰是按旧规格
+    判出来的（"这张检不出棋盘，算地面照"），换了规格它就和 calib_input/ 一样不可信。
     """
     if explicit is not None:
         p = resolve_user_path(explicit, DIR_IPM_IN)
@@ -3020,6 +3052,8 @@ def discover_ipm_source(explicit: Optional[Path] = None) -> Optional[Path]:
             raise SystemExit(f'--ipm-source 指向的文件不存在: {p}\n'
                              f'（只写文件名时会到 {DIR_IPM_IN} 下查找）')
         return p
+    require_material_basis('逆透视标定', block_unknown=False)
+
     if IPM_SOURCE.is_file():
         return IPM_SOURCE
     candidates = list_images(DIR_IPM_IN)

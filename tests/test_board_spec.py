@@ -14,6 +14,8 @@
   E. 真的调用一次相机标定
   F. project.json 跨重启、原子写
   G. 素材库规格状态机：material_set 不被增量导入洗白、覆盖导入的事务性
+  H. 状态层边界：_incomplete/ 也算素材、stale 拦住逆透视取图、replace 遇坏图整批
+     放弃、project.json 读不动时 fail closed
 """
 from __future__ import annotations
 
@@ -325,6 +327,112 @@ def scenario_material_set() -> None:
 
 
 
+def scenario_state_guards() -> None:
+    """状态层的四条边界，全部是"看起来已经拦住了、其实有旁路"那一类。
+
+      1. `_incomplete/` 也是分拣产物：漏算它，"全是拍不全的棋盘照"这批素材会
+         被当成空库，换规格不报 stale，增量导入直接混两套规格。
+      2. stale 时 ipm_input/ 同样不可信 —— 里面装的是"旧规格判它检不出棋盘"的照片。
+      3. replace 遇坏图必须整批放弃，否则"19 张好图 + 1 张坏图"照样换掉旧库。
+      4. 未来版本 / 损坏的 project.json 不许被当成空配置，更不许被覆盖降级。
+    """
+    import shutil
+    tmp = Path(tempfile.mkdtemp(prefix='neuq_guard_'))
+    old_root, old_board = core.SCRIPT_DIR, core.BOARD
+    spec_a = core.CheckerboardSpec(12, 9, 20.0)
+    spec_b = core.CheckerboardSpec(9, 7, 25.0)
+    floor = np.full((80, 80, 3), 128, np.uint8)
+    try:
+        # ---- A. 只有 _incomplete/ 里有图：仍然算"库非空"
+        core.configure_paths(root=tmp / 'incomplete_only')
+        core.configure_board(spec_a)
+        inc = core.DIR_CALIB_IN / core.INCOMPLETE_SUBDIR
+        inc.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(inc / 'half_board.jpg', floor)
+        core.set_material_board(spec_a)
+        check(core.material_has_images(), '_incomplete/ 里的图算素材库非空')
+        core.configure_board(spec_b)
+        check(core.material_stale_reason() is not None,
+              '只有 _incomplete/ 有图时，换规格照样判 stale')
+        src = tmp / 'batch'
+        src.mkdir()
+        core.safe_imwrite(src / 'floor.jpg', floor)
+        try:
+            core.import_dataset(src, mode='add')
+            check(False, '只有 _incomplete/ 时增量导入也被拦住')
+        except SystemExit as exc:
+            check('增量导入已中止' in str(exc), '只有 _incomplete/ 时增量导入也被拦住',
+                  str(exc).splitlines()[0])
+
+        # ---- B. stale 时不许继续做逆透视
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_IPM_IN / 'ground.jpg', floor)
+        try:
+            core.discover_ipm_source()
+            check(False, 'stale 时拒绝自动从 ipm_input/ 取图')
+        except SystemExit as exc:
+            check('逆透视标定已中止' in str(exc), 'stale 时拒绝自动从 ipm_input/ 取图',
+                  str(exc).splitlines()[0])
+        outside = tmp / 'outside.jpg'
+        core.safe_imwrite(outside, floor)
+        picked = core.discover_ipm_source(outside)
+        check(picked is not None and picked.name == 'outside.jpg',
+              '显式指定的外部图放行（它不依赖分拣结果）', str(picked))
+
+        # ---- C. replace 遇坏图：整批放弃（all-or-nothing），add 仍是 best effort
+        mixed = tmp / 'mixed'
+        mixed.mkdir()
+        core.safe_imwrite(mixed / 'ok_1.jpg', floor)
+        core.safe_imwrite(mixed / 'ok_2.jpg', floor)
+        (mixed / 'broken.jpg').write_bytes(b'not an image at all')
+        before = sorted(p.name for p in core.list_images(core.DIR_IPM_IN))
+        try:
+            core.import_dataset(mixed, mode='replace')
+            check(False, 'replace 里混进坏图时整批放弃')
+        except SystemExit as exc:
+            check('原素材库保持不变' in str(exc), 'replace 里混进坏图时整批放弃',
+                  str(exc).splitlines()[0][:30])
+        check(sorted(p.name for p in core.list_images(core.DIR_IPM_IN)) == before,
+              '被放弃的覆盖导入没动正式素材库', str(before))
+        check(core.material_board() == spec_a, '被放弃的覆盖导入没改写依据')
+        core.configure_board(spec_a)          # 回到一致状态，才轮得到坏图这条路径
+        got = core.import_dataset(mixed, mode='add')
+        check(got['imported_ipm'] == 2 and got['skipped_unreadable'] == 1,
+              'add 模式跳过坏图、其余照常入库', str(got))
+
+        # ---- D. project.json 读不动时 fail closed，绝不覆盖
+        core.configure_paths(root=tmp / 'future')
+        payload = {'schema_version': core.SCHEMA_VERSION + 1,
+                   'board': spec_b.to_dict(), 'future_only': 'keep me'}
+        core.project_config_path().parent.mkdir(parents=True, exist_ok=True)
+        core.project_config_path().write_text(json.dumps(payload), encoding='utf-8')
+        try:
+            core.load_project_config()
+            check(False, '未来版本的 project.json 拒绝读取')
+        except SystemExit as exc:
+            check('结构版本' in str(exc), '未来版本的 project.json 拒绝读取',
+                  str(exc).splitlines()[0][:40])
+        try:
+            core.configure_board(spec_a, persist=True)
+            check(False, '未来版本的 project.json 不会被降级覆盖')
+        except SystemExit:
+            check(True, '未来版本的 project.json 不会被降级覆盖')
+        raw = json.loads(core.project_config_path().read_text(encoding='utf-8'))
+        check(raw == payload, '文件内容原样保留', str(raw.get('schema_version')))
+
+        core.project_config_path().write_text('{ 这不是 JSON', encoding='utf-8')
+        try:
+            core.load_project_config()
+            check(False, '损坏的 project.json 不当空配置用')
+        except SystemExit as exc:
+            check('无法读取' in str(exc), '损坏的 project.json 不当空配置用',
+                  str(exc).splitlines()[0][:40])
+    finally:
+        core.configure_paths(root=old_root)
+        core.configure_board(old_board)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     print('[A] 规格对象')
     d = core.DEFAULT_BOARD
@@ -458,6 +566,9 @@ def main() -> int:
 
     print('\n[G] 素材库的规格状态机 + 覆盖导入事务')
     scenario_material_set()
+
+    print('\n[H] 状态层边界：_incomplete / 逆透视闸门 / 坏图 / 配置 fail closed')
+    scenario_state_guards()
 
     print()
     if FAILED:
