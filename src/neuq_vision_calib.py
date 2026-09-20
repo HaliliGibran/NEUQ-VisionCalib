@@ -48,7 +48,6 @@ import re
 import shutil
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -95,6 +94,7 @@ from neuq_core.config import (  # noqa: F401
 )
 from neuq_core.geometry import (  # noqa: F401
     DEGENERATE_EPS,
+    DEN_EPS,
     LINE_PARALLEL_EPS,
     apply_homography,
     clip_polygon_halfplane,
@@ -116,6 +116,16 @@ from neuq_core.io import (
     safe_imread,
     safe_imwrite,
     to_gray,
+)
+from neuq_core.lut import (  # noqa: F401
+    MapPair,
+    build_composite_reverse_map,
+    distort_points,
+    mask_out_of_range,
+    pixel_grid,
+    resample_map_pair,
+    table_spaces,
+    undistorted_grid,
 )
 
 # ---------------------------------------------------------------- 配置
@@ -194,7 +204,6 @@ HEADING_DEG = 0.0   # 物理标定区相对车辆前进坐标系的转角，正�
 MAX_RANGE_CM = 300.0
 MAX_LATERAL_CM = 300.0
 
-DEN_EPS = 1e-3          # 地平线裁剪余量，|den| 小于此值视为映射到无穷远
 DISPLAY_SCALE = 2.0     # 交互窗口放大倍数，仅影响显示与拾取
 PICK_RADIUS = 12        # 端点拾取半径（显示坐标下的像素）
 
@@ -1183,31 +1192,6 @@ def quantize_table(mat: np.ndarray) -> np.ndarray:
     return out
 
 
-def resample_map_pair(map_x: np.ndarray, map_y: np.ndarray,
-                      size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
-    """把一组映射表重采样到目标网格。
-
-    只在所有贡献像素都有效时才输出有效值：地平线两侧的坐标相差极大，跨越边界插值
-    会算出根本不存在的采样点，宁可把有效边界收缩一格。
-    """
-    h, w = map_x.shape
-    tw, th = size
-    if (w, h) == (tw, th):
-        return map_x, map_y
-
-    valid = (np.isfinite(map_x) & np.isfinite(map_y)
-             & (map_x >= 0.0) & (map_y >= 0.0))
-    interp = cv2.INTER_AREA if (tw < w or th < h) else cv2.INTER_LINEAR
-    keep = cv2.resize(valid.astype(np.float32), (tw, th), interpolation=interp) >= 0.999
-
-    out = []
-    for m in (map_x, map_y):
-        vals = cv2.resize(np.where(valid, m, 0.0).astype(np.float32), (tw, th),
-                          interpolation=interp).astype(np.float64)
-        out.append(np.where(keep, vals, np.nan))
-    return out[0], out[1]
-
-
 def write_table_txt(path: Path, mat: np.ndarray) -> None:
     """逗号分隔文本，非有限值写 -1。与历史产物格式完全一致。"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1334,36 +1318,6 @@ def clear_stale_tables(out_dir: Path) -> None:
             path.unlink()
 
 
-@dataclass
-class MapPair:
-    """一份"最终交付"的映射表。
-
-    这是整条打表链路的分水岭。重采样、无效哨兵、定点量化只在这里做一次，
-    之后序列化与批量测试消费的是同一个对象——而不是"写文件走一条链、
-    验证走另一条链"，那正是导出的表与验过的表其实是两份数据的老毛病。
-
-    `x`/`y` 里放的是 C 端重建出来的坐标（bin/c 已按 Q 定点还原），
-    所以拿它跑批量测试等价于拿真实交付物跑。
-    """
-
-    x: np.ndarray                      # (H, W) 输出像素 -> 源图采样坐标 X
-    y: np.ndarray                      # 同上，Y
-    source_size: Tuple[int, int]       # 采样坐标所在的原图分辨率 (W, H)
-    fixed_point: Optional[int] = None  # bin/c 的定点位数；文本格式为 None
-    qx: Optional[np.ndarray] = None    # 已量化的 int16 载荷（仅 bin/c）
-    qy: Optional[np.ndarray] = None
-
-    @property
-    def size(self) -> Tuple[int, int]:
-        """输出网格 (W, H)。TABLE_SIZE 生效时它就是重采样后的网格。"""
-        return self.x.shape[1], self.x.shape[0]
-
-    @property
-    def invalid(self) -> np.ndarray:
-        """无效点掩码；-1 是两套表约定的哨兵，任一分量落到图上即视为无效。"""
-        return (self.x < 0) | (self.y < 0)
-
-
 def prepare_map_pair(map_x: np.ndarray, map_y: np.ndarray,
                      source_size: Tuple[int, int]) -> MapPair:
     """把数学上算出的映射表加工成最终要交付的那一份。
@@ -1488,32 +1442,6 @@ def _load_c_header(path: Path, source_size: Tuple[int, int]) -> MapPair:
                    source_size=real_src, fixed_point=shift, qx=qs[0], qy=qs[1])
 
 
-def table_spaces(tag: str) -> dict:
-    """一套表的索引空间与取值空间。
-
-    四种表的语义各不相同，不能统一写一个 coordinate_space：
-      undistort reverse    : 索引 = 去畸变图像素，取值 = 原图采样坐标
-      undistort forward    : 索引 = 原图像素，    取值 = 去畸变图落点
-      undistort_ipm reverse: 索引 = BirdView 像素，取值 = 原图采样坐标
-      undistort_ipm forward: 索引 = 原图像素，    取值 = BirdView 落点
-    把 forward 表也标成 raw_distorted_px 会让 C 端直接理解反。
-    """
-    is_ipm = tag.startswith('undistort_ipm')
-    is_reverse = tag.endswith('reverse')
-    out_space = 'birdview_px' if is_ipm else 'undistorted_px'
-    if is_reverse:
-        return {'mapping_direction': 'dst_to_src',
-                'index_space': out_space,
-                'value_space': 'raw_distorted_px',
-                'index_desc': f'{out_space}（输出图像素）',
-                'value_desc': '原始畸变图上的采样坐标'}
-    return {'mapping_direction': 'src_to_dst',
-            'index_space': 'raw_distorted_px',
-            'value_space': out_space,
-            'index_desc': '原始畸变图像素',
-            'value_desc': f'{out_space}（输出图上的落点）'}
-
-
 def load_map_pair(folder: Path, source_size: Tuple[int, int],
                   grid: Optional[Tuple[int, int]] = None,
                   fixed_point: Optional[int] = None) -> MapPair:
@@ -1576,49 +1504,6 @@ def report_table_size(out_dir: Path, shape: Tuple[int, int]) -> None:
           f'体积 {total / 1024:.1f} KB（{len(files)} 个文件）')
 
 
-def pixel_grid(size: Tuple[int, int]) -> np.ndarray:
-    """返回 (H*W, 2) 的像素坐标点集，按行优先展开。"""
-    w, h = size
-    xs, ys = np.meshgrid(np.arange(w, dtype=np.float64),
-                         np.arange(h, dtype=np.float64))
-    return np.column_stack((xs.ravel(), ys.ravel()))
-
-
-def mask_out_of_range(pts: np.ndarray, size: Tuple[int, int],
-                      extra_valid: Optional[np.ndarray] = None) -> np.ndarray:
-    """把越界、非有限或未通过附加判据的点置 -1。
-
-    -1 是交付给 C 端的无效哨兵。越界坐标若原样写出去，C 端会当成合法采样点用，
-    所以必须和非有限值一样统一标掉。
-    """
-    p = np.asarray(pts, dtype=np.float64).reshape(-1, 2).copy()
-    w, h = size
-    valid = np.isfinite(p).all(axis=1)
-    valid &= (p[:, 0] >= 0.0) & (p[:, 0] <= w - 1.0)
-    valid &= (p[:, 1] >= 0.0) & (p[:, 1] <= h - 1.0)
-    if extra_valid is not None:
-        valid &= extra_valid
-    p[~valid] = -1.0
-    return p
-
-
-def undistorted_grid(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
-                     size: Tuple[int, int]) -> np.ndarray:
-    """每个原始畸变像素对应的去畸变坐标，(H*W, 2)。"""
-    grid = pixel_grid(size).reshape(-1, 1, 2)
-    return cv2.undistortPoints(grid, K, D, P=Knew).reshape(-1, 2)
-
-
-def distort_points(pts_undist: np.ndarray, K: np.ndarray, D: np.ndarray,
-                   Knew: np.ndarray) -> np.ndarray:
-    """去畸变像素 -> 原始畸变像素。畸变正向模型是闭式的，无需迭代。"""
-    norm = apply_homography(np.linalg.inv(Knew), pts_undist)
-    obj = np.column_stack((norm, np.ones(norm.shape[0])))
-    zeros = np.zeros(3, dtype=np.float64)
-    proj, _ = cv2.projectPoints(obj.reshape(-1, 1, 3), zeros, zeros, K, D)
-    return proj.reshape(-1, 2)
-
-
 def export_undistort_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                             size: Tuple[int, int],
                             table_root: Optional[Path] = None) -> MapPair:
@@ -1641,34 +1526,6 @@ def export_undistort_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
     print('去畸变表已写入:', out_dir)
     report_table_size(out_dir, rev_pair.size)
     return rev_pair
-
-
-def build_composite_reverse_map(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
-                                H: np.ndarray, H0: np.ndarray, sign: float,
-                                size: Tuple[int, int]
-                                ) -> Tuple[np.ndarray, np.ndarray]:
-    """BirdView 每个输出像素 -> 原始畸变图采样坐标，无效点标 -1。
-
-    两道判据都不能省：
-    1. 中间的去畸变坐标必须落在地平线的地面侧。地平线另一侧（相机后方）的输出像素
-       反投后同样会落在图内，坐标有限、下游无法识别，采样出来是镜像鬼影。
-    2. 中间的去畸变坐标必须落在图内。畸变多项式只在有效成像域内可逆，域外的点会被
-       径向项折返到图内某个无关位置。
-    """
-    w, h = size
-    und = apply_homography(np.linalg.inv(H), pixel_grid(size))
-
-    valid = np.isfinite(und).all(axis=1)
-    valid &= sign * homography_denominator(H0, und) >= DEN_EPS
-    valid &= (und[:, 0] >= 0.0) & (und[:, 0] <= w - 1.0)
-    valid &= (und[:, 1] >= 0.0) & (und[:, 1] <= h - 1.0)
-
-    dist = np.full_like(und, np.nan)
-    if valid.any():
-        dist[valid] = distort_points(und[valid], K, D, Knew)
-
-    dist = mask_out_of_range(dist, size, valid)
-    return dist[:, 0].reshape(h, w), dist[:, 1].reshape(h, w)
 
 
 def export_composite_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,

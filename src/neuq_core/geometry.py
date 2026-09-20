@@ -9,8 +9,6 @@
                         apply_options() 里用 global 重新赋值的运行时状态。搬它就得为这些
                         值做一份跨模块镜像，那是新增状态复制，不是这一刀的范围。它留在
                         facade，继续调用这里搬出来的 clip_polygon_halfplane / apply_homography。
-  DEN_EPS               自身没被重新赋值，但 LUT 那一坨还在直接用它，而 LUT 本轮不拆；
-                        不为一个常量做跨模块 re-export。
   MAX_RANGE_CM / MAX_LATERAL_CM
                         运行时状态，权威留在 facade。
   IpmCalibrator         交互标定类，依赖 cv2 窗口与大量运行时开关，不属于这一层。
@@ -22,6 +20,7 @@ import numpy as np
 
 LINE_PARALLEL_EPS = 1e-8    # 两直线求交的行列式下限，小于此值视为平行
 DEGENERATE_EPS = 1e-12      # DLT 归一化的平均距离下限，小于此值视为点集退化
+DEN_EPS = 1e-3          # 地平线裁剪余量，|den| 小于此值视为映射到无穷远
 
 
 def normalize_points_for_dlt(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -232,6 +231,7 @@ def max_scale_for_fov(poly_cm: np.ndarray, anchor_px: Tuple[float, float],
 
 __all__ = [
     'DEGENERATE_EPS',
+    'DEN_EPS',
     'LINE_PARALLEL_EPS',
     'apply_homography',
     'clip_polygon_halfplane',
