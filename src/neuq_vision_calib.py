@@ -403,6 +403,10 @@ INCOMPLETE_SUBDIR = '_incomplete'
 # 覆盖导入的暂存目录后缀，与导出事务同一套路：新素材全部就位后一次性换装。
 STAGING_SUFFIX = '.staging'
 
+# 换装时旧正式目录的暂时落脚点。和 STAGING_SUFFIX 一样必须是常量：
+# 事务残留检查要和 _commit_dirs 看同一组路径，写死两份字面量迟早对不上。
+BACKUP_SUFFIX = '.old'
+
 # 在线拍摄：置 True 时打开摄像头，空格存图到 calib_input/，回车结束采集。
 CAPTURE_ONLINE = False
 CAMERA_INDEX = 0
@@ -2391,7 +2395,14 @@ def _commit_dirs(pairs: Sequence[Tuple[Path, Path]], what: str = 'matrix 与 loo
     installed: List[Tuple[Path, Path]] = []        # (target, stage)，rename 真的成功过
     try:
         for stage, target in pairs:
-            backup = target.with_name(target.name + '.old')
+            backup = target.with_name(target.name + BACKUP_SUFFIX)
+            if keep_staging and backup.exists():
+                # 素材事务：.old 已经存在说明上一轮换装留下了残留，里面可能是
+                # 用户仅存的旧素材。宁可什么都不做，也不能顺手删掉它腾地方。
+                raise SystemExit(
+                    f'检测到上一次未完成的素材换装残留: {backup}\n'
+                    '它可能是上一轮特意保住的旧素材库。为避免覆盖，本次不做任何改动。\n'
+                    '请先确认其中内容并手工处置，再重试。')
             shutil.rmtree(backup, ignore_errors=True)
             if target.exists():
                 target.rename(backup)
@@ -2699,6 +2710,35 @@ def material_stage_pairs() -> List[Tuple[Path, Path]]:
             for d in (DIR_CALIB_IN, DIR_IPM_IN)]
 
 
+def material_transaction_residue() -> List[Path]:
+    """上一次素材导入事务留下的残留目录（*.staging / *.old）。
+
+    这些目录只会在换装失败时留下，而 --move 导入的暂存区里可能是用户照片的
+    **唯一副本**（原位置已经没有了）。所以新的覆盖导入必须先让路：
+    不猜"这是 copy 模式留下的、删了也没事"，一律要求人工确认。
+    """
+    found: List[Path] = []
+    for stage, target in material_stage_pairs():
+        for p in (stage, target.with_name(target.name + BACKUP_SUFFIX)):
+            if p.exists():
+                found.append(p)
+    return found
+
+
+def require_no_material_residue() -> None:
+    """有事务残留就拒绝启动新的覆盖导入。"""
+    residue = material_transaction_residue()
+    if not residue:
+        return
+    lines = '\n'.join(f'  - {p}' for p in residue)
+    raise SystemExit(
+        '检测到上一次未完成的素材导入残留：\n'
+        f'{lines}\n'
+        '这些目录可能包含通过 --move 搬入、已经不在原位置的唯一原件。\n'
+        '为避免数据丢失，本次不会自动删除或覆盖它们。\n'
+        '请先检查并恢复/备份其中内容，手工删除残留目录后再重试。')
+
+
 def import_dataset(src_dir: Path, move: bool = False,
                    mode: str = 'add') -> dict:
     """把混合素材目录按"能否检出棋盘"拆进 calib_input/ 与 ipm_input/。
@@ -2731,6 +2771,9 @@ def import_dataset(src_dir: Path, move: bool = False,
     # 分拣目的地：正式目录 -> 本轮实际写入的目录
     incomplete = DIR_CALIB_IN / INCOMPLETE_SUBDIR
     if mode == 'replace':
+        # 必须在创建暂存区之前检查：下面那句 rmtree(stage) 会毫不留情地
+        # 删掉上一轮失败时特意保住的 *.staging，而 --move 时那可能是唯一副本。
+        require_no_material_residue()
         pairs = material_stage_pairs()
         dest_of = {
             DIR_CALIB_IN: pairs[0][0],

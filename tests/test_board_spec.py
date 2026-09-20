@@ -66,6 +66,19 @@ def synth_pose(base, seed):
     return cv2.warpPerspective(base, M, (w, h), borderValue=(255, 255, 255))
 
 
+def tree_fingerprint(roots) -> str:
+    """一组目录的内容指纹（相对路径 + 字节），用来断言"一个字节都没动"。"""
+    import hashlib
+    h = hashlib.sha256()
+    for root in sorted(roots, key=str):
+        h.update(str(root).encode('utf-8'))
+        for p in sorted(root.rglob('*'), key=str):
+            if p.is_file():
+                h.update(str(p.relative_to(root)).encode('utf-8'))
+                h.update(p.read_bytes())
+    return h.hexdigest()[:16]
+
+
 def failing_rename_into(dest: Path):
     """让"把某个 *.staging 换装成 dest"这一步失败，其余 rename 放行。
 
@@ -298,6 +311,13 @@ def scenario_material_set() -> None:
               '覆盖导入中途失败：原素材库一个文件都没少',
               f'{before} -> {[p.name for p in core.list_images(core.DIR_IPM_IN)]}')
         check(core.material_board() == spec_b, '中途失败也不会改写依据')
+        # 准备阶段失败同样会留下 *.staging（里面 --move 时可能是唯一原件），
+        # 所以下一次 replace 会被残留闸拦住。模拟用户按提示处置掉残留再继续。
+        check(len(core.material_transaction_residue()) > 0,
+              '准备阶段失败也留下残留供人工处置',
+              str([p.name for p in core.material_transaction_residue()]))
+        for p in core.material_transaction_residue():
+            shutil.rmtree(p, ignore_errors=True)
 
         # ---- E. 一张都没进来时不许覆盖：否则等于把素材库清空了
         empty = tmp / 'unreadable'
@@ -537,6 +557,45 @@ def scenario_state_guards() -> None:
         check(not core.list_images(user_dir),
               '源目录确实已被 move 清空（所以 staging 是仅存的那一份）')
         check(core.material_board() == spec_a, '失败的覆盖导入没改写依据')
+
+        # 失败 → 修好问题 → 再点一次"覆盖导入"：必须立刻拒绝。
+        # 少了这道闸，import_dataset 开头的 rmtree(stage) 会把上一轮保住的
+        # 唯一原件删掉 —— 这一次没丢，重试时丢了。
+        residue_before = tree_fingerprint(core.material_transaction_residue())
+        check(len(core.material_transaction_residue()) == 2,
+              '残留检测报出两个 *.staging',
+              str([p.name for p in core.material_transaction_residue()]))
+        core.safe_imwrite(user_dir / 'retry_shot.jpg', synth_pose(base, 200))
+        try:
+            core.import_dataset(user_dir, mode='replace', move=True)
+            check(False, '有残留时第二次覆盖导入被拒绝')
+        except SystemExit as exc:
+            check('未完成的素材导入残留' in str(exc), '有残留时第二次覆盖导入被拒绝',
+                  str(exc).splitlines()[0])
+        check(tree_fingerprint(core.material_transaction_residue()) == residue_before,
+              '被拒绝的重试没动过 *.staging 里的任何一个字节')
+        check((user_dir / 'retry_shot.jpg').is_file(),
+              '被拒绝的重试也没搬走新素材')
+
+        # .old 残留同样要拦（上一轮"搬不回 staging"的极端分支会留下它）
+        core.configure_paths(root=tmp / 'old_residue')
+        core.configure_board(spec_a)
+        core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_CALIB_IN / 'live.jpg', synth_board_image(spec_a))
+        stale_old = core.DIR_IPM_IN.with_name(core.DIR_IPM_IN.name + core.BACKUP_SUFFIX)
+        stale_old.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(stale_old / 'rescued.jpg', floor)
+        core.set_material_board(spec_a)
+        src2 = tmp / 'src2'
+        src2.mkdir()
+        core.safe_imwrite(src2 / 'x.jpg', floor)
+        try:
+            core.import_dataset(src2, mode='replace')
+            check(False, '.old 残留时也拒绝覆盖导入')
+        except SystemExit as exc:
+            check('未完成的素材导入残留' in str(exc), '.old 残留时也拒绝覆盖导入',
+                  str(exc).splitlines()[0])
+        check((stale_old / 'rescued.jpg').is_file(), '.old 里被救下的素材没被删')
     finally:
         core.configure_paths(root=old_root)
         core.configure_board(old_board)
