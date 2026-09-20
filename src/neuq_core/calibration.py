@@ -40,7 +40,7 @@ def detect_chessboard(gray: np.ndarray, fast: bool = False,
     必须换成 ChArUco 板——每个格子有唯一编码，才能把局部角点对上正确的物理坐标。
 
     fast=True 用于实时预览，跳过耗时的 EXHAUSTIVE/ACCURACY 搜索。
-    board 不给时用当前工程的规格（core.BOARD）。
+    board 不给时使用当前工程的标定板规格。
     """
     spec = config.BOARD if board is None else board
     if hasattr(cv2, 'findChessboardCornersSB'):
