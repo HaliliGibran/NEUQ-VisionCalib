@@ -126,14 +126,39 @@ def homography_denominator(H: np.ndarray, pts: np.ndarray) -> np.ndarray:
 
 
 def horizon_sign(H0: np.ndarray, ground_pts: np.ndarray) -> float:
-    """判定"地面有限侧"对应的分母符号。
+    """判定"地面有限侧"对应的分母符号；参考点与单应必须全部有限，否则报错。
 
     必须用标定四点作参考——它们一定落在地面上、映射到有限的 cm 坐标。
     若拿图像中心当参考，当地平线落在图像中心以下（相机上仰、或四条线被拖到
     异常位形）时会选中天空侧，max_scale 随之完全错误。
+
+    非有限输入一律 ValueError，不过滤、不"用剩下的点继续投票"。因为这个函数的
+    语义不是"从一堆可能有效的点里投票"，而是"用确定属于地面的参考点判断有限侧"：
+    四个可信参考点掉成三个，大概率还能得出同一个符号，但那等于把一次上游几何
+    错误吞掉，事后只会表现成某些查找表的有效区莫名其妙。
+
+    尤其不能依赖 homography_denominator 的 nan_to_num：那个 helper 是为 LUT 的
+    向量化路径设计的（无效点已由调用方的 mask 判掉，归零只为避免 inf 运算告警），
+    在这里会把 inf 参考点悄悄变成 (0,0)，算出一个看着正常的分母、返回一个看着
+    正常的 ±1。契约是：要么返回可信的 +1/-1，要么明确失败，绝不把 NaN 翻译成
+    某个方向。
     """
-    den = homography_denominator(H0, ground_pts)
+    H = np.asarray(H0, dtype=np.float64)
+    pts = np.asarray(ground_pts, dtype=np.float64).reshape(-1, 2)
+
+    if not np.isfinite(H).all():
+        raise ValueError('单应矩阵含非有限值，无法判断地平线有限侧。')
+    if not np.isfinite(pts).all():
+        raise ValueError('地面参考点含非有限值，无法判断地平线有限侧。')
+
+    den = homography_denominator(H, pts)
+    # 即便 H 与 pts 都有限，极端数值下乘法仍可能溢出。这道检查成本几乎为零，
+    # 是"要么可信要么失败"这条契约的最后一环。
+    if not np.isfinite(den).all():
+        raise ValueError('地平线分母含非有限值，无法判断有限侧。')
+
     return 1.0 if float(np.mean(den)) >= 0 else -1.0
+
 
 
 def line_intersection(a1, a2, b1, b2) -> Optional[np.ndarray]:

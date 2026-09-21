@@ -1191,6 +1191,49 @@ def main() -> int:
     print('\n[H] 状态层边界：_incomplete / 逆透视闸门 / 坏图 / 配置 fail closed / 事务残留三档')
     scenario_state_guards()
 
+    print('\n[I] horizon_sign 的 finite-or-fail 契约')
+    # 地平线有限侧判错，整套查找表的有效区就会反过来，所以这个函数的契约是
+    # "要么返回可信的 ±1，要么明确失败"。旧实现依赖 homography_denominator 的
+    # nan_to_num，会把 inf 参考点悄悄变成 (0,0)，算出看着正常的 ±1。
+    quad = np.array([[60., 90.], [260., 90.], [20., 220.], [300., 220.]])
+    H0 = core.compute_homography(quad, core.physical_rect(30., 40.))
+    good = core.horizon_sign(H0, quad)
+    check(good in (1.0, -1.0), '正常有限四点仍返回 ±1（行为未变）', str(good))
+
+    bad_pts = [('含 +inf', np.inf), ('含 -inf', -np.inf), ('含 nan', np.nan)]
+    for why, val in bad_pts:
+        pts = quad.copy()
+        pts[0] = [val, val]
+        try:
+            got = core.horizon_sign(H0, pts)
+            check(False, f'地面参考点{why} 必须拒绝', f'却返回了 {got}')
+        except ValueError as exc:
+            check('地面参考点' in str(exc), f'地面参考点{why} -> ValueError', str(exc))
+
+    for why, val in (('nan', np.nan), ('inf', np.inf)):
+        Hbad = H0.copy()
+        Hbad[2, 0] = val
+        try:
+            got = core.horizon_sign(Hbad, quad)
+            check(False, f'单应含 {why} 必须拒绝', f'却返回了 {got}')
+        except ValueError as exc:
+            check('单应矩阵' in str(exc), f'单应含 {why} -> ValueError', str(exc))
+
+    # 证明这确实是旧 bug：按旧实现（直接过 homography_denominator）算同一组坏输入，
+    # 会得到一个合法的 ±1，而不是报错。
+    pts = quad.copy()
+    pts[0] = [np.inf, np.inf]
+    legacy = 1.0 if float(np.mean(core.homography_denominator(H0, pts))) >= 0 else -1.0
+    check(legacy in (1.0, -1.0),
+          '旧实现对同一组坏输入会静默给出方向（这正是要堵的）', f'legacy={legacy}')
+
+    # 主路径不受影响：build_corners 与 compute_homography 已保证喂进来的都是有限值，
+    # 所以不在 recompute() 里额外兜一层——那只会掩盖"按设计不该发生"的内部违约。
+    cal = core.IpmCalibrator(np.zeros((240, 320, 3), np.uint8), 30., 40.)
+    cal.recompute()
+    check(cal.H0 is not None and cal.sign in (1.0, -1.0),
+          'IpmCalibrator 正常路径不受影响', f'sign={cal.sign}')
+
     print()
     if FAILED:
         print('失败项:')
