@@ -86,6 +86,8 @@ from neuq_core.config import (  # noqa: F401
     material_stage_pairs,
     material_stale_reason,
     material_transaction_residue,
+    material_transaction_state,
+    material_transaction_unsafe_reason,
     project_config_path,
     require_material_basis,
     require_no_material_residue,

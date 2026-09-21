@@ -427,12 +427,24 @@ def material_basis_unknown_reason() -> Optional[str]:
 
 
 def require_material_basis(what: str, block_unknown: bool = True) -> None:
-    """当前规格下这套素材还能不能用；不能用就中止 what 这件事。"""
+    """当前规格下这套素材还能不能用；不能用就中止 what 这件事。
+
+    顺序不能反：先问"素材库本身说不说得清"（事务残留），再问规格。素材库本身
+    可能是新旧混合时，补一次标定、挑一张逆透视原图都没有意义；而规格这条判据在
+    "这次 replace 没换棋盘规格"（A → 新的一批 A）时完全看不出异常 ——
+    BOARD == material_set，material_stale_reason() 返回 None，用户照样能往下走。
+    这里是那条洞的唯一闸门，所以 calibrate_camera / discover_ipm_source /
+    增量导入这些调用点都靠它自动覆盖，不在各处重复判。
+    """
+    reason = material_transaction_unsafe_reason()
+    if reason is not None:
+        raise SystemExit(f'{what}已中止：\n{reason}')
     reason = material_stale_reason()
     if reason is None and block_unknown:
         reason = material_basis_unknown_reason()
     if reason is not None:
         raise SystemExit(f'{what}已中止：\n{reason}')
+
 
 
 def material_stage_pairs() -> List[Tuple[Path, Path]]:
@@ -463,7 +475,88 @@ def material_transaction_residue() -> List[Path]:
     return found
 
 
+def material_transaction_state() -> dict:
+    """素材导入事务的残留状态：哪里都从这里读，不要各自去 stat 目录。
+
+    返回 {'pending': bool, 'residue': [相对名], 'unsafe': bool, 'message': Optional[str]}。
+    三档语义（"正式目录" = calib_input/ 与 ipm_input/）：
+
+    | pending | .old | .staging | 正式目录状态                      | 新 replace | 消费（标定/IPM/add） |
+    |---------|------|----------|-----------------------------------|-----------|---------------------|
+    | 有      | 任意 | 任意     | install 走到哪不确定，可能新旧混合   | 拒绝      | 拒绝                |
+    | 无      | 有   | 任意     | 同样不可判定（见下）                | 拒绝      | 拒绝                |
+    | 无      | 无   | 有       | 准备阶段失败或已完整回滚，旧库完好    | 拒绝      | 允许                |
+    | 无      | 无   | 无       | 干净                              | 允许      | 允许                |
+
+    第 2 行为什么也不能消费（这条最反直觉）：乍看"pending 没了说明最终 JSON 写成功、
+    目录=新库、配置=新库，一致"，但有一条路径会产出同样的表象而目录是**混合**的——
+    DirectorySwapTransaction.rollback() 的 stranded 分支：某个 target 搬不回暂存区
+    就原样保留（里面是本轮的新内容）、它的 .old 一并保留、且不往该 target 放回 .old；
+    此后若事务的异常处理把 pending 清掉，磁盘上就是"一个目录是新的、另一个是旧的"，
+    而配置看起来毫无异常。所以 .old 单独存在同样不可判定，必须拒绝消费。
+    （本模块的 MaterialImportTransaction 现在只在回滚干净时才清 pending，让这种
+    表象尽量少出现；但历史遗留与手工删掉 pending 的情况仍然要靠这一条兜住。）
+
+    第 3 行为什么可以消费：*.staging 单独存在意味着正式目录从没被动过（准备阶段就
+    失败了），或者已经被完整回滚，旧库完好。只需要防住下一次 replace 把其中可能仅存的
+    --move 原件删掉，没必要连标定都锁死——否则一次 copy 失败就把其实安全的旧库全锁住。
+
+    'unsafe' 就是前两行；'message' 在 unsafe 时是拒绝理由，在只有 *.staging 时是
+    "可以继续用，但 replace 会被拦"的提示，干净时为 None。
+    """
+    pending = material_import_pending() is not None
+    residue = material_transaction_residue()
+    names = [p.name for p in residue]
+    backups = [p for p in residue if p.name.endswith(BACKUP_SUFFIX)]
+    listing = '\n'.join(f'  - {p}' for p in residue)
+
+    if pending:
+        message = (
+            f'上次导入未完成：{project_config_path()} 里还留着 {MATERIAL_PENDING_KEY} 标记。\n'
+            '素材库可能正处于新旧混合的中间态——目录换装走到哪一步无从判断，'
+            '正式目录里是新素材、旧素材还是一半一半，都有可能。\n'
+            + (f'文件系统上的残留：\n{listing}\n' if residue else '')
+            + '在这种状态上做相机标定 / 选逆透视原图 / 增量导入，结论都建立在说不清的'
+              '素材上，所以一并拒绝。\n'
+              '程序不自动猜恢复方向——两种猜法都可能把用户仅存的原件删掉。\n'
+              '请人工核对 calib_input/ 与 ipm_input/ 的内容，处置残留目录并删掉这条标记后再继续。')
+    elif backups:
+        message = (
+            f'检测到上一次素材换装留下的备份目录：\n{listing}\n'
+            f'{MATERIAL_PENDING_KEY} 标记已经不在，但这并不代表换装成功：回滚时若某个'
+            '正式目录搬不回暂存区，程序会原样保留它（里面是那一轮的新内容）、同时保留它的'
+            ' .old，事后标记又被清掉——表象与"成功"一模一样，而磁盘上其实是一个目录新、'
+            '一个目录旧的混合态。\n'
+            '所以 .old 单独存在同样不可判定，相机标定 / 选逆透视原图 / 增量导入一并拒绝。\n'
+            '请人工比对 .old 与正式目录的内容，确认要保留哪一份、手工处置之后再继续。')
+    elif residue:
+        message = (
+            f'检测到上一次覆盖导入留下的暂存目录：\n{listing}\n'
+            '正式素材库没有被动过（准备阶段就失败了，或者已经完整回滚），'
+            '相机标定与逆透视选图可以照常进行。\n'
+            '但新的「覆盖整个素材库」会被拒绝：暂存区里可能是 --move 搬入、'
+            '原位置已经没有的唯一原件，程序不会替你删。请确认后手工处置这些目录。')
+    else:
+        message = None
+
+    return {'pending': pending,
+            'residue': names,
+            'unsafe': bool(pending or backups),
+            'message': message}
+
+
+def material_transaction_unsafe_reason() -> Optional[str]:
+    """正式素材库是否处于不可判定状态（pending 或 .old）；可消费时返回 None。
+
+    与 require_no_material_residue() 的区别是刻意的：那一条守的是"破坏性换装"，
+    最严；这一条守的是"读素材库得出结论"，允许只剩 *.staging 的安全情形。
+    """
+    state = material_transaction_state()
+    return state['message'] if state['unsafe'] else None
+
+
 def require_no_material_residue() -> None:
+
     """有事务残留就拒绝启动新的覆盖导入。
 
     残留有两种：磁盘上的 *.staging / *.old，和 project.json 里没被清掉的 pending
@@ -510,7 +603,11 @@ class MaterialImportTransaction:
 
     两次写都基于构造时读到的同一份 base 算出**完整** dict，所以"最终 JSON 里
     material_set 与 last_import 同时出现"是天然成立的，不存在两次独立写之间的窗口。
+
+    回滚**不干净**时（某个正式目录搬不回暂存区，磁盘上成了新旧混合）pending 刻意
+    保留，不把它清掉——见 _revert_config 与 material_transaction_state 的说明。
     """
+
 
     def __init__(self, pairs: Sequence[Tuple[Path, Path]],
                  spec: CheckerboardSpec, last_import: dict) -> None:
@@ -551,15 +648,27 @@ class MaterialImportTransaction:
         self.tx.finalize()
 
     def _revert_config(self) -> None:
-        """尽力把 project.json 恢复成事务开始前的样子（pending 随之消失）。
+        """回滚干净时，把 project.json 恢复成事务开始前的样子（pending 随之消失）。
 
-        这一步也失败就让 pending 留着：它是 fail closed 的凭据，下一次覆盖导入
-        会据此拒绝，而不是在一个说不清的状态上继续做破坏性换装。
+        回滚**不**干净（tx.stranded 非空：某个正式目录里还是本轮的新内容、它的 .old
+        也还在）时刻意保留 pending：此时磁盘上是新旧混合，而"pending 没了 + .old 还在"
+        与"导入成功"的表象几乎一样，清掉标记等于把唯一的线索也抹掉。留着它，下一次
+        导入、标定、选逆透视原图全部 fail closed（见 material_transaction_state）。
+
+        写配置这一步本身失败也让 pending 留着，理由相同。
         """
+        if self.tx.stranded:
+            print(f'  警告: 回滚没有完全干净（{"、".join(str(p) for p in self.tx.stranded)} '
+                  '里仍是本轮的新内容），'
+                  f'保留 {project_config_path()} 里的 {MATERIAL_PENDING_KEY} 标记：'
+                  '素材库现在是新旧混合，下一次导入与相机标定 / 逆透视选图都会据此拒绝。\n'
+                  '  请人工核对上述目录与对应的 .old，确认要保留哪一份之后再删掉这条标记。')
+            return
         try:
             write_project_config_strict(self.base)
         except OSError as exc:
             print(f'警告: 无法清除 {project_config_path()} 里的 {MATERIAL_PENDING_KEY} '
                   f'标记（{exc}）。目录已回滚，但下一次覆盖导入会因这条标记被拒绝，'
                   '请确认素材库无误后手工删掉它。')
+
 

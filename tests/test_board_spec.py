@@ -98,6 +98,27 @@ def failing_rename_into(dest: Path):
     return lambda: setattr(pathlib.Path, 'rename', orig)
 
 
+def failing_rename_back(target_name: str):
+    """让"正式目录 -> *.staging"（回滚时把新内容搬回暂存区）这一步失败。
+
+    对应 DirectorySwapTransaction.rollback() 的 stranded 分支：那个目录里是本轮的
+    新内容、搬不回去就原样保留，于是磁盘上成了"一个目录新、一个目录旧"的混合态。
+    只匹配"来源是 target_name、目标以 .staging 结尾"，install 时的两轮 rename
+    （target->.old、.staging->target）都不受影响。返回还原函数。
+    """
+    import pathlib
+    orig = pathlib.Path.rename
+
+    def fake(self, target, *a, **kw):
+        if (Path(self).name == target_name
+                and str(target).endswith(core.STAGING_SUFFIX)):
+            raise OSError(f'模拟把 {target_name} 搬回暂存区时失败')
+        return orig(self, target, *a, **kw)
+
+    pathlib.Path.rename = fake
+    return lambda: setattr(pathlib.Path, 'rename', orig)
+
+
 def failing_project_write(nth: int):
     """让 project.json 的第 nth 次原子写抛 OSError（nth=0 表示只记录、不注入）。
 
@@ -413,6 +434,9 @@ def scenario_state_guards() -> None:
       7. 覆盖导入的事务闭环（G 段五条）：pending / 换装 / 最终 project.json 三步
          必须同生共死。特别是"目录全部换好、最终配置写失败"这一刻——老实现在这里
          已经把 .old 删了，只能留下「磁盘是新库 B、配置说旧库 A」的脏状态。
+      8. 事务残留的三档语义（H 段）：pending 或 .old 意味着正式目录不可判定，连
+         相机标定 / 逆透视选图 / 增量导入都要拒绝；只剩 *.staging 则旧库完好，
+         只拦下一次 replace。这条洞在"replace 没换规格"时所有规格判据都看不出来。
     """
     import shutil
     tmp = Path(tempfile.mkdtemp(prefix='neuq_guard_'))
@@ -817,6 +841,213 @@ def scenario_state_guards() -> None:
             check('未完成的素材导入残留' in str(exc),
                   '只剩 pending（目录看不出异常）时同样拒绝',
                   str(exc).splitlines()[1][:46])
+
+        # ---- H. 事务残留的三档语义 + 消费端 fail closed
+        # 上面 G 段守的全是"下一次 replace"。但相机标定 / 逆透视选图 / 增量导入走的是
+        # require_material_basis()，它只看规格：如果这次 replace **没换棋盘规格**
+        # （A → 新的一批 A），那么 BOARD == material_set，material_stale_reason()
+        # 返回 None，用户可以在一个可能新旧混合的目录上继续标定、继续挑 IPM 原图。
+        # H 段把这条洞钉住，同时钉住"只剩 *.staging 时不许连坐"。
+        print('  -- H1 只有 *.staging：正式库完好，消费放行、replace 仍拒绝')
+        core.configure_paths(root=tmp / 'txn_staging_only')
+        core.configure_board(spec_a)
+        core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_CALIB_IN / 'board.jpg', synth_board_image(spec_a))
+        core.safe_imwrite(core.DIR_IPM_IN / 'ground.jpg', floor)
+        core.set_material_board(spec_a)
+        stage_only = core.material_stage_pairs()[0][0]
+        stage_only.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(stage_only / 'prepared.jpg', floor)
+        check(core.material_transaction_unsafe_reason() is None,
+              '只有 *.staging 不算不可判定（准备阶段就失败了，旧库完好）')
+        try:
+            core.require_material_basis('相机标定')
+            check(True, '只有 *.staging 时相机标定照常放行')
+        except SystemExit as exc:
+            check(False, '只有 *.staging 时相机标定照常放行', str(exc).splitlines()[0])
+        picked = core.discover_ipm_source()
+        check(picked is not None and picked.name == 'ground.jpg',
+              '只有 *.staging 时逆透视选图照常放行', str(picked))
+        try:
+            core.require_no_material_residue()
+            check(False, '只有 *.staging 时新的 replace 仍被拒绝（最严那一条不放松）')
+        except SystemExit as exc:
+            check('未完成的素材导入残留' in str(exc),
+                  '只有 *.staging 时新的 replace 仍被拒绝（最严那一条不放松）',
+                  str(exc).splitlines()[0])
+
+        print('  -- H2 pending 且刻意"没换规格"：标定与逆透视选图一起拒绝')
+        core.configure_paths(root=tmp / 'txn_pending_consume')
+        core.configure_board(spec_a)
+        core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_CALIB_IN / 'board.jpg', synth_board_image(spec_a))
+        core.safe_imwrite(core.DIR_IPM_IN / 'ground.jpg', floor)
+        # material_set 与 pending 里的 board 都是 A：这正是本刀要堵的前提 ——
+        # 目录可能是中间态，而所有跟"规格"有关的判据全都看不出异常。
+        core.write_project_config_strict({
+            'board': spec_a.to_dict(),
+            'material_set': {'board': spec_a.to_dict()},
+            core.MATERIAL_PENDING_KEY: {'operation': 'replace',
+                                        'board': spec_a.to_dict(),
+                                        'last_import': {'mode': 'replace'}},
+        })
+        check(core.material_stale_reason() is None,
+              '前提：没换规格，stale 判据完全看不出异常')
+        check(core.material_basis_unknown_reason() is None,
+              '前提：依据也不算未知（material_set 就是当前规格）')
+        try:
+            core.require_material_basis('相机标定', block_unknown=False)
+            check(False, 'pending 时相机标定被拦住')
+        except SystemExit as exc:
+            check('相机标定已中止' in str(exc) and '上次导入未完成' in str(exc),
+                  'pending 时相机标定被拦住', str(exc).splitlines()[1][:46])
+        try:
+            core.discover_ipm_source()
+            check(False, 'pending 时逆透视选图被拦住（哪怕 stale 为 None）')
+        except SystemExit as exc:
+            check('逆透视标定已中止' in str(exc) and '上次导入未完成' in str(exc),
+                  'pending 时逆透视选图被拦住（哪怕 stale 为 None）',
+                  str(exc).splitlines()[1][:46])
+
+        print('  -- H3 只有 .old（pending 已不在）：同样不可判定')
+        core.configure_paths(root=tmp / 'txn_old_only')
+        core.configure_board(spec_a)
+        core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_CALIB_IN / 'board.jpg', synth_board_image(spec_a))
+        core.safe_imwrite(core.DIR_IPM_IN / 'ground.jpg', floor)
+        core.set_material_board(spec_a)
+        lone_old = core.DIR_IPM_IN.with_name(core.DIR_IPM_IN.name + core.BACKUP_SUFFIX)
+        lone_old.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(lone_old / 'maybe_old.jpg', floor)
+        reason = core.material_transaction_unsafe_reason()
+        check(reason is not None and core.BACKUP_SUFFIX in reason,
+              '.old 单独存在也判为不可判定（stranded 分支会产出同样的表象）',
+              (reason or '').splitlines()[0][:40])
+        check(core.material_import_pending() is None, '前提：pending 确实不在')
+        check(core.material_stale_reason() is None, '前提：规格一致，stale 为 None')
+        for what, call in (
+                ('相机标定', lambda: core.require_material_basis('相机标定',
+                                                             block_unknown=False)),
+                ('逆透视选图', core.discover_ipm_source)):
+            try:
+                call()
+                check(False, f'只有 .old 时{what}被拒绝')
+            except SystemExit as exc:
+                check(core.BACKUP_SUFFIX in str(exc), f'只有 .old 时{what}被拒绝',
+                      str(exc).splitlines()[0])
+
+        print('  -- H4 干净状态：replace / 标定 / 选图三者都放行')
+        core.configure_paths(root=tmp / 'txn_clean')
+        core.configure_board(spec_a)
+        core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_CALIB_IN / 'board.jpg', synth_board_image(spec_a))
+        core.safe_imwrite(core.DIR_IPM_IN / 'ground.jpg', floor)
+        core.set_material_board(spec_a)
+        check(core.material_transaction_state() == {'pending': False, 'residue': [],
+                                                    'unsafe': False, 'message': None},
+              '干净状态的 state 是全空', str(core.material_transaction_state()))
+        try:
+            core.require_no_material_residue()
+            core.require_material_basis('相机标定')
+            got_clean = core.discover_ipm_source()
+            check(got_clean is not None, '干净状态下三道闸门全部放行', str(got_clean))
+        except SystemExit as exc:
+            check(False, '干净状态下三道闸门全部放行', str(exc).splitlines()[0])
+
+        print('  -- H5 stranded 回滚：pending 保留，消费被拒')
+        # install 全部成功 → 最终 JSON 写失败 → 回滚时 ipm_input 搬不回暂存区。
+        # 结果是"ipm_input 是新的、calib_input 是旧的"，而且**没换规格**，
+        # 所以除了事务状态本身，没有任何判据能看出异常。
+        core.configure_paths(root=tmp / 'txn_stranded')
+        core.configure_board(spec_a)
+        core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_CALIB_IN / 'old_board.jpg', synth_board_image(spec_a))
+        core.safe_imwrite(core.DIR_IPM_IN / 'old_floor.jpg', floor)
+        core.set_material_board(spec_a)
+        src_h = tmp / 'txn_stranded_src'
+        src_h.mkdir()
+        for i in range(2):
+            core.safe_imwrite(src_h / f'new_{i}.jpg', floor)
+        new_names = sorted(p.name for p in core.list_images(src_h))
+        stranded_old = core.DIR_IPM_IN.with_name(core.DIR_IPM_IN.name + core.BACKUP_SUFFIX)
+        restore_w, calls = failing_project_write(2)        # 1=pending，2=最终提交
+        restore_r = failing_rename_back(core.DIR_IPM_IN.name)
+        try:
+            core.import_dataset(src_h, mode='replace')
+            check(False, '最终配置写失败时抛出来（stranded 场景）')
+        except OSError:
+            check(True, '最终配置写失败时抛出来（stranded 场景）')
+        finally:
+            restore_r()
+            restore_w()
+        check(sorted(p.name for p in core.list_images(core.DIR_IPM_IN)) == new_names,
+              'ipm_input 搬不回暂存区 → 原样保留本轮的新内容（绝不删）',
+              str(sorted(p.name for p in core.list_images(core.DIR_IPM_IN))))
+        check(sorted(p.name for p in core.list_images(stranded_old)) == ['old_floor.jpg'],
+              '它的 .old 一并保留，改动前的内容还找得回来')
+        check(sorted(p.name for p in core.list_images(core.DIR_CALIB_IN)) == ['old_board.jpg'],
+              'calib_input 那一半回滚成旧内容 —— 磁盘确实是新旧混合')
+        check(calls['n'] == 2, '没有第 3 次写：回滚不干净时不去清 pending', str(calls['n']))
+        check(core.material_import_pending() is not None,
+              'pending 仍然保留（这一刀的核心：不干净就留线索）')
+        check(core.material_stale_reason() is None,
+              '没换规格，stale 判据依旧看不出异常')
+        reason = core.material_transaction_unsafe_reason()
+        check(reason is not None and '上次导入未完成' in reason,
+              '混合态被 material_transaction_unsafe_reason 判为不可判定',
+              (reason or '').splitlines()[0][:40])
+        for what, call in (
+                ('相机标定', lambda: core.require_material_basis('相机标定',
+                                                             block_unknown=False)),
+                ('逆透视选图', core.discover_ipm_source),
+                ('增量导入', lambda: core.import_dataset(src_h, mode='add'))):
+            try:
+                call()
+                check(False, f'stranded 混合态下{what}被拒绝')
+            except SystemExit as exc:
+                check('上次导入未完成' in str(exc), f'stranded 混合态下{what}被拒绝',
+                      str(exc).splitlines()[0])
+
+        print('  -- H6 material_transaction_state() 对着状态表逐行核')
+        core.configure_paths(root=tmp / 'txn_state_table')
+        core.configure_board(spec_a)
+        core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+        core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+        core.safe_imwrite(core.DIR_IPM_IN / 'ground.jpg', floor)
+        core.set_material_board(spec_a)
+        tbl_stage = core.DIR_CALIB_IN.with_name(core.DIR_CALIB_IN.name + core.STAGING_SUFFIX)
+        tbl_old = core.DIR_IPM_IN.with_name(core.DIR_IPM_IN.name + core.BACKUP_SUFFIX)
+        record = {'operation': 'replace', 'board': spec_a.to_dict(),
+                  'last_import': {'mode': 'replace'}}
+        # (pending, .old, .staging) -> (unsafe, 残留个数, 说明)
+        rows = (
+            (False, False, False, False, 0, '干净 → replace 允许、消费允许'),
+            (False, False, True, False, 1, '只有 .staging → replace 拒绝、消费允许'),
+            (False, True, False, True, 1, '只有 .old → 两者都拒绝'),
+            (True, False, False, True, 0, '只有 pending → 两者都拒绝'),
+            (True, True, True, True, 2, 'pending + .old + .staging → 两者都拒绝'),
+        )
+        for want_pending, has_old, has_stage, want_unsafe, n_residue, why in rows:
+            shutil.rmtree(tbl_stage, ignore_errors=True)
+            shutil.rmtree(tbl_old, ignore_errors=True)
+            if has_stage:
+                tbl_stage.mkdir(parents=True, exist_ok=True)
+            if has_old:
+                tbl_old.mkdir(parents=True, exist_ok=True)
+            core.update_project_config(
+                **{core.MATERIAL_PENDING_KEY: record if want_pending else None})
+            st = core.material_transaction_state()
+            clean = not want_unsafe and n_residue == 0
+            check(st['pending'] is want_pending and st['unsafe'] is want_unsafe
+                  and len(st['residue']) == n_residue
+                  and (st['message'] is None) is clean
+                  and (core.material_transaction_unsafe_reason() is None) is not want_unsafe,
+                  f'状态表: {why}', str(st))
     finally:
         core.configure_paths(root=old_root)
         core.configure_board(old_board)
@@ -957,7 +1188,7 @@ def main() -> int:
     print('\n[G] 素材库的规格状态机 + 覆盖导入事务')
     scenario_material_set()
 
-    print('\n[H] 状态层边界：_incomplete / 逆透视闸门 / 坏图 / 配置 fail closed')
+    print('\n[H] 状态层边界：_incomplete / 逆透视闸门 / 坏图 / 配置 fail closed / 事务残留三档')
     scenario_state_guards()
 
     print()

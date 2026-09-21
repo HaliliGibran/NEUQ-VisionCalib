@@ -271,6 +271,11 @@ def api_status() -> dict:
         # 素材是否按旧规格分拣的，必须常驻可见：只在"应用规格"那一刻回显一次的话，
         # 刷新页面或重启服务之后警告就消失了，而脏状态还原样留着。
         'material_stale': material_warning(),
+        # 素材导入事务的残留：与后端闸门读同一份事实（core.material_transaction_state）。
+        # 刻意不缩成一个 material_pending 布尔——界面要分得清"不可判定，连标定都拒绝"
+        # 和"只剩暂存目录，旧库完好、只是不能再 replace"这两档。
+        'material_transaction': core.material_transaction_state(),
+
         'ipm_state': core.load_ipm_state(),
         'ipm_candidates': [p.name for p in core.list_images(core.DIR_IPM_IN)],
         'ipm_source': safe_rel(STATE['src_path']) if STATE['src_path'] else None,

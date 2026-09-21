@@ -258,6 +258,28 @@ function renderMaterialWarning(reason) {
   });
 }
 
+// 素材导入事务的残留（/api/status 的 material_transaction）。分两档：
+//   unsafe（project.json 里还有 pending，或正式目录旁边留着 .old）
+//     → 正式素材库处于不可判定状态，后端连相机标定 / 逆透视选图 / 增量导入都拒绝，
+//       红色常驻。
+//   只剩 *.staging → 旧库完好，可以继续用，只是下一次「覆盖整个素材库」会被拦，
+//       黄色提示。
+// 这里刻意只做"显示"：不提供自动恢复、也不提供一键删除残留 —— 哪一份才是用户想
+// 保留的，程序猜不出来，而 --move 导入时残留里可能是原位置已经没有的唯一原件。
+// 真正的拦截始终在后端，前端只是把这个事实提前告诉用户。
+function renderTransactionWarning(txn) {
+  const unsafe = !!(txn && txn.unsafe);
+  const residue = (txn && txn.residue) || [];
+  const show = !!(txn && txn.message) && (unsafe || residue.length > 0);
+  ['board-txn', 'import-txn'].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.className = unsafe ? 'stale bad' : 'stale';
+    el.textContent = show ? (unsafe ? '⛔ ' : '⚠ ') + txn.message : '';
+    el.hidden = !show;
+  });
+}
+
 async function refreshStatus() {
   const st = await api('/api/status');
   const calib = st.calib;
@@ -291,6 +313,7 @@ async function refreshStatus() {
       `${b.square_size_mm} mm / 内角点 ${b.corners_x}×${b.corners_y}`;
   }
   renderMaterialWarning(st.material_stale);
+  renderTransactionWarning(st.material_transaction);
 
   const badge = $('gallery-badge');
   if (badge) {

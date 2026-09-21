@@ -47,12 +47,16 @@
       <p class="hint inline">方格至少 4×5 或 5×4；OpenCV 内角点：<code id="board-corners">11 × 8</code></p>
       <div id="board-active" class="hint mono"></div>
       <div id="board-stale" class="stale" hidden></div>
+      <!-- 素材导入事务的残留：后端已据此拦截，这里只是常驻把事实摆出来。
+           刻意没有"自动恢复 / 一键删残留"按钮——猜错就是删掉用户仅存的原件。 -->
+      <div id="board-txn" class="stale" hidden></div>
     </article>
 
     <article class="card" id="step-import">
       <div class="card-head"><span class="num">1</span><h3>导入素材</h3></div>
       <p class="hint">把棋盘照和地面照混在一起的目录丢进来，按"能否检出棋盘"自动分拣。</p>
       <div id="import-stale" class="stale" hidden></div>
+      <div id="import-txn" class="stale" hidden></div>
       <label>素材目录
         <input id="in-import-dir" type="text" placeholder="例如 WIN_20260903_17_22_10_Pro 或 D:\素材\9月">
       </label>

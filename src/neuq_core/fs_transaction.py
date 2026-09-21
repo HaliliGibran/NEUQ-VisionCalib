@@ -48,6 +48,10 @@ class DirectorySwapTransaction:
         self.keep_staging = keep_staging
         self.moved: List[Tuple[Path, Path, Path]] = []   # (target, backup, stage)
         self.installed: List[Tuple[Path, Path]] = []     # (target, stage)，rename 真的成功过
+        # 上一次 rollback() 里搬不回暂存区、只能原样保留的正式目录。空 = 回滚干净。
+        # 调用方需要这个事实：不干净意味着"目录里一个是新的、另一个是旧的"，它的
+        # 事务标记就不能清掉，否则磁盘上的混合态再也没有线索可查。
+        self.stranded: List[Path] = []
 
     def install(self) -> None:
         """全部 target -> .old，再全部 stage -> target；**不删 .old**。
@@ -78,8 +82,13 @@ class DirectorySwapTransaction:
             shutil.rmtree(backup, ignore_errors=True)
 
     def rollback(self) -> None:
-        """回到 install 之前的状态；install 成功之后同样可以调用（.old 还在）。"""
-        stranded: List[Path] = []
+        """回到 install 之前的状态；install 成功之后同样可以调用（.old 还在）。
+
+        结束后 self.stranded 列出"搬不回暂存区、只能原样保留"的正式目录：空表示
+        回滚干净、磁盘确实回到了改动前；非空表示磁盘是新旧混合，调用方必须据此
+        保留自己的事务标记（见 neuq_core.config.MaterialImportTransaction）。
+        """
+        self.stranded = []                # 每次回滚重新判定
         # 撤掉已经就位的新目录。keep_staging 时搬回暂存区而不是删除
         for target, stage in reversed(self.installed):
             if not self.keep_staging:
@@ -91,12 +100,12 @@ class DirectorySwapTransaction:
             except OSError as exc:
                 # 搬不回去也绝不删：宁可留一个占位的正式目录要人工处置，
                 # 也不能让 --move 进来的原件在这里消失
-                stranded.append(target)
+                self.stranded.append(target)
                 print(f'  警告: {target} 里是本轮的新内容（--move 导入时可能是仅存的原件），'
                       f'无法搬回 {stage}（{exc}），已原样保留，请手工处置后重试。')
         # 再把 .old 放回正式位置
         for target, backup, _stage in self.moved:
-            if target in stranded:
+            if target in self.stranded:
                 print(f'  {target} 仍被新内容占用，改动前的内容保留在 {backup}。')
                 continue
             shutil.rmtree(target, ignore_errors=True)

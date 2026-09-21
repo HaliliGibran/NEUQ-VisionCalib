@@ -9,6 +9,8 @@
 
 覆盖：
   A. /api/status 常驻暴露 material_stale，replace 之后消失；stale 时 api_source 被拒
+  A2. /api/status 常驻暴露 material_transaction：只剩 *.staging 是"可继续用"的一档，
+      pending / .old 是"不可判定"的一档，后者连 api_source 都要被拒
   B. 备份 manifest 带 project_config 快照，且清空后素材库依据作废
   C. 备份目录跟着 --root 现取（不能停在 import 时抄下来的旧根）
 """
@@ -96,6 +98,40 @@ def main() -> int:
         server.api_import({'dir': str(tmp / 'batch_b'), 'mode': 'replace'})
         check(server.api_status()['material_stale'] is None,
               '覆盖导入后告警消除', str(core.material_board()))
+
+        # ---- A'. 事务残留也要常驻可见，而且分得清两档
+        # 后端已经据此 fail closed（pending / .old 时连标定和选图都拒绝），界面要能
+        # 提前把这个事实摆出来；否则用户只会在点下一步时莫名吃一个报错。
+        print('\n[A2] /api/status 暴露 material_transaction')
+        txn = server.api_status()['material_transaction']
+        check(txn == {'pending': False, 'residue': [], 'unsafe': False, 'message': None},
+              '干净状态下四个字段都是空的（前端据此不显示任何条幅）', str(txn))
+        stage_only = core.material_stage_pairs()[0][0]
+        stage_only.mkdir(parents=True, exist_ok=True)
+        txn = server.api_status()['material_transaction']
+        check(txn['residue'] == [stage_only.name] and txn['unsafe'] is False
+              and txn['message'] is not None,
+              '只剩 *.staging：黄色一档（residue 有、unsafe 为假）', str(txn))
+        core.update_project_config(
+            **{core.MATERIAL_PENDING_KEY: {'operation': 'replace',
+                                           'board': spec_b.to_dict(),
+                                           'last_import': {'mode': 'replace'}}})
+        txn = server.api_status()['material_transaction']
+        check(txn['pending'] is True and txn['unsafe'] is True
+              and '上次导入未完成' in (txn['message'] or ''),
+              'pending：红色一档（unsafe 为真，消息点明上次导入未完成）',
+              (txn['message'] or '').splitlines()[0][:40])
+        try:
+            server.api_source({'name': 'floor_0.jpg'})
+            check(False, 'unsafe 时 api_source 被后端拒绝（界面提示之外仍有真闸门）')
+        except SystemExit as exc:
+            check('上次导入未完成' in str(exc),
+                  'unsafe 时 api_source 被后端拒绝（界面提示之外仍有真闸门）',
+                  str(exc).splitlines()[0])
+        core.update_project_config(**{core.MATERIAL_PENDING_KEY: None})
+        shutil.rmtree(stage_only, ignore_errors=True)
+        check(server.api_status()['material_transaction']['message'] is None,
+              '残留处置干净后提示自动消失')
 
         # ---- B. 备份要把"这批素材按什么规格分类"一起存下来
         print('\n[B] 备份 manifest 带 project_config 快照')

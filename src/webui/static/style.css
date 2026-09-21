@@ -111,6 +111,12 @@ main {
   font-size: 12px; white-space: pre-wrap;
 }
 .stale[hidden] { display: none; }
+/* 素材库处于不可判定状态（导入事务留下 pending 或 .old）：这一档后端连相机标定
+   和逆透视选图都会拒绝，所以用红色区分于"只是暂存目录还在"的黄色提示。 */
+.stale.bad {
+  background: var(--danger-bg); color: var(--danger);
+  border-color: #f7c1c1;
+}
 
 /* 标定柱状图占位 */
 .chart-wrap {
