@@ -225,7 +225,7 @@ def load_project_config() -> dict:
       → 用户点一次「应用棋盘规格」→ project.json 被降级成 schema=1，
         material_set 等新字段全部丢失。
 
-    甚至不用点：启动时 restore_board() 从 calib.json 迁移规格也会写一次。
+    甚至不用点：启动时若需要把规格从 calib.json 迁移到 project.json，同样会写一次。
     那正好与加 schema 闸门的初衷相反，所以未来版本与损坏文件都 fail closed，
     由用户自己决定是修、是改名还是删除 —— 程序绝不自动覆盖它。
     """

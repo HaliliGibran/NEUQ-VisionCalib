@@ -87,7 +87,10 @@ class MapPair:
 
     @property
     def size(self) -> Tuple[int, int]:
-        """输出网格 (W, H)。TABLE_SIZE 生效时它就是重采样后的网格。"""
+        """当前映射表的网格尺寸 (W, H)，直接取 x/y 数组的实际形状。
+
+        上层若对映射表做过重采样，这里自然反映重采样后的网格。
+        """
         return self.x.shape[1], self.x.shape[0]
 
     @property

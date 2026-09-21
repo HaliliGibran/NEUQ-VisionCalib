@@ -214,7 +214,7 @@ MAX_LATERAL_CM = 300.0
 DISPLAY_SCALE = 2.0     # 交互窗口放大倍数，仅影响显示与拾取
 PICK_RADIUS = 12        # 端点拾取半径（显示坐标下的像素）
 
-MIN_QUAD_AREA_PX = 10.0     # 四边形面积下限，小于此值视为四条线退化重合
+MIN_QUAD_AREA_PX = 10.0     # 交互标定里判四条线退化重合的面积阈值（业务阈值，不属于 quad_area）
 INIT_MARGIN_RATIO = 0.20    # 四条线初始位置距图像边缘的比例
 INIT_SCALE_RATIO = 0.8      # 初始 scale 取 max_scale 的比例，留出裕量
 MIN_SCALE = 0.05            # scale 下限（px/cm），防止退化为 0
