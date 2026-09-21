@@ -133,6 +133,34 @@ def main() -> int:
         check(server.api_status()['material_transaction']['message'] is None,
               '残留处置干净后提示自动消失')
 
+        # ---- A3. 改规格这一步不刷 /api/status，所以 /api/board 也得带上事务状态，
+        #          否则那条常驻条幅会停在改规格之前的样子，直到下一次轮询才更正。
+        print('\n[A3] /api/board 同步 material_transaction')
+        b = server.api_board({'squares_x': 9, 'squares_y': 7, 'square_size_mm': 25.0})
+        check('material_transaction' in b, 'api_board 返回里带 material_transaction',
+              str(sorted(k for k in b if k.startswith('material'))))
+        check(b['material_transaction']['unsafe'] is False,
+              '干净状态下 unsafe 为假', str(b['material_transaction']))
+
+        stage_only.mkdir(parents=True, exist_ok=True)
+        b = server.api_board({'squares_x': 12, 'squares_y': 9, 'square_size_mm': 20.0})
+        check(b['material_transaction']['residue'] == [stage_only.name]
+              and b['material_transaction']['unsafe'] is False,
+              '只有 staging 时返回 residue 且 unsafe 为假（黄色一档）',
+              str(b['material_transaction']))
+
+        core.update_project_config(
+            **{core.MATERIAL_PENDING_KEY: {'operation': 'replace',
+                                           'board': spec_b.to_dict(),
+                                           'last_import': {'mode': 'replace'}}})
+        b = server.api_board({'squares_x': 9, 'squares_y': 7, 'square_size_mm': 25.0})
+        check(b['material_transaction']['unsafe'] is True
+              and '上次导入未完成' in (b['material_transaction']['message'] or ''),
+              'unsafe 状态下 api_board 仍原样返回 unsafe=true',
+              (b['material_transaction']['message'] or '').splitlines()[0][:36])
+        core.update_project_config(**{core.MATERIAL_PENDING_KEY: None})
+        shutil.rmtree(stage_only, ignore_errors=True)
+
         # ---- B. 备份要把"这批素材按什么规格分类"一起存下来
         print('\n[B] 备份 manifest 带 project_config 快照')
         result = server.api_backup_clear({'name': 'round1'})

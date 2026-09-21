@@ -438,6 +438,9 @@ def apply_board(body: dict) -> dict:
     core.configure_board(spec, persist=True)
     payload = board_payload()
     payload['material_stale'] = material_warning()
+    # 事务告警也要跟着返回：改规格这一步不刷 /api/status，少了它界面上那条常驻
+    # 红/黄条幅就会停在改规格之前的状态，直到下一次轮询才更正。
+    payload['material_transaction'] = core.material_transaction_state()
     return payload
 
 

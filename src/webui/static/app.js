@@ -1198,6 +1198,7 @@ function bindActions() {
         + '，已写入 project.json', 'ok');
       // 规格参与"棋盘照/地面照"的判定：改了规格，已导入的素材就是按旧标准分的
       renderMaterialWarning(b.material_stale);
+      renderTransactionWarning(b.material_transaction);
       if (b.material_stale) log('⚠ ' + b.material_stale, 'err');
     } catch (e) { log('规格设置失败: ' + e.message, 'err'); }
   });
@@ -1212,6 +1213,7 @@ function bindActions() {
       updateBoardHint();
       $('board-active').textContent = '当前生效：' + b.label;
       renderMaterialWarning(b.material_stale);
+      renderTransactionWarning(b.material_transaction);
       log('已恢复为仓库自带棋盘 12×9 / 20 mm', 'ok');
     } catch (e) { log('恢复失败: ' + e.message, 'err'); }
   });
