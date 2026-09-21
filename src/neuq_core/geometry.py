@@ -206,14 +206,22 @@ def is_convex_quad(pts: np.ndarray) -> bool:
 
 
 def clip_polygon_halfplane(poly: np.ndarray, a: float, b: float, c: float) -> np.ndarray:
-    """保留满足 a*x + b*y + c >= 0 的部分（Sutherland-Hodgman 单边裁剪）。"""
-    if poly.shape[0] == 0:
-        return poly
+    """保留满足 a*x + b*y + c >= 0 的部分（Sutherland-Hodgman 单边裁剪）。
+
+    poly 必须是 (N, 2)；返回值始终是新建的 float64 (M, 2) 数组。
+    """
+    p = np.asarray(poly, dtype=np.float64)
+    if p.ndim != 2 or p.shape[1] != 2:
+        raise ValueError(f'多边形点集必须是 (N, 2)，收到形状 {p.shape}。')
+
+    if p.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+
     out: List[np.ndarray] = []
-    n = poly.shape[0]
+    n = p.shape[0]
     for i in range(n):
-        cur = poly[i]
-        nxt = poly[(i + 1) % n]
+        cur = p[i]
+        nxt = p[(i + 1) % n]
         d_cur = a * cur[0] + b * cur[1] + c
         d_nxt = a * nxt[0] + b * nxt[1] + c
         if d_cur >= 0:

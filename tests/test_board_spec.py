@@ -1234,6 +1234,39 @@ def main() -> int:
     check(cal.H0 is not None and cal.sign in (1.0, -1.0),
           'IpmCalibrator 正常路径不受影响', f'sign={cal.sign}')
 
+    print('\n[J] clip_polygon_halfplane 的 (N,2)-or-fail 契约')
+    # 原实现空输入时 `return poly` 直接返回入参本体：不 copy、dtype 随输入，
+    # 而其余所有分支都返回新建的 float64 数组；(0,) 这种错形状也被静默放行。
+    square = np.array([[0., 0.], [10., 0.], [10., 10.], [0., 10.]])
+    kept = core.clip_polygon_halfplane(square, 1.0, 0.0, -5.0)   # 保留 x >= 5
+    check(kept.shape == (4, 2) and kept.dtype == np.float64,
+          '普通裁剪的形状与 dtype 不变', f'{kept.shape} {kept.dtype}')
+    check(abs(float(kept[:, 0].min()) - 5.0) < 1e-12,
+          '普通裁剪的数值不变（裁在 x=5 上）', str(kept[:, 0].min()))
+
+    for label, arr in (('float32 (0,2)', np.empty((0, 2), dtype=np.float32)),
+                       ('float64 (0,2)', np.empty((0, 2), dtype=np.float64))):
+        got = core.clip_polygon_halfplane(arr, 1.0, 0.0, 0.0)
+        check(got.shape == (0, 2) and got.dtype == np.float64,
+              f'空 {label} → 新建的 float64 (0,2)', f'{got.shape} {got.dtype}')
+        check(got is not arr, f'空 {label} 不返回入参本体（这次要堵的 bug）')
+
+    for label, arr in (('(0,)', np.empty((0,), dtype=np.float64)),
+                       ('(2,)', np.array([1.0, 2.0])),
+                       ('(N,3)', np.zeros((4, 3), dtype=np.float64))):
+        try:
+            core.clip_polygon_halfplane(arr, 1.0, 0.0, 0.0)
+            check(False, f'形状 {label} 必须拒绝')
+        except ValueError as exc:
+            check('(N, 2)' in str(exc), f'形状 {label} → ValueError', str(exc))
+
+    # 刻意不加 finite 检查：非有限点是否该拒绝是另一层语义，这一刀只收
+    # "空输入破坏输出类型/形状/所有权契约" 这两行。
+    with_nan = np.array([[0., 0.], [np.nan, 1.], [1., 1.]])
+    got = core.clip_polygon_halfplane(with_nan, 1.0, 0.0, 0.0)
+    check(isinstance(got, np.ndarray) and got.dtype == np.float64,
+          '含 nan 的多边形仍按原样处理（不在这一刀扩大数值契约）', f'{got.shape}')
+
     print()
     if FAILED:
         print('失败项:')
