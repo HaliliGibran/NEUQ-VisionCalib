@@ -28,10 +28,9 @@ TABLE_FIXED_POINT"的策略编排，所以留。
   IpmCalibrator         交互标定类，依赖 cv2 窗口与大量运行时开关，不属于这一层。
 """
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
-
-import math
 
 import cv2
 import numpy as np
