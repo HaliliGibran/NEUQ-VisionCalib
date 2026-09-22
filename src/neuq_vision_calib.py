@@ -8,19 +8,24 @@
      → calib_data/calib.json
   2. 标定照片去畸变效果 → calib_preview/
   3. 逆透视标定原图去畸变 → ipm_output/UnDistortionImage.jpg
-  4. 交互标定逆透视：四条线定义地平面几何约束，三自由度调节目标 ROI
+  4. 交互逆透视标定：四条线的交点定义地平面度量关系；以去畸变图底边中点对应的
+     地面点作为逆透视参考原点；再用横向锚点、纵向锚点、朝向偏移、比例尺控制俯视图布局
   5. 六矩阵导出 → matrix/
-  6. 两套打表（各含正向/反向）→ lookup_table/undistort/、lookup_table/undistort_ipm/
+  6. 两套打表（各含正向映射/反向映射）→ lookup_table/undistort/、lookup_table/undistort_ipm/
   7. 批量测试 test_input/ → test_output/
 
-坐标约定：全程 OpenCV 0-based 像素坐标。物理坐标单位 cm，x 向右、y 向下（朝向车辆），
-标定矩形中心为原点；BirdView 图正上方为车辆前进方向。
+坐标约定：全程 OpenCV 0-based 像素坐标。物理坐标单位 cm，x 向右、y 向下（朝向车辆）；
+俯视图正上方为车辆前进方向。两个物理坐标系要分清：
+  标定矩形坐标系 : 以标定矩形中心为原点，H0 的输出就在这个系里
+  逆透视坐标系   : 以**参考原点**为原点，即去畸变图底边中点经 H0 映射到地平面的点。
+                   它只是人为选定的坐标参考点，不代表摄像头光心、车辆几何中心或保险杠。
 
-单应分解：H = T(anchor) @ S(scale) @ R(heading) @ H0
-  H0    : 源图（去畸变）像素 -> 物理 cm 坐标，仅由四点与物理长宽决定
-  R     : 绕原点旋转 heading_offset，物理标定区相对车辆前进坐标系的转角
-  S     : cm -> BirdView 像素，scale 的单位是 px/cm
-  T     : 平移到 anchor 指定的输出图位置
+单应分解：H = T(锚点) @ S(比例尺) @ R(朝向偏移) @ T(-参考原点) @ H0
+  H0    : 源图（去畸变）像素 -> 标定矩形坐标系的 cm 坐标，仅由四点与实测长宽决定
+  T(-ref): 把原点平移到逆透视参考原点。必须排在 R 之前——朝向偏移绕的是参考原点
+  R     : 绕参考原点旋转，把标定区转到与车辆前进方向对齐
+  S     : cm -> 俯视图像素，比例尺的单位是 px/cm
+  T     : 平移到锚点指定的俯视图位置
 T/S/R 第三行均为 [0,0,1]，故 H[2,:] 恒等于 H0[2,:]，地平线只随四点变化。
 
 查找表约定（交付给嵌入式 C 端）：
@@ -32,7 +37,7 @@ T/S/R 第三行均为 [0,0,1]，故 H[2,:] 恒等于 H0[2,:]，地平线只随�
   python src/neuq_vision_calib.py --list                 查看各目录现状
   python src/neuq_vision_calib.py --import-dir <混合目录> 按"能否检出棋盘"拆分素材入库
   python src/neuq_vision_calib.py --stage calib          只跑相机标定
-  python src/neuq_vision_calib.py                        跑全流程（交互标定逆透视）
+  python src/neuq_vision_calib.py                        跑全流程（交互逆透视标定）
   python src/neuq_vision_calib.py --stage tables --quad ...
                                                          无 GUI 跑完整链路
   python src/webui/server.py                             打开浏览器控制台（推荐）
@@ -211,21 +216,22 @@ UNDIST_ALPHA = None
 PHYS_W_CM = 45.0
 PHYS_H_CM = 45.0
 
-# 目标地面窗口（cm）：BirdView 里真正想看到的那一块地面，是**构图目标**。
-# 纵向基准是标定矩形的近边（y 最大的那条边），向前 TARGET_FORWARD_CM；横向以标定
-# 矩形的中线为对称轴，总宽 TARGET_WIDTH_CM。刻意不写成"车前多少 cm"：物理原点是
-# 标定矩形中心，系统并不知道保险杠在哪，那样的标注是假精确。
+# 目标地面范围（cm）：俯视图里真正想看到的那一块地面，是**构图目标**。
+# 以逆透视参考原点为纵向基准，向前 TARGET_FORWARD_CM；横向关于参考原点对称，
+# 总宽 TARGET_WIDTH_CM。参考原点 = 去畸变图底边中点经 H0 映射到地平面的那个点，
+# 它只是人为选定的坐标参考点，**不代表摄像头、车辆几何中心或保险杠位置**，
+# 所以界面与文档一律写"参考点前方 N cm"，不写"车前 N cm"。
 #
 # 与 MAX_RANGE_CM / MAX_LATERAL_CM 的分工必须一直分清：后者是**有效性边界**，只为
 # 截断地平线附近映射到无穷远的部分；前者是构图目标。实测教训见 target_window_cm
-# 的 docstring——把有效性边界当构图目标，整幅 BirdView 会变成放射状拉丝。
+# 的 docstring——把有效性边界当构图目标，整幅俯视图会变成放射状拉丝。
 TARGET_WIDTH_CM = 150.0
 TARGET_FORWARD_CM = 150.0
 
-# 目标 ROI 三自由度初值
-ANCHOR_X = 0.5      # 归一化，ROI 中心在输出图的横向位置
-ANCHOR_Y = 0.708    # 归一化，沿用原 160x120 方案中下部的布局比例
-HEADING_DEG = 0.0   # 物理标定区相对车辆前进坐标系的转角，正值顺时针
+# 俯视图布局四自由度的初值（锚点为归一化坐标）
+ANCHOR_X = 0.5      # 横向锚点：参考原点在俯视图里的横向位置
+ANCHOR_Y = 0.708    # 纵向锚点：沿用原 160x120 方案中下部的布局比例
+HEADING_DEG = 0.0   # 朝向偏移：标定区相对车辆前进方向的转角，正值顺时针
 
 # 有效视野的前向距离上限（cm）。地平线附近像素映射到无穷远，必须截断，
 # 否则"完整容纳有效视野"会把对应的 scale 逼到 0。这是数学截断边界，不是构图目标。
@@ -899,7 +905,7 @@ def valid_fov_polygon(H0: np.ndarray, ground_tf: np.ndarray,
     最后按前向/横向距离上限截断。sign 由 horizon_sign 给出。
 
     ground_tf 是 H0 之后、scale/canvas 之前的那一段齐次变换，A3 之后它是
-    `R(heading) @ T(-ref)`——只传 R 会让多边形停在 marker frame，而目标窗口已经
+    `R(heading) @ T(-ref)`——只传 R 会让多边形停在 标定矩形坐标系，而目标窗口已经
     在参考原点系里，两者不同源，自动布局就会拿两个坐标系的数去比。
     地平线裁剪仍然只看 H0 的第三行：T 与 R 的第三行都是 [0,0,1]，不影响分母。
     """
@@ -927,7 +933,7 @@ def valid_fov_polygon(H0: np.ndarray, ground_tf: np.ndarray,
 # ---------------------------------------------------------------- 4. 交互标定
 
 class IpmCalibrator:
-    """四条线定义地平面约束，三自由度实时调节目标 ROI。"""
+    """四条线的交点定义地平面度量关系；横向锚点、纵向锚点、朝向偏移、比例尺调节俯视图布局。"""
 
     def __init__(self, img: np.ndarray, phys_w: float, phys_h: float):
         self.img = img
@@ -980,7 +986,7 @@ class IpmCalibrator:
         # 新的构图目标是目标地面窗口，它通常远小于整幅有效视野，因此正常情况下
         # scale > full_fov_fit_scale —— 远处与侧面被裁掉是故意的，不该告警。
         self.full_fov_fit_scale = 0.0
-        # A3: 去畸变图底边中点经 H0 映射到地平面的坐标（marker frame cm）。
+        # A3: 去畸变图底边中点经 H0 映射到地平面的坐标（标定矩形坐标系 cm）。
         # 这是逆透视坐标系的参考原点——compose() 里的 T_ref 就是平移它到 (0,0)。
         # None 表示尚未算出或底边中点落在地平线无穷远侧。
         self.ground_ref_marker_cm: Optional[np.ndarray] = None
@@ -1030,7 +1036,7 @@ class IpmCalibrator:
     def compose(self, H0: np.ndarray) -> np.ndarray:
         """按当前参数组合出完整单应 H = T_canvas @ S @ R @ T_ref @ H0。
 
-        A3 新增的 T_ref 把 marker frame 原点平移到 IPM 参考原点——去畸变图底边中点
+        A3 新增的 T_ref 把 标定矩形坐标系 原点平移到 IPM 参考原点——去畸变图底边中点
         对应的那个地面点。平移必须发生在 R(heading) 之前：heading 围绕的是**参考
         原点**而不是 marker 原点，否则旋转会把参考点甩到别的地方去。
         """
@@ -1235,7 +1241,7 @@ class IpmCalibrator:
         self.render_preview()
 
     def render_preview(self) -> None:
-        """刷新 BirdView 预览：叠加目标 ROI、anchor、前进方向与 scale 状态。"""
+        """刷新俯视图预览：叠加标定矩形、锚点、前进方向与比例尺状态。"""
         if self.birdview is None or self.corners is None or self.H is None:
             blank = np.zeros((self.h, self.w, 3), dtype=np.uint8)
             cv2.putText(blank, 'invalid quad (parallel/crossed/concave)', (8, 20),
@@ -2482,7 +2488,7 @@ def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
         'schema_version': SCHEMA_VERSION,
         'tool_version': TOOL_VERSION,
         'H': cal.H.tolist(),
-        # H0 始终是"图像 -> marker frame（45x45 中心为原点）"那一段，不含 T_ref。
+        # H0 始终是"图像 -> 标定矩形坐标系（45x45 中心为原点）"那一段，不含 T_ref。
         # T_ref/R/S/T_canvas 全部已经并进 H，单独留 H0 只为地平线分母与重算。
         'H0': cal.H0.tolist(),
         'horizon_sign': cal.sign,
@@ -2591,7 +2597,7 @@ def ask_physical_size(default_w: float = PHYS_W_CM,
             return default
         return v
 
-    print('\n输入标定矩形的真实物理尺寸，用于确定目标 ROI 的长宽比与物理尺度。')
+    print('\n输入地面标定矩形的实测尺寸，用于确定俯视图的长宽比与比例尺（px/cm）。')
     return ask('标定矩形宽度', default_w), ask('标定矩形高度', default_h)
 
 

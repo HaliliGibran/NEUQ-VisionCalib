@@ -1008,7 +1008,7 @@ def apply_auto_layout(cal) -> dict:
 
 def api_preview(body: dict) -> dict:
 
-    """实时预览：按当前四点与三自由度算 H，返回 BirdView 与标定矩形位置。"""
+    """实时预览：按当前四点与俯视图布局四自由度算 H，返回俯视图与标定矩形位置。"""
     p = _preview_inputs(body)
     cal = make_calibrator(p['quad'], p['phys_w'], p['phys_h'],
                           p['anchor_x'], p['anchor_y'], p['heading'], p['scale'],

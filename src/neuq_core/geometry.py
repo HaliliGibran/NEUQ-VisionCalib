@@ -265,7 +265,7 @@ def max_scale_for_fov(poly_cm: np.ndarray, anchor_px: Tuple[float, float],
 
 def ground_reference_origin(H0: np.ndarray, src_size: Tuple[int, int],
                             sign: float) -> Optional[np.ndarray]:
-    """去畸变图**底边中点**经 H0 映射到地平面得到的点（marker frame，cm）。
+    """去畸变图**底边中点**经 H0 映射到地平面得到的点（标定矩形坐标系，cm）。
 
     这个点是**逆透视坐标系的参考原点**，人为选定，语义仅此而已：
 
@@ -277,12 +277,12 @@ def ground_reference_origin(H0: np.ndarray, src_size: Tuple[int, int],
     "底边中点就是摄像头位置"这个**物理解释**是错的，两者极易混。
 
     也不能拿标定矩形中心当业务原点：那只是为了求 H0、表达 45x45 尺度而设的
-    marker frame 原点，凭什么代表车？真要拿到车辆位置得用 solvePnP 恢复相机位姿再
+    标定矩形坐标系 原点，凭什么代表车？真要拿到车辆位置得用 solvePnP 恢复相机位姿再
     取光心的地面投影，再叠一个安装偏置——那属于车辆安装参数，不该让标定矩形承担。
     本工具刻意不走那条路，只要一个**说得清**的坐标参考点。
 
     返回 None 的情形：底边中点落在地平线的无穷远侧（sign*den < DEN_EPS），此时没有
-    有限的地面交点。调用方应当退回 marker frame 原点并把这件事落盘说明，而不是
+    有限的地面交点。调用方应当退回 标定矩形坐标系 原点并把这件事落盘说明，而不是
     硬取一个 1e15 量级的坐标。
     """
     H = np.asarray(H0, dtype=np.float64)
