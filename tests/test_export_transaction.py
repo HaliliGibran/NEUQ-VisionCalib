@@ -234,8 +234,8 @@ def main() -> int:
               'metadata 记下单一倍率，C 端不必再分 step_x/step_y',
               f"factor={meta_f.get('downsample_factor')} grid={meta_f.get('grid_size')}")
 
-        # ---------- G. CAL1：calib_preview 整体换装，不留上一轮的残留
-        print('\n[G] CAL1 预览目录整体换装')
+        # ---------- G. CAL1/CAL1.1：calib.json 与 calib_preview 一起换装
+        print('\n[G] CAL1.1 标定数据与预览的联合事务')
         rng2 = np.random.default_rng(7)
         raws = []
         core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
@@ -245,18 +245,26 @@ def main() -> int:
                                                dtype=np.uint8))
             raws.append(p)
 
-        core.export_undistort_previews(raws, K, D, SRC_SIZE)
+        # calib_data/ 里用户自己的资料必须活下来（整体替换最容易误删的就是它）
+        core.DIR_CALIB_DATA.mkdir(parents=True, exist_ok=True)
+        keepsake = core.DIR_CALIB_DATA / 'calibrationSession.mat'
+        keepsake.write_bytes(b'user data')
+
+        core.commit_calibration(K, D, SRC_SIZE, raws)
         names4 = sorted(p.name for p in core.DIR_CALIB_PREVIEW.glob('*.jpg'))
         check(len(names4) == 4, '第一轮 4 张预览落盘', str(names4))
+        check(keepsake.is_file() and keepsake.read_bytes() == b'user data',
+              'calib_data/ 里的用户资料没被整体替换删掉')
 
         # 第二轮只用前 2 张（等价"人工剔掉误差大的两张后重标"）
-        core.export_undistort_previews(raws[:2], K, D, SRC_SIZE)
+        core.commit_calibration(K, D, SRC_SIZE, raws[:2])
         names2 = sorted(p.name for p in core.DIR_CALIB_PREVIEW.glob('*.jpg'))
         check(names2 == ['shot_0_undist.jpg', 'shot_1_undist.jpg'],
               '第二轮只剩 2 张——被剔掉那两张的旧预览没有残留', str(names2))
         check(leftovers(root) == [], '换装后无 .staging/.old 残留', str(leftovers(root)))
 
-        # 中途失败：旧预览必须完好，暂存区清干净
+        # 中途失败：calib.json 与旧预览必须一起保持原样
+        before_json = core.CALIB_JSON.read_bytes()
         real_imwrite = core.safe_imwrite
         calls = {'n': 0}
 
@@ -268,24 +276,41 @@ def main() -> int:
 
         core.safe_imwrite = imwrite_boom
         try:
-            core.export_undistort_previews(raws, K, D, SRC_SIZE)
+            core.commit_calibration(K, D, SRC_SIZE, raws)
             check(False, '预览写到一半故障应当抛出', '却正常返回')
         except OSError as exc:
             check(True, '预览写到一半故障抛出', str(exc))
         finally:
             core.safe_imwrite = real_imwrite
-        check(sorted(p.name for p in core.DIR_CALIB_PREVIEW.glob('*.jpg')) == names2,
-              '中途故障后旧预览完整保留（换装前一个字节都没动）')
-        check(leftovers(root) == [], '故障后暂存区已清理', str(leftovers(root)))
+        check(sorted(p.name for p in core.DIR_CALIB_PREVIEW.glob('*.jpg')) == names2
+              and core.CALIB_JSON.read_bytes() == before_json,
+              '中途故障后 calib.json 与旧预览一起保持原样')
+        check(leftovers(root) == [], '故障后两个暂存区都已清理', str(leftovers(root)))
 
-        # ---------- H. CAL1：calib.json 落 provenance
-        print('\n[H] CAL1 标定 provenance')
+        # CAL1.1 的靶心：换装阶段失败时，两个目录必须一起回滚。旧实现是
+        # "预览先单独换装、紧接着写 calib.json"，这一步失败就会留下
+        # "新预览 + 旧 calib.json"。
+        restore = failing_rename(2)
+        try:
+            core.commit_calibration(K, D, SRC_SIZE, raws)
+            check(False, '换装第 2 次 rename 失败应当抛出', '却正常返回')
+        except OSError as exc:
+            check(True, '换装阶段失败抛出', str(exc))
+        finally:
+            restore()
+        check(sorted(p.name for p in core.DIR_CALIB_PREVIEW.glob('*.jpg')) == names2
+              and core.CALIB_JSON.read_bytes() == before_json,
+              '换装失败 → calib.json 与预览一起回滚，没有"新预览配旧参数"')
+        check(leftovers(root) == [], '回滚后无残留', str(leftovers(root)))
+
+        # ---------- H. CAL1 provenance + CAL2 基准指纹
+        print('\n[H] CAL1 provenance 与 CAL2 标定基准指纹')
         fit = {'rms': 1.053, 'mean_reprojection_error': 0.880, 'threshold': 1.5,
                'used_names': [f'u{i}.jpg' for i in range(21)],
                'dropped': [{'name': 'bad0.jpg', 'error': 2.355},
                            {'name': 'bad1.jpg', 'error': 2.202}],
                'opencv_version': '4.10.0'}
-        core.save_calibration(K, D, SRC_SIZE, fit_result=fit)
+        core.commit_calibration(K, D, SRC_SIZE, raws[:2], fit_result=fit)
         cj = json.loads(core.CALIB_JSON.read_text(encoding='utf-8'))
         check(cj.get('rms_px') == 1.053
               and cj.get('mean_reprojection_error_px') == 0.880
@@ -298,12 +323,42 @@ def main() -> int:
               f"rms={cj.get('rms_px')} used={len(cj.get('used_images') or [])} "
               f"dropped={len(cj.get('dropped_images') or [])}")
 
-        core.save_calibration(K, D, SRC_SIZE)
+        core.commit_calibration(K, D, SRC_SIZE, raws[:2])
         cj2 = json.loads(core.CALIB_JSON.read_text(encoding='utf-8'))
         check(not any(k in cj2 for k in
                       ('rms_px', 'used_images', 'dropped_images', 'opencv_version')),
               '没有 fit_result 时干脆不写这些键，而不是写一堆 null',
               '"字段缺失"与"标定时没记"是两件事，后者会被读成"真的没有被剔的图"')
+
+        basis = cj2.get('calibration_basis_hash')
+        check(isinstance(basis, str) and len(basis) == 64,
+              'calib.json 记下标定基准指纹', str(basis)[:16] + '…')
+        check(core.current_calibration_basis() == basis,
+              'current_calibration_basis() 与落盘值一致')
+        check(core.calibration_basis_stale(basis) is None, '指纹相同 → 不 stale')
+        for bad_hash, why in ((None, '产物没记指纹（CAL2 之前导出的）'),
+                              ('0' * 64, '产物属于另一版标定')):
+            reason = core.calibration_basis_stale(bad_hash)
+            check(reason is not None, f'{why} → 判 stale', str(reason))
+            try:
+                core.require_calibration_basis(bad_hash, '测试闸门')
+                check(False, f'{why} → 闸门必须拒绝', '却放行了')
+            except SystemExit as exc:
+                check(True, f'{why} → 闸门拒绝', str(exc).split('：')[0])
+
+        # provenance 变了不该让几何基准失效（这就是不对整个文件取哈希的理由）
+        core.commit_calibration(K, D, SRC_SIZE, raws[:2], fit_result=fit)
+        cj3 = json.loads(core.CALIB_JSON.read_text(encoding='utf-8'))
+        check(cj3.get('calibration_basis_hash') == basis,
+              '只有 provenance 变化时指纹不变（K/D/Knew/尺寸没动）')
+        # Knew 变了必须换指纹：四点是在去畸变图上点的
+        old_alpha = core.UNDIST_ALPHA
+        core.UNDIST_ALPHA = 0.5
+        try:
+            check(core.current_calibration_basis() != basis,
+                  'UNDIST_ALPHA 改变 Knew → 指纹必须变（旧四点不能直接复用）')
+        finally:
+            core.UNDIST_ALPHA = old_alpha
 
         # 收尾：把这轮改过的全局还原，免得影响后续段落
         core.TABLE_FORMAT = 'txt'

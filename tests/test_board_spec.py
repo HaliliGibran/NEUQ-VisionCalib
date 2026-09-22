@@ -180,7 +180,7 @@ def scenario_calibration() -> None:
         core.configure_board(spec)
 
         # provenance：已有 calib.json 的规格与当前不一致时要拦住复用
-        core.save_calibration(K, D, size)
+        core.commit_calibration(K, D, size, [])
         core.configure_board(core.CheckerboardSpec(9, 7, 25.0))
         conflict = core.board_conflict(core.calib_board_meta())
         check(conflict is not None and '不一致' in conflict,
@@ -1144,7 +1144,8 @@ def main() -> int:
         core.configure_board(core.CheckerboardSpec(9, 7, 25.0))
         (core.DIR_CALIB_DATA).mkdir(parents=True, exist_ok=True)
         K = np.eye(3)
-        core.save_calibration(K, np.zeros(5), (1280, 720))
+        # 只验 calib.json 的字段，不需要预览：commit_calibration 传空的用图列表
+        core.commit_calibration(K, np.zeros(5), (1280, 720), [])
         raw = json.loads(core.CALIB_JSON.read_text(encoding='utf-8'))
         check(raw.get('schema_version') == core.SCHEMA_VERSION,
               'calib.json 带 schema_version', str(raw.get('schema_version')))

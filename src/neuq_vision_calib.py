@@ -625,41 +625,29 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
         print(f'内参标准差: fx={std_int[0]:.3f} fy={std_int[1]:.3f} '
               f'cx={std_int[2]:.3f} cy={std_int[3]:.3f}')
 
-    export_undistort_previews(used, K, D, img_size)
+    # 标定数据与去畸变预览作为**一套**一起提交：两者都描述同一份 K/D，
+    # 不能一个换成新的、另一个还留着旧的。详见 commit_calibration。
+    commit_calibration(K, D, img_size, used, board=spec, fit_result=fit_result)
 
     # 返回值从 3 元组扩到 4 元组：前三个保留旧签名给命令行路径用，
     # 第四个 fit_result 是给 Web 端画柱状图用的逐帧数据。
     return K, D, img_size, fit_result
 
 
-def export_undistort_previews(files: List[Path], K: np.ndarray, D: np.ndarray,
-                              img_size: Tuple[int, int]) -> None:
-    """把参与标定的每张图去畸变后存盘，等价 cameraCalibrator 的 Show Undistorted。
+def render_undistort_previews(files: List[Path], K: np.ndarray, D: np.ndarray,
+                              img_size: Tuple[int, int], out_dir: Path) -> None:
+    """把参与标定的每张图去畸变后写进 out_dir，等价 cameraCalibrator 的 Show Undistorted。
 
-    先写暂存区、全部写完再整体换装，**不在旧目录上增量覆盖**。理由是实测踩到的：
-    29 张全量标定 → 人工剔掉 8 张 → 用剩下 21 张重标，旧实现只写这 21 张的预览，
-    被剔的 8 张 `_undist.jpg` 原样留在目录里。于是 calib_preview/ 同时混着
-    "当前 K/D 生成的 21 张" 与 "上一轮 K/D 生成的 8 张"，界面把它们一视同仁地
-    当当前结果展示——比"图缺失"危险得多，因为看上去完全正常。实测那 8 张与用
-    当前 calib.json 重算的结果差异高达 7.3%~10.5%。
+    只负责渲染，不做任何换装——目录事务归 commit_calibration 统一管。
     """
-    staging = DIR_CALIB_PREVIEW.with_name(DIR_CALIB_PREVIEW.name + '.staging')
-    shutil.rmtree(staging, ignore_errors=True)
-    staging.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     Knew = resolve_new_camera_matrix(K, D, img_size)
-    try:
-        for path in files:
-            img = safe_imread(path)
-            if img is None:
-                continue
-            undist = cv2.undistort(img, K, D, None, Knew)
-            safe_imwrite(staging / f'{path.stem}_undist.jpg', undist)
-    except BaseException:
-        # 本轮没写完：暂存区作废，旧预览一个字节都没动过
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-    commit_dirs(((staging, DIR_CALIB_PREVIEW),), what='标定去畸变预览')
-    print(f'标定图去畸变效果已写入: {DIR_CALIB_PREVIEW}（{len(files)} 张，整体换装）')
+    for path in files:
+        img = safe_imread(path)
+        if img is None:
+            continue
+        undist = cv2.undistort(img, K, D, None, Knew)
+        safe_imwrite(out_dir / f'{path.stem}_undist.jpg', undist)
 
 
 def resolve_new_camera_matrix(K: np.ndarray, D: np.ndarray,
@@ -671,23 +659,17 @@ def resolve_new_camera_matrix(K: np.ndarray, D: np.ndarray,
     return np.asarray(Knew, dtype=np.float64)
 
 
-def save_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
-                     board: Optional[CheckerboardSpec] = None,
-                     fit_result: Optional[dict] = None) -> None:
-    """把内参、畸变系数、标定分辨率与**这一份参数的来历**写入 calib_data/calib.json。
+def calibration_payload(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
+                        board: Optional[CheckerboardSpec] = None,
+                        fit_result: Optional[dict] = None) -> dict:
+    """组装 calib.json 的内容：内参、畸变系数、标定分辨率、板规格与 provenance。
 
     board 显式传入时以它为准：provenance 必须跟着"实际用于标定的那块板"走，
     不能只读当时的全局状态——否则 calibrate_camera(board=A) 之后再改全局，
     落盘的就会是 A 的参数配 B 的规格。
-
-    fit_result 就是 calibrate_camera 的第四个返回值，给的话把质量与用图记录下来。
-    非可选不可的原因，是实测已经出过一次无法回答的问题：目录里 29 张棋盘照，
-    自动全量标定后人工把 RMS > 1.5 px 的 8 张剔掉、用剩下 21 张重标，而
-    calib.json 里没有任何痕迹——拿到产物的人只能靠"用 29 张重算一遍看对不对得上"
-    去反推，对不上又说不清是少用了几张还是 OpenCV 版本差异。
     """
     spec = BOARD if board is None else board
-    DIR_CALIB_DATA.mkdir(parents=True, exist_ok=True)
+    Knew = resolve_new_camera_matrix(K, D, img_size)
     payload = {
         'image_width': int(img_size[0]),
         'image_height': int(img_size[1]),
@@ -699,10 +681,104 @@ def save_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
         # 老字段保留一轮：外部脚本或旧版网页可能还在读这两个键
         'chessboard_corners': list(spec.corners),
         'square_size_mm': spec.square_size_mm,
+        # CAL2：这一份几何基准的指纹。下游（ipm_state / matrices）记同一个值，
+        # 重标之后对不上就知道旧四点与旧表已经不属于当前标定。
+        'calibration_basis_hash': calibration_basis_hash(K, D, Knew, img_size),
     }
     payload.update(calibration_provenance(fit_result))
-    write_json_atomic(CALIB_JSON, payload)
-    print('标定数据已保存:', CALIB_JSON)
+    return payload
+
+
+def commit_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
+                       used: List[Path], board: Optional[CheckerboardSpec] = None,
+                       fit_result: Optional[dict] = None) -> None:
+    """把 calib.json 与全部去畸变预览作为**一个事务**提交。
+
+    CAL1 只把 calib_preview/ 改成整体换装，留下一个窗口：预览已经换成 B 的了，
+    紧接着写 calib.json 时磁盘满/没权限，最终就是 `calib.json = A` 配
+    `calib_preview = B`——正是刚修掉的那类不匹配，只是换了个触发时机。所以这里
+    按 export_all 的同一套路，两个目录一起换：
+
+      1) calib_data.staging/    从旧目录**播种**后写新的 calib.json
+      2) calib_preview.staging/ 只写本轮的预览，**不播种**
+      3) 两个正式目录一起换装，失败一起回滚
+
+    播种口径刻意不同：calib_data/ 里可能有用户自己放的资料（历史
+    calibrationSession.mat 之类），整体替换会误删，所以先 copytree；
+    calib_preview/ 恰恰要的是"上一轮多出来的预览必须消失"，所以从空目录开始。
+    """
+    data_stage = DIR_CALIB_DATA.with_name(DIR_CALIB_DATA.name + '.staging')
+    prev_stage = DIR_CALIB_PREVIEW.with_name(DIR_CALIB_PREVIEW.name + '.staging')
+    for stage in (data_stage, prev_stage):
+        shutil.rmtree(stage, ignore_errors=True)
+    try:
+        if DIR_CALIB_DATA.is_dir():
+            shutil.copytree(DIR_CALIB_DATA, data_stage, dirs_exist_ok=True)
+        else:
+            data_stage.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(data_stage / CALIB_JSON.name,
+                          calibration_payload(K, D, img_size, board, fit_result))
+        render_undistort_previews(used, K, D, img_size, prev_stage)
+    except BaseException:
+        # 本轮没准备完：两个暂存区一起作废，正式目录一个字节都没动过
+        for stage in (data_stage, prev_stage):
+            shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+    commit_dirs(((data_stage, DIR_CALIB_DATA), (prev_stage, DIR_CALIB_PREVIEW)),
+                what='标定数据与去畸变预览')
+    print(f'标定数据已保存: {CALIB_JSON}')
+    print(f'标定图去畸变效果已写入: {DIR_CALIB_PREVIEW}（{len(used)} 张，与 calib.json 同一事务）')
+
+
+def calibration_basis_hash(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
+                           img_size: Tuple[int, int]) -> str:
+    """标定几何基准的指纹：SHA256(canonical_json(K, D, Knew, image_size))。
+
+    刻意**不是**对 calib.json 整个文件取哈希：provenance 字段（RMS、用了哪些图、
+    OpenCV 版本）变了并不改变几何，不该让下游全部失效。
+
+    也刻意**包含 Knew**：IPM 的四点是在**去畸变图**上点的，就算 K/D 一个字节没变，
+    只要 UNDIST_ALPHA 改了 Knew 就变，去畸变图的像素坐标系随之改变，旧四点同样
+    不能直接复用。
+    """
+    canonical = json.dumps({
+        'K': np.asarray(K, dtype=np.float64).reshape(3, 3).tolist(),
+        'D': np.asarray(D, dtype=np.float64).ravel().tolist(),
+        'Knew': np.asarray(Knew, dtype=np.float64).reshape(3, 3).tolist(),
+        'image_size': [int(img_size[0]), int(img_size[1])],
+    }, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
+def current_calibration_basis() -> Optional[str]:
+    """当前工程的标定基准指纹；标定数据读不出来时返回 None。"""
+    try:
+        K, D, img_size = load_calibration()
+    except (SystemExit, OSError, ValueError, KeyError, TypeError, IndexError):
+        return None
+    if K is None or D is None or not img_size:
+        return None
+    return calibration_basis_hash(K, D, resolve_new_camera_matrix(K, D, img_size),
+                                  img_size)
+
+
+def calibration_basis_stale(recorded: Optional[str]) -> Optional[str]:
+    """产物记录的基准与当前标定是否已经对不上；对得上返回 None，否则返回原因。
+
+    只判定、不删文件——与素材库那套闸门同一风格：标 stale + 阻止消费，
+    但把"要不要重做"留给用户。老产物没有这个字段时也算不可判定，同样要拦：
+    那是 CAL2 之前导出的，无法证明它属于当前标定。
+    """
+    current = current_calibration_basis()
+    if current is None:
+        return '读不出当前标定数据，无法确认产物属于哪一版标定'
+    if not recorded:
+        return '产物里没有记录标定基准指纹（CAL2 之前导出的），无法证明它属于当前标定'
+    if recorded != current:
+        return (f'产物属于另一版标定（记录 {recorded[:12]}…，当前 {current[:12]}…）：'
+                'K/D/Knew 或标定分辨率已经变了')
+    return None
 
 
 def calibration_provenance(fit_result: Optional[dict]) -> dict:
@@ -2349,6 +2425,30 @@ def board_conflict(meta: Optional[dict],
             '请改回已有规格，或勾选"强制重新标定"（命令行加 --force-calib）重标一次。')
 
 
+def exported_basis_hash() -> Optional[str]:
+    """已导出的 matrices.json 里记录的标定基准指纹；读不到返回 None。"""
+    if not MATRIX_JSON.is_file():
+        return None
+    try:
+        data = json.loads(MATRIX_JSON.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, OSError):
+        return None
+    value = data.get('calibration_basis_hash')
+    return str(value) if value else None
+
+
+def require_calibration_basis(recorded: Optional[str], what: str) -> None:
+    """消费闸门：产物不属于当前标定就拒绝，并说清为什么。
+
+    与素材库那套闸门同风格——不删任何文件，只阻止消费。拿一份属于旧 K/D 的
+    查找表去跑批测，得到的图看上去完全正常，却与当前标定不是一套；这种"看起来对"
+    的错误比直接报错危险得多。
+    """
+    reason = calibration_basis_stale(recorded)
+    if reason:
+        raise SystemExit(f'{what}：{reason}。请重新做逆透视标定并重新导出查找表。')
+
+
 def ground_origin_meta(cal: 'IpmCalibrator') -> dict:
     """逆透视坐标参考原点的落盘描述。
 
@@ -2401,6 +2501,9 @@ def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
         'src_quad_tl_tr_bl_br': cal.corners.tolist(),
         'src_image_width': int(img_size[0]),
         'src_image_height': int(img_size[1]),
+        # CAL2：这套四点/H 是在哪一版 K/D/Knew 的去畸变图上定出来的。重标之后
+        # 对不上就不该再恢复旧四点，也不该再拿旧表跑批测。
+        'calibration_basis_hash': current_calibration_basis(),
     }
     payload.update(ground_origin_meta(cal))
     if src_path is not None:
@@ -2639,8 +2742,9 @@ def load_or_run_calibration(force: bool = False
         else:
             print('未找到 calib.json，开始从标定照片重新标定。')
         spec = BOARD          # 显式捕获：provenance 跟着本次实际用的板走
-        K, D, img_size, fit = calibrate_camera(board=spec)
-        save_calibration(K, D, img_size, board=spec, fit_result=fit)
+        # calib.json 与 calib_preview/ 由 calibrate_camera 内部作为一个事务提交，
+        # 这里不再单独写一次——分两步就会留下"新预览 + 旧 calib.json"的窗口。
+        K, D, img_size, _fit = calibrate_camera(board=spec)
     Knew = resolve_new_camera_matrix(K, D, img_size)
     assert_invertible('K', K)
     assert_invertible('Knew', Knew)
@@ -2680,12 +2784,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     K, D, Knew, img_size = load_or_run_calibration(force=args.force_calib)
 
     if stage == 'test':
-        # 优先用真正落盘的那份表；表不在（或被删了）才退回按状态重算
+        # 优先用真正落盘的那份表；表不在（或被删了）才退回按状态重算。
+        # CAL2：两条路都先确认产物属于当前标定——重标之后磁盘上的表仍是上一版的。
         try:
+            require_calibration_basis(exported_basis_hash(), '已导出的查找表不可用')
             pair = load_exported_reverse_pair(img_size)
             print(f'批量测试使用已导出的表: {DIR_TABLE / "undistort_ipm" / "reverse"}')
         except SystemExit as exc:
-            print(f'未找到可用的导出表（{exc}），改为按 ipm_state.json 重算。')
+            print(f'未使用已导出的表（{exc}），改为按 ipm_state.json 重算。')
+            require_calibration_basis((load_ipm_state() or {}).get('calibration_basis_hash'),
+                                      'ipm_state.json 也不可用')
             pair = rebuild_reverse_map_from_state(K, D, Knew, img_size)
         batch_test(pair)
         print('\n批量测试完成。')
@@ -2700,6 +2808,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     # 只有 tables 阶段允许完全复用上次交互的结果；带 --quad 时一律按新参数重算。
     state = None if quad is not None else load_ipm_state()
     if stage == 'tables' and state is not None:
+        # CAL2：复用旧四点/旧 H 之前先确认它属于当前标定。K/D/Knew 变了之后，
+        # 那套四点是在**另一张去畸变图**上点的，直接拿来出表是不合法的。
+        require_calibration_basis(state.get('calibration_basis_hash'),
+                                  '复用已有逆透视标定结果被拒绝')
         print(f'\n复用已有的逆透视标定结果: {ipm_state_path()}')
         H = np.asarray(state['H'], dtype=np.float64).reshape(3, 3)
         H0 = np.asarray(state['H0'], dtype=np.float64).reshape(3, 3)
@@ -2764,6 +2876,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         'horizon_sign': calibrator.sign,
         'max_range_cm': MAX_RANGE_CM,
         'max_lateral_cm': MAX_LATERAL_CM,
+        'calibration_basis_hash': current_calibration_basis(),
     }, **ground_origin_meta(calibrator)), img_size, ipm_state=ipm_state)
 
     # 导出已经成功，这时才写结果图：它和矩阵、查找表属于同一批产物

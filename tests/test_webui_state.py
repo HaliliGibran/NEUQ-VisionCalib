@@ -516,6 +516,9 @@ def main() -> int:
         try:
             ipm_candidates([f'cand_{i}' for i in range(8)])
             picked = core.DIR_IPM_IN / 'cand_3.jpg'
+            # CAL2 之后 api_batch 会先过标定基准闸门，所以这个合成工程也得有一份
+            # 真的 calib.json——闸门的前提就是"读得出当前标定"。
+            core.commit_calibration(np.eye(3), np.zeros(5), (80, 80), [])
 
             # 用户自己放在 test_input/ 根目录的东西：图片、说明文件，还有上次的结果
             core.DIR_TEST_IN.mkdir(parents=True, exist_ok=True)
@@ -689,6 +692,12 @@ def main() -> int:
             # ---- 单独点「只重跑批量测试」：仍是 test_input 根目录语义
             core.batch_test = spy_batch
             core.load_exported_reverse_pair = lambda size: sentinel
+            # export_all 在这一段是被打桩的，磁盘上没有真的 matrices.json；
+            # CAL2 的闸门要读它里面的基准指纹，所以这里补一份最小的。
+            core.MATRIX_JSON.parent.mkdir(parents=True, exist_ok=True)
+            core.MATRIX_JSON.write_text(json.dumps(
+                {'calibration_basis_hash': core.current_calibration_basis()}),
+                encoding='utf-8')
             seen.clear()
             server.api_batch()
             check(seen.get('input_dir') is None and seen.get('output_dir') is None,

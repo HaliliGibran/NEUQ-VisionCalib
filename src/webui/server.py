@@ -326,6 +326,13 @@ def api_status() -> dict:
     phys_w, phys_h = initial_phys_size()
     target_w, target_f = initial_target_window()
 
+    # CAL2：产物是否还属于当前标定。只判定不删文件——与素材库那套闸门同风格。
+    saved_ipm = core.load_ipm_state()
+    ipm_basis_stale = (core.calibration_basis_stale(saved_ipm.get('calibration_basis_hash'))
+                       if saved_ipm else None)
+    tables_basis_stale = (core.calibration_basis_stale(core.exported_basis_hash())
+                          if tables_ready else None)
+
 
     # 报告上次导出用的表格式，让"交付给 C 端的到底是什么"一眼可见
     last_table = None
@@ -354,7 +361,11 @@ def api_status() -> dict:
         # 和"只剩暂存目录，旧库完好、只是不能再 replace"这两档。
         'material_transaction': core.material_transaction_state(),
 
-        'ipm_state': core.load_ipm_state(),
+        'ipm_state': saved_ipm,
+        # CAL2：这两条不是"文件在不在"，而是"它还属于当前标定吗"。stale 时前端不恢复
+        # 旧四点，后端也拒绝拿旧表跑批测——产物本身一个都不删。
+        'ipm_basis_stale': ipm_basis_stale,
+        'tables_basis_stale': tables_basis_stale,
         # 物理尺寸初值：优先级（历史 > 默认）在服务端判完再给前端，页面直接照填
         'phys_init': {'w': phys_w, 'h': phys_h},
         # 目标地面窗口初值，同一套优先级。这是**构图目标**，不是有效性边界。
@@ -849,7 +860,11 @@ def api_calibrate(body: dict) -> dict:
         if body.get('force') or not core.CALIB_JSON.is_file():
             spec = core.BOARD     # 显式捕获：provenance 跟着本次实际用的板走
             K, D, img_size, fit = core.calibrate_camera(board=spec)
-            core.save_calibration(K, D, img_size, board=spec, fit_result=fit)
+            # calib.json 与 calib_preview/ 由 calibrate_camera 内部作为一个事务提交；
+            # 这里再单独写一次 calib.json 就会留下"新预览 + 旧参数"的窗口。
+            # 重标之后旧成果一律作废：那些 BirdView 是用**上一版** K/D 与上一份 LUT
+            # 算的，与新标定已经不是一套。宁可按钮回到 disabled。
+            STATE['ipm_results'] = []
         else:
             print(f'复用已有标定文件 {core.CALIB_JSON.name}'
                   '（勾选"强制重新标定"可从头再算一遍）。')
@@ -1229,6 +1244,7 @@ def api_commit(body: dict) -> dict:
             'horizon_sign': cal.sign,
             'max_range_cm': core.MAX_RANGE_CM,
             'max_lateral_cm': core.MAX_LATERAL_CM,
+            'calibration_basis_hash': core.current_calibration_basis(),
         }, **origin), img_size, ipm_state=ipm_state)
         # 导出已成功，这时才写结果图（与矩阵、查找表同属一批产物）
         core.safe_imwrite(core.IPM_RESULT, cal.birdview)
@@ -1265,15 +1281,23 @@ def api_batch() -> dict:
 
     优先消费已经导出的那套表——这才是"交付给 C 端的表能不能用"的直接验证；
     表不在时才退回按 ipm_state.json 重算。
+
+    CAL2：两条路都先过标定基准闸门。重标之后磁盘上的 matrix/lookup_table/ipm_state
+    仍是上一版的，拿它们跑出来的图看上去完全正常却不属于当前标定——这种"看起来对"
+    的产物必须拦住，而不是删掉。
     """
     ensure_calibration()
     try:
+        core.require_calibration_basis(core.exported_basis_hash(), '已导出的查找表不可用')
         pair = core.load_exported_reverse_pair(STATE['img_size'])
         prefix = '使用已导出的查找表。\n'
     except SystemExit as exc:
+        state = core.load_ipm_state() or {}
+        core.require_calibration_basis(state.get('calibration_basis_hash'),
+                                       'ipm_state.json 也不可用')
         pair = core.rebuild_reverse_map_from_state(
             STATE['K'], STATE['D'], STATE['Knew'], STATE['img_size'])
-        prefix = f'未找到已导出的表（{exc}），改为按 ipm_state.json 重算。\n'
+        prefix = f'未使用已导出的表（{exc}），改为按 ipm_state.json 重算。\n'
     _r, log = capture(core.batch_test, pair)
     return {'log': prefix + log}
 

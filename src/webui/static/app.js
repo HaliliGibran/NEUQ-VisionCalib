@@ -1658,7 +1658,13 @@ function bindActions() {
   refreshBackups();
   try {
     const st = await refreshStatus();
-    const saved = st.ipm_state || null;
+    // CAL2：旧 ipm_state 只有在它属于当前标定时才可以恢复。K/D/Knew 或标定分辨率
+    // 变了之后，那套四点是在**另一张去畸变图**上点的，照原样贴回来会悄悄错位。
+    if (st.ipm_state && st.ipm_basis_stale) {
+      log('警告: ' + st.ipm_basis_stale, 'err');
+      log('已跳过恢复上次的四点 / anchor / scale，请重新确认逆透视标定。', 'err');
+    }
+    const saved = (st.ipm_basis_stale ? null : st.ipm_state) || null;
     const savedName = saved && saved.src_image
       ? saved.src_image.split(/[\\/]/).pop() : null;
 
