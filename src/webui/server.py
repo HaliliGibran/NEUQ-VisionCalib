@@ -1,8 +1,9 @@
-"""NEUQ 视觉标定工具的本地 Web 控制台。
+"""NEUQ 视觉标定工具的本地 Web 控制台——主算法外面的一层薄壳。
 
-把 neuq_vision_calib.py 的全部能力搬到浏览器里：素材导入、相机标定、逆透视四点拖拽、
-实时 BirdView 预览、矩阵与查找表导出、批量测试。服务端不重复实现任何几何逻辑，
-所有计算都直接调用主脚本的函数，保证网页上看到的结果和命令行跑出来的完全一致。
+它把 neuq_vision_calib.py 的能力接到浏览器：素材导入、相机标定、逆透视四点拖拽、
+实时 BirdView 预览、矩阵与查找表导出、批量测试。HTTP 层只负责校验请求、保存短期
+交互状态和整理响应；几何、事务与文件格式仍直接调用主脚本。这样 Web 和 CLI 只是
+同一条流水线的两个入口，不会各自产生一套“看起来差不多”的 H 或 LUT。
 
 启动（在工程根目录下执行）:
     python src/webui/server.py            # 默认 http://127.0.0.1:8770
@@ -72,17 +73,21 @@ def static_dir() -> Path:
 
 STATIC_DIR = static_dir()
 
-# 服务端只有一份全局状态：本地单人使用，用锁串行化所有计算请求即可，
-# 不值得为并发去拆分会话。
+# 服务端只有一份进程内状态：工具只监听本机、面向单人使用，用锁串行化计算请求即可。
+# 各字段寿命刻意不同：
+#   K/D/Knew/img_size  从 calib.json 载入或重标后缓存，直到服务退出或再次标定；
+#   src_*              只属于当前选中的 IPM 原图，换图或重标就整体清空；
+#   ipm_results        只属于本进程里最近一次“导出后自动批测”，不拿磁盘旧文件冒充。
+# 真正需要跨进程复用的事实都在 calib.json / ipm_state.json / matrices.json，不依赖 STATE。
 LOCK = threading.Lock()
 STATE: dict = {
-    'K': None,          # 相机内参
-    'D': None,          # 畸变系数
-    'Knew': None,       # 去畸变输出相机矩阵
-    'img_size': None,   # (W, H)
-    'src_path': None,   # 当前逆透视标定原图
-    'src_raw': None,    # 原始畸变图
-    'src_undist': None, # 去畸变图，四点拖拽在它上面进行
+    'K': None,          # 相机内参：归一化相机坐标 -> 原始像素
+    'D': None,          # 原始镜头的畸变系数
+    'Knew': None,       # 去畸变输出所采用的像素坐标系
+    'img_size': None,   # 标定分辨率 (W, H)
+    'src_path': None,   # 当前 IPM 原图路径
+    'src_raw': None,    # 当前原始畸变图
+    'src_undist': None, # 当前 Knew 去畸变图；四点在这个坐标系中拖拽
     # 上一次导出后自动批测的成果记录：[{name, role, raw, birdview}]，由 batch_test
     # 的**实际返回**填充（见 record_ipm_results）。逆透视成果画廊只读它，不去扫目录
     # 按 stem 反查配对——那正是标定画廊踩过的坑。
@@ -260,16 +265,20 @@ def initial_phys_size() -> tuple[float, float]:
 def initial_target_window() -> tuple[float, float]:
     """网页上「目标地面窗口」两个输入框的初值：(横向宽度, 前向深度)。
 
-    与物理尺寸同一套口径。老的 ipm_state 里没有这两个键（A2 之前的版本），
-    取不到就退回模块默认，不去猜。
+    与物理尺寸同一套口径。早期 ipm_state 没有这两个键，取不到就退回模块默认，
+    不从其它尺寸字段猜测。
     """
     return _state_pair('target_width_cm', 'target_forward_cm',
                        (core.TARGET_WIDTH_CM, core.TARGET_FORWARD_CM))
 
 
 def api_status() -> dict:
+    """返回前端完整状态快照：目录、标定、来源闸门、IPM 与导出物。
 
-    """工程现状：目录清单、标定摘要、逆透视状态、可选原图。"""
+    前端的 ``refreshStatus()`` 把这里当作唯一同步入口。按钮动作完成后重新读取快照，
+    而不是在浏览器里猜“后端大概改了什么”；刷新页面与刚完成一次操作因此会得到
+    同一种状态表达。
+    """
     rows = (
         ('calib_input', core.DIR_CALIB_IN, '相机标定照片'),
         ('calib_data', core.DIR_CALIB_DATA, '标定结果 calib.json'),
@@ -326,7 +335,7 @@ def api_status() -> dict:
     phys_w, phys_h = initial_phys_size()
     target_w, target_f = initial_target_window()
 
-    # CAL2：产物是否还属于当前标定。只判定不删文件——与素材库那套闸门同风格。
+    # 产物是否还属于当前标定。只判定不删文件——与素材库那套闸门同风格。
     saved_ipm = core.load_ipm_state()
     ipm_basis_stale = (core.calibration_basis_stale(saved_ipm.get('calibration_basis_hash'))
                        if saved_ipm else None)
@@ -362,7 +371,7 @@ def api_status() -> dict:
         'material_transaction': core.material_transaction_state(),
 
         'ipm_state': saved_ipm,
-        # CAL2：这两条不是"文件在不在"，而是"它还属于当前标定吗"。stale 时前端不恢复
+        # 这两条不是“文件在不在”，而是“它还属于当前标定吗”。stale 时前端不恢复
         # 旧四点，后端也拒绝拿旧表跑批测——产物本身一个都不删。
         'ipm_basis_stale': ipm_basis_stale,
         'tables_basis_stale': tables_basis_stale,
@@ -882,7 +891,12 @@ def api_calibrate(body: dict) -> dict:
 
 
 def api_source(body: dict) -> dict:
-    """选定逆透视标定原图并去畸变，返回图与一个起点四边形。"""
+    """选定 IPM 原图，统一到标定分辨率并去畸变，再返回一个可拖拽起点。
+
+    四点坐标属于 ``Knew`` 去畸变图，而不是原始畸变图。若素材依据已经 stale 或未知，
+    函数在读图前就拒绝：候选列表本身是旧棋盘规格分拣出的结论，点名其中一张并不会
+    让它自动重新可信。
+    """
     # 界面上的候选列表就是 ipm_input/ 的分拣结果，规格换了它整体不可信：
     # 里面可能混着"新规格能认出是棋盘、旧规格认成地面"的照片。只在页面上飘一行
     # 红字是不够的，用户照样能点下去一路导出。core 侧只拦了自动取图，这里
@@ -959,7 +973,7 @@ def recommended_layout(cal) -> dict:
 
     口径是 IpmCalibrator.target_layout()：把**目标地面窗口**（自标定矩形近边向前
     target_forward_cm、横向 target_width_cm）贴住输出图底边并最大化装入，anchor_y
-    与 scale 一起解出来。A2 之前这里装的是整幅 valid FOV，实测把 ±300 cm 的地面
+    与 scale 一起解出来。若误把整幅 valid FOV 当构图目标，会把 ±300 cm 的地面
     压进 1280x720，48% 的输出像素来自不到 0.04 个源像素——整幅图是放射状拉丝。
 
     source 字段区分两种来源：
@@ -1026,7 +1040,7 @@ def api_preview(body: dict) -> dict:
     rect = core.apply_homography(cal.H, cal.corners)
     cv2.polylines(view, [rect[[0, 1, 3, 2]].astype(np.int32)], True, (0, 255, 0), 2)
     # anchor 十字正好就是逆透视坐标参考原点（去畸变图底边中点对应的地面点）：
-    # A3 之后 H 把那个点精确映到 anchor，所以不用再单独画一个标记。
+    # 完整 H 会把那个点精确映到 anchor，所以不用再单独画一个标记。
     ax, ay = cal.anchor_px()
     cv2.drawMarker(view, (int(round(ax)), int(round(ay))), (0, 140, 255),
                    cv2.MARKER_CROSS, 18, 2)
@@ -1192,6 +1206,7 @@ def run_auto_batch(pair) -> dict:
 def api_commit(body: dict) -> dict:
     """落盘：保存逆透视状态、导出六矩阵与两套查找表，再跑自动批量测试。
 
+    前置条件是当前四点能构成 H、表网格合法，且相机参数与选中原图已经在 STATE 中。
     回包里 export_ok 与 batch 是两件事，必须分开看。自动批测是**交付之后**的验证，
     不属于导出事务：它失败了矩阵与查找表照样已经提交成功（绝不回滚），所以它的
     异常不能冒出去——否则前端只会看到一句"导出失败"，而表其实已经在盘上了。
@@ -1285,7 +1300,7 @@ def api_batch() -> dict:
     优先消费已经导出的那套表——这才是"交付给 C 端的表能不能用"的直接验证；
     表不在时才退回按 ipm_state.json 重算。
 
-    CAL2：两条路都先过标定基准闸门。重标之后磁盘上的 matrix/lookup_table/ipm_state
+    两条路都先过标定基准闸门。重标之后磁盘上的 matrix/lookup_table/ipm_state
     仍是上一版的，拿它们跑出来的图看上去完全正常却不属于当前标定——这种"看起来对"
     的产物必须拦住，而不是删掉。
     """

@@ -1,24 +1,24 @@
-"""校验导出的矩阵与查找表是否自洽。
+"""把一次导出当成小型验收项目：检查矩阵、图像效果与四组 LUT。
 
-交付给嵌入式 C 端的是一堆映射表。表一旦内部不一致（方向搞反、无效点没标、精度不够），
-在车上是极难排查的。这个脚本把每条约定都独立验一遍：
+交付给嵌入式 C 端的是预先算好的坐标；方向写反、坐标系错一层或量化溢出，往往仍能
+生成一张“有画面”的图，所以只看文件存在远远不够。本脚本按由几何到字节的顺序检查：
 
-  1. H 把源四点映射成矩形，且尺寸/邻边垂直/旋转角/参考原点四项不变量成立
-  2. 表网格是源图的整数倍**等比**缩小（非等比会破坏 BirdView 的公制纵横比）
-  3. undistort/reverse 表 remap 的结果 == cv2.undistort
-  4. undistort_ipm/reverse 表 remap 的结果 == cv2.warpPerspective(去畸变图, H)
-  5. undistort_ipm 的 forward 与 reverse 互为逆映射
-  6. 无效哨兵只出现在合法区域之外，且有效区连通
-  7. 落盘的 forward 与 reverse **各自**等于流水线应当生成的那张表
+  1. ``H`` 的四个几何不变量：尺寸、邻边垂直、朝向、参考原点 → 锚点
+  2. LUT 网格是否为源图的整数倍等比缩小
+  3. ``undistort/reverse`` 重建图是否等于 OpenCV ``undistort``
+  4. ``undistort_ipm/reverse`` 重建图是否等于 OpenCV 两步参考链
+  5. IPM forward/reverse 往返误差（降采样时只作诊断）
+  6. 四组表的 X/Y 无效哨兵是否同步、值是否统一
+  7. 落盘 forward/reverse 是否分别等于流水线应生成的最终数组
 
-第 7 条才是主判据。理由见 check_forward_reverse 的 docstring：一对经过栅格化、
-INTER_AREA 重采样与定点量化的离散表，本来就不保证严格互逆，把"互逆"当成必须成立的
-数学不变量会得到一个随 scale 漂移的假失败。职责因此分成三段：
+这里故意使用两类 oracle（判定参照）：第 3、4 项走 OpenCV 的独立图像 API，回答
+“数学方向和组合结果对不对”；第 7 项按本项目流水线重建数组，回答“重采样、量化和
+序列化有没有忠实落盘”。两个结果互相一致不等于两者都正确，因此不能只让 forward
+与 reverse 互相证明。第 5 项在全分辨率下能补充检验方向，在降采样后则不能当硬门槛：
+栅格化、面积重采样与定点量化都不可逆，严格互逆本来就不再是数学不变量。
 
-  数学生成逻辑对不对                → 第 6 条（流水线 oracle）
-  写盘 / 重采样 / 量化对不对        → 第 6 条（同一条，逐点比对）
-  两张离散表能不能完美互逆          → 第 4 条，全分辨率下是 hard gate，
-                                     降采样后只作诊断
+第 6 项只检查哨兵的成对和值域约定，不判断有效区是否连通；几何有效性由第 4、7 项
+及生成阶段的地平线/边界判据覆盖。每项 docstring 还说明了失败通常指向哪一层。
 
 落盘格式自动识别：逗号分隔文本（MapW.txt）、int16 定点二进制（MapW.bin）、
 C 头文件（Map.h）。读取统一走主脚本的 core.load_map_pair，这样"脚本怎么读表"
@@ -107,7 +107,7 @@ def describe_pair(folder: Path) -> str:
 
 
 def apply_homography(M: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """对 (N,2) 点集应用单应。"""
+    """对 ``(N,2)`` 点集应用单应；本地实现让验收脚本不依赖主流程的同名 helper。"""
     p = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
     hom = np.column_stack((p, np.ones(p.shape[0])))
     out = (M @ hom.T).T
@@ -199,7 +199,7 @@ def full_resolution() -> bool:
 def pipeline_composite_maps(calib: dict, matrices: dict) -> dict:
     """按流水线重算 undistort_ipm 的正反两张表（重采样、量化之前）。
 
-    这是整个脚本的 oracle：复刻 core.export_composite_tables 里那几行数学，
+    这是“落盘忠实度”的流水线 oracle：复刻 core.export_composite_tables 里的生成步骤，
     逐点比对落盘结果。**正反都要算** —— 以前只重算 reverse，forward 的数学
     错了（方向反了、无效判据不一致）在这里是看不出来的，而 forward 恰恰是
     "互逆"那一条唯一能间接碰到的地方，那条又天然带着插值误差。
@@ -226,7 +226,11 @@ def pipeline_composite_maps(calib: dict, matrices: dict) -> dict:
 
 def compare_to_pipeline(root: Path, direction: str,
                         expect: tuple) -> bool:
-    """把一个方向的落盘表与流水线重算结果逐点比对。"""
+    """把一个方向的落盘表与流水线重算结果逐点比对。
+
+    无效掩码不一致通常指向边界/哨兵处理；掩码一致但数值超容差，通常指向重采样、
+    Q 格式解释或序列化。forward 与 reverse 分开比较，避免一侧的错误被另一侧掩盖。
+    """
     fx, fy = expect
     if IMAGE_SIZE != TABLE_SHAPE:
         fx, fy = core.resample_map_pair(fx, fy, TABLE_SHAPE)
@@ -256,7 +260,7 @@ def compare_to_pipeline(root: Path, direction: str,
 
 
 def check_grid_isotropy() -> bool:
-    """检查 7: 表网格必须是源图的**整数倍等比**缩小。
+    """检查 2：表网格必须是源图的**整数倍等比**缩小。
 
     这一条是交付级的公制几何门槛，不是格式挑剔。1280x720 降成 320x240 时 x 缩 4 倍、
     y 缩 3 倍，小图里的公制尺度就变成 x=scale/4、y=scale/3——一个物理上 45x45 cm 的
@@ -265,6 +269,7 @@ def check_grid_isotropy() -> bool:
     正是这张真实的小图，所以风险不是理论上的。
 
     等比之后 C 端只需要一个倍率 n：full = (small + 0.5) * n - 0.5。
+    失败通常不是镜头标定问题，而是导出尺寸/metadata 违反了公制纵横比约定。
     """
     sw, sh = IMAGE_SIZE
     tw, th = (TABLE_SHAPE if TABLE_SHAPE else IMAGE_SIZE)
@@ -279,11 +284,12 @@ def check_grid_isotropy() -> bool:
 
 
 def check_export_fidelity(root: Path, calib: dict, matrices: dict) -> bool:
-    """检查 6: 落盘的正反两张表是否忠实等于流水线重算的结果。
+    """检查 7：落盘的正反两张表是否忠实等于流水线重算的结果。
 
     覆盖重采样与定点量化两步。检查 2/3 验证的是数学（只有全分辨率下才可比），
     这一项验证的是"算出来的东西有没有原样写进文件"，任何网格、任何格式都成立，
-    因此它才是降采样交付物的主判据。
+    因此它才是降采样交付物的主判据。失败通常落在文件格式、网格重采样、Q 位数或
+    哨兵序列化；它与流水线共享数学 helper，所以不能替代第 3、4 项的独立 OpenCV oracle。
     """
     # core 已在模块顶部导入（那时就把 src/ 挂上了 sys.path），这里只需按用户给的
     # 工程根重绑定路径常量，并把表格格式同步过去，好让 core.load_map_pair 读得对。
@@ -301,7 +307,8 @@ def quant_tolerance() -> float:
 
     单轴最多差半个量化步长（文本是 %.2f 即 0.005，定点是 0.5/2^N）；
     两轴合成后是二维欧氏距离，最大 sqrt(2) 倍。以前写成 `0.01 + step`，
-    对文本表偏松约 7 倍、对 Q0 偏松到 1.01 px，几乎没有判别力。
+    对文本表偏松约 7 倍、对 Q0 偏松到 1.01 px，几乎没有判别力。以 Q4 为例，
+    单轴上限 ``0.5/16`` px，二维上限 ``sqrt(2)*0.5/16 ≈ 0.0442`` px。
     """
     half_axis = 0.005 if IS_TEXT_TABLE else 0.5 / (1 << FIXED_POINT)
     return float(np.sqrt(2.0) * half_axis + 1e-6)
@@ -423,10 +430,9 @@ def check_homography(matrices: dict) -> bool:
       3. atan2(TR-TL) == heading（矩形对边平行，角度在模 180° 意义下比较）
       4. **去畸变图底边中点** 经 H 之后正好落在 anchor 上
 
-    第 4 条是 A3 换掉的那一条。以前验的是"四点中心 == anchor"，那只在 marker 原点
-    兼任坐标原点时才成立；A3 在 H0 之后插了 T(-ref)，落在 anchor 上的已经是
-    **逆透视坐标参考原点**（底边中点对应的地面点），不再是标定矩形中心。改完之后
-    这条判据反而更硬：它直接钉住"画面最底下中点 -> BirdView 底部锚点"这条链路。
+    第 4 条不能写成“标定矩形中心 == anchor”：H0 之后还有 ``T(-ref)``，落在 anchor
+    上的是**逆透视坐标参考原点**（底边中点对应的地面点），不是标定矩形中心。
+    任一项失败通常说明 H 的组合顺序、角点对应、物理尺寸/比例尺或参考原点语义错了。
     """
     H = np.asarray(matrices['H'], dtype=np.float64).reshape(3, 3)
     quad = np.asarray(matrices['src_quad_tl_tr_bl_br'], dtype=np.float64).reshape(4, 2)
@@ -475,7 +481,12 @@ def check_homography(matrices: dict) -> bool:
 
 
 def check_undistort_tables(root: Path, calib: dict) -> bool:
-    """检查 2: 去畸变反向表 remap == cv2.undistort。"""
+    """检查 3：去畸变 reverse 表重建图是否等于独立的 ``cv2.undistort``。
+
+    这项想证明 destination → source 方向、K/D/Knew 与双线性取样都一致。失败通常
+    指向 reverse 表方向写反、Knew 选错、表值坐标系错误，或落盘精度超出预期。
+    降采样后输出尺寸不同，逐像素图像比较失去同位语义，因此明确跳过而不伪装成通过。
+    """
     if not full_resolution():
         return skip('undistort/reverse 表 == cv2.undistort',
                     f'表已降采样到 {TABLE_SHAPE[0]}x{TABLE_SHAPE[1]}，'
@@ -500,7 +511,11 @@ def check_undistort_tables(root: Path, calib: dict) -> bool:
 
 
 def check_composite_tables(root: Path, calib: dict, matrices: dict) -> bool:
-    """检查 3: 逆透视反向表 remap == warpPerspective。"""
+    """检查 4：复合 reverse 表是否等于 OpenCV 的“去畸变 → warpPerspective”。
+
+    这是端到端的独立图像 oracle：一侧用一次 LUT remap，另一侧调用两套 OpenCV API。
+    失败通常说明畸变与 H 的复合方向、地平线有效区、Knew 或插值约定不一致。
+    """
     if not full_resolution():
         return skip('undistort_ipm/reverse 表 == warpPerspective',
                     f'表已降采样到 {TABLE_SHAPE[0]}x{TABLE_SHAPE[1]}，'
@@ -539,7 +554,7 @@ def check_composite_tables(root: Path, calib: dict, matrices: dict) -> bool:
 
 
 def check_forward_reverse(root: Path) -> bool:
-    """检查 4: 逆透视的 forward 与 reverse 是否互为逆映射。
+    """检查 5：逆透视的 forward 与 reverse 是否近似互为逆映射。
 
     做法：reverse 给出连续的原图坐标 -> 换算成 forward 表的连续网格坐标 ->
     **双线性**采样 forward -> 应当回到出发的那个输出像素。
@@ -599,7 +614,11 @@ def check_forward_reverse(root: Path) -> bool:
 
 
 def check_sentinel(root: Path) -> bool:
-    """检查 5: 无效哨兵 -1 的分布是否合理。"""
+    """检查 6：每组表的 X/Y 无效掩码同步，且解码后统一使用 -1。
+
+    X 无效而 Y 有效会让 C 端拼出不存在的二维坐标；出现其它负值则说明定点哨兵还原
+    或文本序列化约定漂移。这项不判断无效区域的几何形状或连通性。
+    """
     ok = True
     for name in ('undistort', 'undistort_ipm'):
         for direction in ('reverse', 'forward'):
@@ -675,13 +694,22 @@ def main() -> int:
     print_table_inventory(root)
     print()
 
+    # 按“几何语义 → 网格契约 → 独立图像 oracle → 双向诊断 → 字节忠实度”排列。
+    # 保留逐项结果而不是遇首错就退出：一次运行可以同时告诉同学问题落在哪几层。
     results = [
+        # 1. H 自己是否仍表达实测矩形、朝向与参考原点。
         check_homography(matrices),
+        # 2. 降采样是否保持 x/y 同一个公制倍率。
         check_grid_isotropy(),
+        # 3. 只去畸变的 reverse LUT 对照独立 OpenCV 实现。
         check_undistort_tables(root, calib),
+        # 4. 去畸变 + IPM 的复合 reverse LUT 对照 OpenCV 两步链。
         check_composite_tables(root, calib, matrices),
+        # 5. forward/reverse 往返；降采样时明确降级为诊断。
         check_forward_reverse(root),
+        # 6. 四组表的无效哨兵在 X/Y 两分量上是否成对。
         check_sentinel(root),
+        # 7. 正反两张落盘数组各自是否忠实于生成流水线。
         check_export_fidelity(root, calib, matrices),
     ]
 

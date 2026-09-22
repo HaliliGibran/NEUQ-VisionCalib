@@ -2,6 +2,9 @@
 
 const $ = (id) => document.getElementById(id);
 
+// 这份 state 只保存当前页面会话里的交互草稿，不是工程事实：刷新后应从 /api/status
+// 和落盘 JSON 恢复。img/quad/linePoints 随当前 IPM 原图存活，fit 属于最近一次标定，
+// lastPreview 属于最近一次预览；成功导出后才把 quad 复制进 committedQuad。
 const state = {
   img: null,          // 去畸变后的源图
   quad: null,         // [[x,y] x4]，图像坐标系
@@ -281,6 +284,11 @@ function renderTransactionWarning(txn) {
   });
 }
 
+/** 从 /api/status 同步所有可持久化状态，是 UI 的单一刷新入口。
+
+    标定、导入、导出与清空之后都重新调用它；不要在每个按钮回调里手工维护另一份
+    “后端应该是什么状态”的推测。这样页面首次打开、按刷新和刚完成操作走同一条路径。
+ */
 async function refreshStatus() {
   const st = await api('/api/status');
   // 可用的 LUT 降采样倍率由标定分辨率决定，所以标定成功之后才有值。这一句必须留在
@@ -927,7 +935,7 @@ async function runPreview() {
     const data = await api('/api/preview', previewParams());
     state.lastPreview = data;
     await drawPreview(data.birdview);
-    // A2 之后不再有"超出不裁切上限"这档：裁掉目标地面范围以外的远处与侧面是故意的。
+    // 比例尺由目标地面范围决定；裁掉范围以外的远处与侧面是构图选择，不是越界故障。
     // 唯一值得单独标出来的是兼容布局 —— 那说明目标范围在当前几何下装不进画布。
     const fb = data.layout_mode === 'fallback';
     setChip(chip, fb ? '目标范围装不下，已用兼容布局' : '正常', fb ? 'warn' : 'ok');
@@ -1669,7 +1677,7 @@ function bindActions() {
   refreshBackups();
   try {
     const st = await refreshStatus();
-    // CAL2：旧 ipm_state 只有在它属于当前标定时才可以恢复。K/D/Knew 或标定分辨率
+    // 旧 ipm_state 只有在它属于当前标定时才可以恢复。K/D/Knew 或标定分辨率
     // 变了之后，那套四点是在**另一张去畸变图**上点的，照原样贴回来会悄悄错位。
     if (st.ipm_state && st.ipm_basis_stale) {
       log('警告: ' + st.ipm_basis_stale, 'err');

@@ -1,4 +1,8 @@
-"""NEUQ 智能车视觉标定一体化工具。
+"""NEUQ 智能车视觉标定一体化工具的应用编排层。
+
+这里把素材、相机标定、逆透视（IPM）、查找表（LUT）和验收串成一条可恢复的流程；
+几何与标定公式分别落在 ``neuq_core.geometry/calibration/lut``。阅读本文件时，先沿下面
+七个阶段看数据怎样流动，不必从模块级常量一路逐行读到 CLI。
 
 目录约定：各工作目录平铺在工程根；data/ 只装两类不属于流水线产物的东西——
 导入前的原始素材（data/import/）与备份压缩包（data/backups/），两者都不入库。
@@ -41,8 +45,7 @@ T/S/R 第三行均为 [0,0,1]，故 H[2,:] 恒等于 H0[2,:]，地平线只随�
   python src/neuq_vision_calib.py --stage tables --quad ...
                                                          无 GUI 跑完整链路
   python src/webui/server.py                             打开浏览器控制台（推荐）
-不带任何参数时的行为与改造前一致：从 calib_input/ 标定，
-用 ipm_input/ 的原图交互标定。
+不带任何参数时会从 calib_input/ 标定，再用 ipm_input/ 的原图交互完成逆透视标定。
 """
 
 import argparse
@@ -146,7 +149,9 @@ from neuq_core.lut import (  # noqa: F401
     undistorted_grid,
 )
 
-# ---------------------------------------------------------------- 配置
+# ================================================================ 工程配置与路径
+# 这一段只决定“用什么规格、到哪里读写、导出采用什么格式”。后面的算法阶段都从
+# 这些权威值读取，避免 CLI、Web 与 OpenCV 交互窗口各藏一套默认值。
 
 # 当前工程的标定板规格。命令行 --board-squares / 网页上的规格卡片都会改它，
 # 之后素材导入、在线拍摄、相机标定、结果落盘全部读这一份，不再各留一套常量。
@@ -264,8 +269,8 @@ def default_project_root() -> Path:
 
     源码方式运行时本文件位于 <工程根>/src/ 下，所以要再上一级才是工程根。
 
-    目录约定：各工作目录（calib_input/、matrix/、lookup_table/ …）直接放在工程根，
-    与改造前一致；只有 data/ 是个例外，它只装两类"不属于流水线产物"的东西——
+    目录约定：各工作目录（calib_input/、matrix/、lookup_table/ …）直接放在工程根；
+    只有 data/ 是个例外，它只装两类“不属于流水线产物”的东西——
     导入前的原始素材（data/import/）和备份压缩包（data/backups/）。
     """
     if getattr(sys, 'frozen', False):
@@ -400,7 +405,10 @@ def configure_paths(root: Optional[Path] = None,
     configure_board(restore_board())
 
 
-# ---------------------------------------------------------------- 1. 相机标定
+# ================================================================ 相机标定
+# 输入：calib_input/ 中同分辨率、不同姿态的棋盘照片。
+# 输出：calib.json（K/D/Knew 的基准）与同一轮参数生成的去畸变预览。
+# 失败通常意味着照片不足、棋盘规格不符、分辨率混杂，或事务无法完整落盘。
 
 
 
@@ -474,8 +482,12 @@ def fit_camera(obj_points, img_points, used, img_size):
     """标定，并在 MAX_REPROJ_ERR 给定时迭代剔除高误差视图。
 
     棋盘照片是手持拍的，个别帧的运动模糊会把整体误差抬高。剔除必须逐轮做：
-    每轮用当前参数算各视图 RMS，丢掉超限的再重标定。一次性剔除会误杀那些
-    仅仅因为初始参数还不准才显得误差大的好帧。
+    每轮用当前参数算各视图 RMS，丢掉超限的再**完整重标定**。K、D 与每张图的
+    rvec/tvec 是联合优化出来的；删掉观测后仍沿用旧参数，得到的就不是剩余数据的
+    最小二乘解。一次性剔除又会误杀那些仅因初始参数还不准才显得误差大的好帧。
+
+    先别急着只看 RMS：角点若都集中在画面中央，即使 RMS 很小，边缘畸变仍可能缺少
+    约束。这里负责稳健地拟合与记录误差，不替代对角点覆盖范围和去畸变预览的检查。
 
     返回值末尾追加两个量：
       dropped    — [(name, error), ...]，按剔除顺序记录每一轮被丢掉的照片及其误差
@@ -513,7 +525,12 @@ def fit_camera(obj_points, img_points, used, img_size):
 
 def calibrate_camera(board: Optional[CheckerboardSpec] = None
                      ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], dict]:
-    """棋盘标定，返回 (K, D, (W, H), fit_result)，并把每张图的重投影误差与去畸变预览一并输出。
+    """运行完整棋盘标定阶段，返回 ``(K, D, (W, H), fit_result)``。
+
+    前置条件是素材库状态可解释，并至少有 3 张能检出完整棋盘、分辨率一致的照片；
+    实际拍摄建议 15 张以上且覆盖不同位置与倾角。函数把物理棋盘点（mm）与图像角点
+    （px）交给 OpenCV，必要时迭代剔除高误差帧，然后把参数、来源信息与去畸变预览
+    作为同一事务提交。失败意味着本轮不会留下“新预览配旧参数”的半套结果。
 
     board 不给时用当前工程的规格（core.BOARD）；显式传入便于测试与将来拆分。
 
@@ -658,7 +675,11 @@ def render_undistort_previews(files: List[Path], K: np.ndarray, D: np.ndarray,
 
 def resolve_new_camera_matrix(K: np.ndarray, D: np.ndarray,
                               img_size: Tuple[int, int]) -> np.ndarray:
-    """按 UNDIST_ALPHA 决定去畸变输出的相机矩阵 Knew。"""
+    """按 UNDIST_ALPHA 决定去畸变输出像素坐标系的内参 ``Knew``。
+
+    ``K`` 描述原始相机像素；``Knew`` 还决定去畸变图保留多少视野、是否出现黑边。
+    IPM 四点是在这张去畸变图上选的，因此 K/D 不变而 Knew 改变时，旧四点照样失效。
+    """
     if UNDIST_ALPHA is None:
         return K.copy()
     Knew, _roi = cv2.getOptimalNewCameraMatrix(K, D, img_size, float(UNDIST_ALPHA), img_size)
@@ -687,7 +708,7 @@ def calibration_payload(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
         # 老字段保留一轮：外部脚本或旧版网页可能还在读这两个键
         'chessboard_corners': list(spec.corners),
         'square_size_mm': spec.square_size_mm,
-        # CAL2：这一份几何基准的指纹。下游（ipm_state / matrices）记同一个值，
+        # 这一份几何基准的指纹。下游（ipm_state / matrices）记同一个值，
         # 重标之后对不上就知道旧四点与旧表已经不属于当前标定。
         'calibration_basis_hash': calibration_basis_hash(K, D, Knew, img_size),
     }
@@ -700,7 +721,7 @@ def commit_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
                        fit_result: Optional[dict] = None) -> None:
     """把 calib.json 与全部去畸变预览作为**一个事务**提交。
 
-    CAL1 只把 calib_preview/ 改成整体换装，留下一个窗口：预览已经换成 B 的了，
+    如果只把 calib_preview/ 整体换装，会留下一个窗口：预览已经换成 B 的了，
     紧接着写 calib.json 时磁盘满/没权限，最终就是 `calib.json = A` 配
     `calib_preview = B`——正是刚修掉的那类不匹配，只是换了个触发时机。所以这里
     按 export_all 的同一套路，两个目录一起换：
@@ -774,7 +795,7 @@ def calibration_basis_stale(recorded: Optional[str]) -> Optional[str]:
 
     只判定、不删文件——与素材库那套闸门同一风格：标 stale + 阻止消费，
     但把"要不要重做"留给用户。老产物没有这个字段时也算不可判定，同样要拦：
-    那是 CAL2 之前导出的，无法证明它属于当前标定。
+    老产物没有这个字段时也无法证明它属于当前标定。
     """
     current = current_calibration_basis()
     if current is None:
@@ -894,7 +915,9 @@ def load_calibration() -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int]
     return K, D, img_size
 
 
-# ---------------------------------------------------------------- 单应与几何
+# ================================================================ 逆透视几何
+# 这一层把“去畸变图上的四点”连接到“可量 cm 的地面”，再裁出相机真正可见且数值
+# 有限的区域。这里还没有画布像素、比例尺或锚点；那些属于 IpmCalibrator 的布局阶段。
 
 def valid_fov_polygon(H0: np.ndarray, ground_tf: np.ndarray,
                       src_size: Tuple[int, int],
@@ -904,9 +927,9 @@ def valid_fov_polygon(H0: np.ndarray, ground_tf: np.ndarray,
     先在源图裁掉地平线另一侧（那里映射到无穷远），再映射到 cm 坐标，
     最后按前向/横向距离上限截断。sign 由 horizon_sign 给出。
 
-    ground_tf 是 H0 之后、scale/canvas 之前的那一段齐次变换，A3 之后它是
-    `R(heading) @ T(-ref)`——只传 R 会让多边形停在 标定矩形坐标系，而目标窗口已经
-    在参考原点系里，两者不同源，自动布局就会拿两个坐标系的数去比。
+    ground_tf 是 H0 之后、scale/canvas 之前的那一段齐次变换，即
+    ``R(heading) @ T(-ref)``。只传 R 会让多边形停在标定矩形坐标系，而目标窗口已经
+    在逆透视参考坐标系里；自动布局若拿两套原点的数做 min，结果没有物理意义。
     地平线裁剪仍然只看 H0 的第三行：T 与 R 的第三行都是 [0,0,1]，不影响分母。
     """
     w, h = src_size
@@ -930,10 +953,21 @@ def valid_fov_polygon(H0: np.ndarray, ground_tf: np.ndarray,
     return poly_cm
 
 
-# ---------------------------------------------------------------- 4. 交互标定
+# ================================================================ IPM 交互与布局
+# 四条线只决定 H0（像素 → 标定矩形 cm）；参考原点、朝向偏移、比例尺与锚点再把 H0
+# 布局到 BirdView。把“测量几何”与“画面构图”分开，是理解这个类的关键。
 
 class IpmCalibrator:
-    """四条线的交点定义地平面度量关系；横向锚点、纵向锚点、朝向偏移、比例尺调节俯视图布局。"""
+    """把地面四点的公制关系与 BirdView 构图组合成最终单应 ``H``。
+
+    ``H0`` 只由去畸变图上的四点和实测矩形尺寸确定，输入是 px，输出是以标定矩形
+    中心为原点的 cm。最终 ``H`` 还依次加入 ``T(-reference_origin)``、朝向旋转、
+    ``px/cm`` 比例尺和画布锚点，因此输出才是 BirdView 像素。
+
+    ``target_window`` 表示我们希望画面装下的地面范围；``valid_fov_polygon`` 表示数学
+    上仍然有效的相机视野，两者不是一回事。``full_fov_fit_scale`` 只报告把后者全部
+    装入画布需要多小的比例尺，不是用户比例尺的上限。
+    """
 
     def __init__(self, img: np.ndarray, phys_w: float, phys_h: float):
         self.img = img
@@ -986,7 +1020,7 @@ class IpmCalibrator:
         # 新的构图目标是目标地面窗口，它通常远小于整幅有效视野，因此正常情况下
         # scale > full_fov_fit_scale —— 远处与侧面被裁掉是故意的，不该告警。
         self.full_fov_fit_scale = 0.0
-        # A3: 去畸变图底边中点经 H0 映射到地平面的坐标（标定矩形坐标系 cm）。
+        # 去畸变图底边中点经 H0 映射到地面的坐标（标定矩形坐标系 cm）。
         # 这是逆透视坐标系的参考原点——compose() 里的 T_ref 就是平移它到 (0,0)。
         # None 表示尚未算出或底边中点落在地平线无穷远侧。
         self.ground_ref_marker_cm: Optional[np.ndarray] = None
@@ -1026,8 +1060,9 @@ class IpmCalibrator:
     def ground_transform(self) -> np.ndarray:
         """H0 之后、scale/canvas 之前的那一段：R(heading) @ T(-ref)。
 
-        目标窗口、有效视野多边形、自动布局三者必须都在这个坐标系里比，否则就是
-        拿两套原点的数在做 min。
+        矩阵从右往左作用：先用 ``T(-ref)`` 把逆透视参考原点移到 (0,0)，再绕这个
+        原点旋转。目标窗口、有效视野多边形、自动布局三者必须都在这个坐标系里比较，
+        否则就是拿两套原点的数在做 min。
         """
         ref = self.ground_ref_marker_cm
         T_ref = translation_matrix(-ref[0], -ref[1]) if ref is not None else np.eye(3)
@@ -1036,9 +1071,9 @@ class IpmCalibrator:
     def compose(self, H0: np.ndarray) -> np.ndarray:
         """按当前参数组合出完整单应 H = T_canvas @ S @ R @ T_ref @ H0。
 
-        A3 新增的 T_ref 把 标定矩形坐标系 原点平移到 IPM 参考原点——去畸变图底边中点
-        对应的那个地面点。平移必须发生在 R(heading) 之前：heading 围绕的是**参考
-        原点**而不是 marker 原点，否则旋转会把参考点甩到别的地方去。
+        ``T_ref`` 把标定矩形坐标系改成以 IPM 参考点为原点的坐标系。矩阵连乘从右
+        往左执行，所以 ``T_ref`` 必须先于 ``R(heading)`` 生效：heading 应绕参考原点
+        旋转，而不是绕标定矩形中心旋转，否则参考点会被甩到别的位置。
         """
         ax, ay = self.anchor_px()
         return (translation_matrix(ax, ay) @ scale_matrix(self.scale)
@@ -1047,7 +1082,7 @@ class IpmCalibrator:
     def target_window(self) -> np.ndarray:
         """以 IPM 参考原点为原点的目标地面窗口（旋转后 cm 坐标，TL,TR,BL,BR）。
 
-        A3 之后坐标系已经平移到参考原点，窗口就是 x=[-W/2,W/2], y=[-F,0]，
+        坐标系已经平移到参考原点，窗口就是 x=[-W/2,W/2], y=[-F,0]，
         不需要知道标定矩形的形状或位置。
         """
         return target_window_cm(self.target_width_cm, self.target_forward_cm)
@@ -1063,7 +1098,11 @@ class IpmCalibrator:
                                   self.out_size)
 
     def recompute(self) -> None:
-        """重算 H0、参考原点、自动布局、full_fov_fit_scale、H 与 BirdView 预览。"""
+        """按依赖顺序重算 ``H0 → 参考原点 → 布局 → H → BirdView``。
+
+        任一基础几何步骤失败都会清空派生结果；调用方看到 ``H is None`` 就知道当前
+        四条线不可用，而不会继续拿上一轮的矩阵预览或导出。
+        """
         self.corners = self.build_corners()
         if self.corners is None:
             self.H0 = self.H = self.birdview = None
@@ -1080,7 +1119,7 @@ class IpmCalibrator:
             return
 
         self.sign = horizon_sign(self.H0, self.corners)
-        # A3: 求参考原点。None 表示底边中点落在地平线无穷远侧——极端几何，
+        # 求参考原点。None 表示底边中点落在地平线无穷远侧——极端几何，
         # compose 里会跳过 T_ref（退回 marker 原点），target_window 照常能用。
         self.ground_ref_marker_cm = ground_reference_origin(
             self.H0, (self.w, self.h), self.sign)
@@ -1314,8 +1353,7 @@ class IpmCalibrator:
                     self.line_points[:] = self.line_default
                     self.dirty = True
                 elif key == ord('f'):
-                    # 语义随 A2 一起变了：以前是"吸附到完整视野的上限"，那个上限
-                    # 已经不再是目标；现在是"回到目标窗口的自动布局"。
+                    # “自动适配”针对目标地面窗口，而不是把整个数学有效视野塞进画布。
                     mode = self.apply_target_layout()
                     self.sync_scale_trackbar()
                     self.dirty = True
@@ -1342,7 +1380,7 @@ class IpmCalibrator:
             cv2.destroyWindow(self.preview_win)
 
 
-# ---------------------------------------------------------------- 5. 矩阵导出
+# ================================================================ 矩阵与元数据导出
 
 def table_convention_text() -> str:
     """把当前生效的表格式约定写成一句话，随矩阵一起导出。"""
@@ -1362,7 +1400,12 @@ def table_convention_text() -> str:
 def export_matrices(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                     H: np.ndarray, extra: dict,
                     matrix_root: Optional[Path] = None) -> None:
-    """导出六矩阵与畸变系数，同时写一份高精度文本便于粘贴。"""
+    """导出六矩阵、畸变系数与坐标约定，并写高精度文本便于粘贴。
+
+    这一步只保存可由矩阵表达的部分：K/Knew、H 及其逆。镜头畸变随半径非线性变化，
+    不能硬塞进一张 3×3 矩阵，所以 D 单独保存，端到端“原图 → BirdView”交给 LUT。
+    ``extra`` 还携带比例尺、锚点、参考原点与来源指纹，使矩阵离开当前进程仍可解释。
+    """
     out_dir = Path(matrix_root) if matrix_root is not None else DIR_MATRIX
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1411,7 +1454,9 @@ def assert_invertible(name: str, m: np.ndarray) -> None:
         raise SystemExit(f'{name} 不可逆，无法导出: {exc}') from None
 
 
-# ---------------------------------------------------------------- 6. 打表
+# ================================================================ LUT 生成与序列化
+# reverse 表用于真正的逐像素渲染；forward 表用于点坐标换算与诊断。两者在这里统一
+# 经历重采样、无效哨兵和量化，批量验证消费同一个 MapPair，不另算一份“更漂亮”的表。
 
 def quantize_table(mat: np.ndarray) -> np.ndarray:
     """把浮点映射表量化成 int16 定点，无效点写 BIN_SENTINEL。
@@ -1762,7 +1807,11 @@ def report_table_size(out_dir: Path, shape: Tuple[int, int]) -> None:
 def export_undistort_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                             size: Tuple[int, int],
                             table_root: Optional[Path] = None) -> MapPair:
-    """原图 <-> 去畸变图，正反两套表。返回反向表的最终交付版本。"""
+    """导出原图 ↔ 去畸变图的正反两套表，返回可直接 remap 的最终 reverse 表。
+
+    reverse 的索引是 Knew 去畸变图像素，值是原始畸变图采样坐标；forward 正好反向。
+    两种 value 都以原始完整分辨率的 px 表示，即使 LUT 索引网格被等比降采样也不变。
+    """
     out_dir = (Path(table_root) if table_root is not None else DIR_TABLE) / 'undistort'
     w, h = size
 
@@ -1787,7 +1836,12 @@ def export_composite_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                             H: np.ndarray, H0: np.ndarray, sign: float,
                             size: Tuple[int, int],
                             table_root: Optional[Path] = None) -> MapPair:
-    """原图 <-> 去畸变逆透视图，正反两套表。返回反向表的最终交付版本。"""
+    """导出原图 ↔ BirdView 的复合正反表，返回最终交付的 reverse 表。
+
+    reverse 把“逆 H + 镜头正向畸变”预先合成，因此嵌入式端一次 ``remap`` 就能从
+    原始畸变图得到 BirdView。forward 则把原始像素先去畸变再过 H，供点坐标换算。
+    两边都显式排除地平线另一侧，避免有限但物理错误的镜像坐标混进交付物。
+    """
     out_dir = (Path(table_root) if table_root is not None else DIR_TABLE) / 'undistort_ipm'
     w, h = size
 
@@ -1816,6 +1870,10 @@ def export_all(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                size: Tuple[int, int],
                ipm_state: Optional[dict] = None) -> MapPair:
     """事务式导出：六矩阵 + 逆透视状态 + 两套表，全部成功才落到正式目录。
+
+    前置条件是 K/Knew/H 可逆、H0 与 horizon sign 已由同一轮 IPM 标定得到、LUT 网格
+    满足整数倍等比约束。成功返回的 MapPair 正是磁盘交付物的内存视图；任一步失败
+    都只清理暂存区，已有的正式 matrix/ 与 lookup_table/ 保持成套不变。
 
     原先的顺序是"先写 matrix/，再写两套表"。中间任何一步失败（打表溢出、
     磁盘满、被 Ctrl+C）都会留下"新矩阵配旧表"的组合，而两边的文件单看都正常，
@@ -1877,7 +1935,7 @@ def _commit_dirs(pairs: Sequence[Tuple[Path, Path]], what: str = 'matrix 与 loo
 
 
 
-# ---------------------------------------------------------------- 7. 批量测试
+# ================================================================ 批量验证
 
 def same_aspect(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
     """两个分辨率是否同宽高比。
@@ -1968,13 +2026,13 @@ def batch_test(pair: MapPair, input_dir: Optional[Path] = None,
     return done
 
 
-# ---------------------------------------------------------------- 8. 命令行与素材管理
+# ================================================================ CLI 与素材管理
 
 STAGES = ('all', 'calib', 'ipm', 'tables', 'test', 'import', 'list')
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """构造命令行解析器。"""
+    """构造 CLI：它只选择阶段与运行策略，不另起一套算法实现。"""
     ap = argparse.ArgumentParser(
         prog='neuq_vision_calib',
         description='NEUQ 智能车视觉标定一体化工具：相机标定 -> 逆透视标定 -> 打表 -> 批量测试',
@@ -2029,15 +2087,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     ipm_g = ap.add_argument_group('逆透视参数')
     ipm_g.add_argument('--quad', metavar='X1,Y1,...,X4,Y4',
-                       help='直接给出源图上标定矩形的四个角点（TL,TR,BL,BR），跳过交互')
+                       help='直接给出去畸变图上标定矩形的四角点（TL,TR,BL,BR），跳过交互')
     ipm_g.add_argument('--phys-w', type=float, help='标定矩形真实宽度（cm）')
     ipm_g.add_argument('--phys-h', type=float, help='标定矩形真实高度（cm）')
-    ipm_g.add_argument('--scale', type=float, help='cm -> 输出像素的尺度（px/cm）')
-    ipm_g.add_argument('--anchor-x', type=float, help='ROI 中心的归一化横向位置 0~1')
-    ipm_g.add_argument('--anchor-y', type=float, help='ROI 中心的归一化纵向位置 0~1')
-    ipm_g.add_argument('--heading', type=float, help='标定区相对车辆前进方向的转角（度）')
-    ipm_g.add_argument('--max-range-cm', type=float, help='前向有效距离上限（cm）')
-    ipm_g.add_argument('--max-lateral-cm', type=float, help='横向有效距离上限（cm）')
+    ipm_g.add_argument('--scale', type=float,
+                       help='比例尺：地面 cm 到 BirdView 像素的等比换算（px/cm）')
+    ipm_g.add_argument('--anchor-x', type=float,
+                       help='横向锚点：逆透视参考原点在 BirdView 中的归一化横向位置 0~1')
+    ipm_g.add_argument('--anchor-y', type=float,
+                       help='纵向锚点：逆透视参考原点在 BirdView 中的归一化纵向位置 0~1')
+    ipm_g.add_argument('--heading', type=float,
+                       help='朝向偏移：标定区相对车辆前进方向的转角（度）')
+    ipm_g.add_argument('--max-range-cm', type=float,
+                       help='数学有效区的前向截断距离（cm，不是目标地面范围）')
+    ipm_g.add_argument('--max-lateral-cm', type=float,
+                       help='数学有效区的横向截断距离（cm，不是目标地面范围）')
 
     tbl_g = ap.add_argument_group('查找表导出')
     tbl_g.add_argument('--table-format', choices=('txt', 'bin', 'c'), default=None,
@@ -2508,7 +2572,7 @@ def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
         'src_quad_tl_tr_bl_br': cal.corners.tolist(),
         'src_image_width': int(img_size[0]),
         'src_image_height': int(img_size[1]),
-        # CAL2：这套四点/H 是在哪一版 K/D/Knew 的去畸变图上定出来的。重标之后
+        # 这套四点/H 是在哪一版 K/D/Knew 的去畸变图上定出来的。重标之后
         # 对不上就不该再恢复旧四点，也不该再拿旧表跑批测。
         'calibration_basis_hash': current_calibration_basis(),
     }
@@ -2574,7 +2638,7 @@ def make_calibrator_from_quad(img: np.ndarray, quad: np.ndarray, phys_w: float,
     return cal
 
 
-# ---------------------------------------------------------------- 主流程
+# ================================================================ 主流程
 
 def ask_physical_size(default_w: float = PHYS_W_CM,
                       default_h: float = PHYS_H_CM) -> Tuple[float, float]:
@@ -2618,8 +2682,7 @@ def resolve_physical_size(args: argparse.Namespace) -> Tuple[float, float]:
 def discover_ipm_source(explicit: Optional[Path] = None) -> Optional[Path]:
     """确定逆透视标定用的原图。
 
-    改造前这里写死 UnInverseImage.jpg：只要照片换个名字丢进 ipm_input/，流程就会以
-    "无法读取"结束，而目录里明明躺着可用素材。现在的顺序是
+    只认固定文件名会让“目录里明明有图”变成“无法读取”。这里按可解释性排序：
     显式指定 -> 约定名 -> 目录内唯一一张 -> 列出候选并要求显式指定。
 
     显式指定的文件分两种：位于 ipm_input/ 之内的，仍要过素材依据这一关——它躺在
@@ -2759,7 +2822,12 @@ def load_or_run_calibration(force: bool = False
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    """按命令行选择的阶段执行。不带参数时等价于改造前的全流程。"""
+    """按 CLI 选择阶段，并让每个阶段只消费已经验证过的上游产物。
+
+    主链是“配置/导入 → 相机标定 → 原图去畸变 → IPM → 事务式导出 → 批量验证”。
+    ``--stage`` 允许停在边界或复用已落盘状态；复用前必须通过素材来源与标定基准指纹
+    两道闸门。失败会停在当前阶段，不把旧状态伪装成本轮的新成果。
+    """
     args = build_arg_parser().parse_args(argv)
     configure_paths(root=args.root, calib_dir=args.calib_dir, ipm_dir=args.ipm_dir,
                     test_dir=args.test_dir, ipm_source=args.ipm_source)
@@ -2792,7 +2860,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     if stage == 'test':
         # 优先用真正落盘的那份表；表不在（或被删了）才退回按状态重算。
-        # CAL2：两条路都先确认产物属于当前标定——重标之后磁盘上的表仍是上一版的。
+        # 两条路都先确认产物属于当前标定——重标之后磁盘上的表仍是上一版的。
         try:
             require_calibration_basis(exported_basis_hash(), '已导出的查找表不可用')
             pair = load_exported_reverse_pair(img_size)
@@ -2815,7 +2883,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     # 只有 tables 阶段允许完全复用上次交互的结果；带 --quad 时一律按新参数重算。
     state = None if quad is not None else load_ipm_state()
     if stage == 'tables' and state is not None:
-        # CAL2：复用旧四点/旧 H 之前先确认它属于当前标定。K/D/Knew 变了之后，
+        # 复用旧四点/旧 H 之前先确认它属于当前标定。K/D/Knew 变了之后，
         # 那套四点是在**另一张去畸变图**上点的，直接拿来出表是不合法的。
         require_calibration_basis(state.get('calibration_basis_hash'),
                                   '复用已有逆透视标定结果被拒绝')
