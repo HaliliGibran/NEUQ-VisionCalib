@@ -283,6 +283,11 @@ function renderTransactionWarning(txn) {
 
 async function refreshStatus() {
   const st = await api('/api/status');
+  // 可用的 LUT 降采样倍率由标定分辨率决定，所以标定成功之后才有值。这一句必须留在
+  // refreshStatus 里、而不是只在初始化时调一次：否则"打开页面时还没标定 → 下拉框
+  // 显示「标定后可选」→ 标定成功 → 状态刷新了但下拉框没跟着填"，用户不按 F5 就永远
+  // 选不到 320×180。所有 /api/status 刷新都走这一条路径，不再有两套。
+  fillTableFactors(st.table_grid_options);
   const calib = st.calib;
   if (calib) {
     setChip($('chip-calib'), `已标定 ${calib.width}×${calib.height}`, 'ok');
@@ -1680,7 +1685,8 @@ function bindActions() {
       $('in-target-w').value = st.target_init.width_cm;
       $('in-target-f').value = st.target_init.forward_cm;
     }
-    fillTableFactors(st.table_grid_options);
+    // 降采样倍率不在这里填：refreshStatus() 已经统一负责了。以前这里单独调一次，
+    // 结果"首次加载能填、标定完成后刷新填不上"，用户不按 F5 就永远选不到 320×180。
 
     // 上次用的原图若还在候选里就优先选它，否则退回第一张
     const pick = (savedName && st.ipm_candidates.includes(savedName))

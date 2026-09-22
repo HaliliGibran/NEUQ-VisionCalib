@@ -779,6 +779,39 @@ def main() -> int:
         core.configure_board(old_board)
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # ---------------------------------------------------------------- H
+    # 前端的"状态刷新必须只有一条路"。这是静态检查，不是行为测试——没有 DOM，
+    # 钉不住"点完标定、不按 F5，下拉框立刻出现选项"这个现象本身。但它能钉住导致
+    # 那个现象的结构：可用倍率只在初始化时填过一次，而 runCalibration() 走的是
+    # refreshStatus()，于是标定成功后服务端已经能给出 1x/2x/4x/… 却填不进 select，
+    # 用户不刷新浏览器就永远选不到 320x180。
+    print('\n[H] 前端：降采样倍率只能由 refreshStatus 统一填充')
+    app_js = (Path(__file__).resolve().parent.parent
+              / 'src' / 'webui' / 'static' / 'app.js').read_text(encoding='utf-8')
+    anchor = 'async function refreshStatus() {'
+    start = app_js.find(anchor)
+    check(start >= 0, 'app.js 里找得到 refreshStatus')
+    # 花括号配平，取出函数体
+    depth, end = 0, len(app_js)
+    for i in range(start + len(anchor) - 1, len(app_js)):
+        if app_js[i] == '{':
+            depth += 1
+        elif app_js[i] == '}':
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    body = app_js[start:end]
+    total = app_js.count('fillTableFactors(st.table_grid_options)')
+    check('fillTableFactors(st.table_grid_options)' in body,
+          'refreshStatus 内部调用 fillTableFactors —— 每次状态刷新都会重填倍率')
+    check(total == 1,
+          '整个 app.js 只有这一处调用点，不存在"初始化一套、刷新另一套"',
+          f'实际 {total} 处')
+    check('fillTableFactors' in app_js.split(anchor)[0]
+          or 'function fillTableFactors' in app_js,
+          'fillTableFactors 有定义（函数声明提升，定义在后面调用也成立）')
+
     print()
     if FAILED:
         print('失败项:')
