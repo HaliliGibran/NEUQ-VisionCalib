@@ -943,7 +943,7 @@ async function runPreview() {
       ['比例尺', `${data.scale.toFixed(3)} px/cm`],
       ['目标地面范围', `横向 ${data.target_window.width_cm} cm`
         + ` × 参考点前方 ${data.target_window.forward_cm} cm`],
-      ['坐标参考原点', `去畸变图 (${data.ground_origin.ground_origin_image_px[0]},`
+      ['逆透视坐标参考原点', `去畸变图 (${data.ground_origin.ground_origin_image_px[0]},`
         + ` ${data.ground_origin.ground_origin_image_px[1]})`
         + ` → 标定矩形坐标系 (${data.ground_origin.ground_origin_marker_cm[0].toFixed(1)},`
         + ` ${data.ground_origin.ground_origin_marker_cm[1].toFixed(1)}) cm`
@@ -1694,7 +1694,7 @@ function bindActions() {
       $('in-phys-w').value = st.phys_init.w;
       $('in-phys-h').value = st.phys_init.h;
     }
-    // 目标地面窗口同一套优先级（历史 > 默认），也由服务端判完再给。
+    // 目标地面范围同一套优先级（历史 > 默认），也由服务端判完再给。
     if (st.target_init) {
       $('in-target-w').value = st.target_init.width_cm;
       $('in-target-f').value = st.target_init.forward_cm;

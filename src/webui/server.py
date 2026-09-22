@@ -163,7 +163,7 @@ def make_calibrator(quad, phys_w, phys_h, anchor_x, anchor_y, heading, scale=Non
     cal.anchor_x = float(anchor_x)
     cal.anchor_y = float(anchor_y)
     cal.heading = float(heading)
-    # 目标地面窗口要在 recompute 之前设好：recompute 里的自动布局就是按它解的
+    # 目标地面范围要在 recompute 之前设好：recompute 里的自动布局就是按它解的
     if target_width is not None:
         cal.target_width_cm = float(target_width)
     if target_forward is not None:
@@ -263,7 +263,7 @@ def initial_phys_size() -> tuple[float, float]:
 
 
 def initial_target_window() -> tuple[float, float]:
-    """网页上「目标地面窗口」两个输入框的初值：(横向宽度, 前向深度)。
+    """网页上「目标地面范围」两个输入框的初值：(横向宽度, 前向深度)。
 
     与物理尺寸同一套口径。早期 ipm_state 没有这两个键，取不到就退回模块默认，
     不从其它尺寸字段猜测。
@@ -377,7 +377,7 @@ def api_status() -> dict:
         'tables_basis_stale': tables_basis_stale,
         # 物理尺寸初值：优先级（历史 > 默认）在服务端判完再给前端，页面直接照填
         'phys_init': {'w': phys_w, 'h': phys_h},
-        # 目标地面窗口初值，同一套优先级。这是**构图目标**，不是有效性边界。
+        # 目标地面范围初值，同一套优先级。这是**构图目标**，不是有效性边界。
         'target_init': {'width_cm': target_w, 'forward_cm': target_f},
         # 查找表允许的降采样倍率。由服务端按标定分辨率算好，页面只负责渲染下拉项——
         # 前端自己拼宽高就会出现 320x240 那种非等比组合，而那会破坏公制纵横比。
@@ -949,7 +949,7 @@ def _preview_inputs(body: dict):
     target_w = float(body.get('target_width', core.TARGET_WIDTH_CM))
     target_f = float(body.get('target_forward', core.TARGET_FORWARD_CM))
     if target_w <= 0 or target_f <= 0:
-        raise ValueError('目标地面窗口的宽度与前向深度必须为正数。')
+        raise ValueError('目标地面范围的宽度与前向深度必须为正数。')
     scale = body.get('scale')
     return {
         'quad': quad,
@@ -971,7 +971,7 @@ def recommended_layout(cal) -> dict:
     采用"，绝不把常量抄进 JS）；二是自动布局模式下 preview 与 commit 都从这里取
     参数，眼睛看到的 BirdView 与最终导出的 H/LUT 因此同源。
 
-    口径是 IpmCalibrator.target_layout()：把**目标地面窗口**（自标定矩形近边向前
+    口径是 IpmCalibrator.target_layout()：把**目标地面范围**（自标定矩形近边向前
     target_forward_cm、横向 target_width_cm）贴住输出图底边并最大化装入，anchor_y
     与 scale 一起解出来。若误把整幅 valid FOV 当构图目标，会把 ±300 cm 的地面
     压进 1280x720，48% 的输出像素来自不到 0.04 个源像素——整幅图是放射状拉丝。
@@ -1050,7 +1050,7 @@ def api_preview(body: dict) -> dict:
         'birdview': encode_jpeg(view, quality=85),
         'scale': float(cal.scale),
         'anchor_y': float(cal.anchor_y),
-        # 诊断量，不是上限：完整容纳整幅有效视野所需的 scale。目标窗口远小于有效视野
+        # 诊断量，不是上限：完整容纳整幅有效视野所需的 scale。目标地面范围远小于有效视野
         # 时 scale 会明显大于它，那是**故意**裁掉远处与侧面，不是错误。
         'full_fov_fit_scale': float(cal.full_fov_fit_scale),
         'layout_mode': str(cal.layout_mode),
@@ -1236,7 +1236,7 @@ def api_commit(body: dict) -> dict:
                         if cal.layout_mode == 'fallback' else '手动指定比例尺'))
         print(f'目标地面范围 {cal.target_width_cm:g} x {cal.target_forward_cm:g} cm'
               f'，比例尺 {cal.scale:.3f} px/cm，布局方式：{layout}')
-        print('坐标参考原点 = 去畸变图底边中点对应的地面点 '
+        print('逆透视坐标参考原点 = 去畸变图底边中点对应的地面点 '
               f"{origin['ground_origin_marker_cm']} cm（标定矩形坐标系）；"
               '仅用于定义逆透视坐标，不代表摄像头或车辆实际位置')
 

@@ -92,8 +92,9 @@ def physical_rect(phys_w: float, phys_h: float) -> np.ndarray:
     """返回标定矩形坐标系中的四个物理角点，单位 cm。
 
     顺序是 ``TL, TR, BL, BR``，原点在矩形中心，x 向右、y 向下（朝向车辆）。
-    这是用四点建立 ``H0`` 的 *marker frame*，不是最终逆透视参考坐标系；后者的
-    原点由 :func:`ground_reference_origin` 另行定义。两个“原点”不能混用。
+    这是用四点建立 ``H0`` 的标定矩形坐标系（代码中的 marker frame），不是最终
+    逆透视坐标系；后者的原点由 :func:`ground_reference_origin` 另行定义。
+    两个“原点”不能混用。
     """
     hw, hh = phys_w / 2.0, phys_h / 2.0
     return np.array([
@@ -350,7 +351,7 @@ def reference_origin_px(src_size: Tuple[int, int]) -> np.ndarray:
 
 
 def target_window_cm(width_cm: float, forward_cm: float) -> np.ndarray:
-    """目标地面窗口：以逆透视参考原点为原点，x 对称 width_cm、向前 forward_cm。
+    """目标地面范围：以逆透视坐标参考原点为原点，x 对称 width_cm、向前 forward_cm。
 
     坐标系是**已经平移到参考原点、并按 heading 旋转后**的 cm 坐标，所以窗口就是
 
@@ -366,9 +367,9 @@ def target_window_cm(width_cm: float, forward_cm: float) -> np.ndarray:
     实测结果是 48% 的输出像素来自不到 0.04 个源像素——整幅图是放射状拉丝。
     """
     if not (np.isfinite(width_cm) and width_cm > 0):
-        raise ValueError(f'目标窗口横向宽度必须为正有限值，收到 {width_cm}。')
+        raise ValueError(f'目标地面范围的横向宽度必须为正有限值，收到 {width_cm}。')
     if not (np.isfinite(forward_cm) and forward_cm > 0):
-        raise ValueError(f'目标窗口前向深度必须为正有限值，收到 {forward_cm}。')
+        raise ValueError(f'目标地面范围的前向深度必须为正有限值，收到 {forward_cm}。')
 
     hw = float(width_cm) / 2.0
     far = -float(forward_cm)
@@ -393,7 +394,7 @@ def fit_bottom_aligned(
     同时把给定多边形放到最大且一点不裁切"的那一组 (anchor_y, scale)。
 
     对 poly_cm 是什么刻意不作假设——它只是“这一块 cm 区域要完整装进画布”。调用方
-    传目标地面窗口（target_window_cm）就是为构图服务；传 valid_fov_polygon 则表示
+    传目标地面范围（target_window_cm）就是为构图服务；传 valid_fov_polygon 则表示
     想完整容纳数学上的有效视野。函数名不带 fov，正是为了不混淆这两种目标。
 
     物理 y 向下即朝向车辆，所以多边形的 qy_max 是最近处、qy_min 是最远处。把近边

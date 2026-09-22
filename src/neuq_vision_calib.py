@@ -13,7 +13,7 @@
   2. 标定照片去畸变效果 → calib_preview/
   3. 逆透视标定原图去畸变 → ipm_output/UnDistortionImage.jpg
   4. 交互逆透视标定：四条线的交点定义地平面度量关系；以去畸变图底边中点对应的
-     地面点作为逆透视参考原点；再用横向锚点、纵向锚点、朝向偏移、比例尺控制俯视图布局
+     地面点作为逆透视坐标参考原点；再用横向锚点、纵向锚点、朝向偏移、比例尺控制俯视图布局
   5. 六矩阵导出 → matrix/
   6. 两套打表（各含正向映射/反向映射）→ lookup_table/undistort/、lookup_table/undistort_ipm/
   7. 批量测试 test_input/ → test_output/
@@ -26,7 +26,7 @@
 
 单应分解：H = T(锚点) @ S(比例尺) @ R(朝向偏移) @ T(-参考原点) @ H0
   H0    : 源图（去畸变）像素 -> 标定矩形坐标系的 cm 坐标，仅由四点与实测长宽决定
-  T(-ref): 把原点平移到逆透视参考原点。必须排在 R 之前——朝向偏移绕的是参考原点
+  T(-ref): 把原点平移到逆透视坐标参考原点。必须排在 R 之前——朝向偏移绕的是参考原点
   R     : 绕参考原点旋转，把标定区转到与车辆前进方向对齐
   S     : cm -> 俯视图像素，比例尺的单位是 px/cm
   T     : 平移到锚点指定的俯视图位置
@@ -222,7 +222,7 @@ PHYS_W_CM = 45.0
 PHYS_H_CM = 45.0
 
 # 目标地面范围（cm）：俯视图里真正想看到的那一块地面，是**构图目标**。
-# 以逆透视参考原点为纵向基准，向前 TARGET_FORWARD_CM；横向关于参考原点对称，
+# 以逆透视坐标参考原点为纵向基准，向前 TARGET_FORWARD_CM；横向关于参考原点对称，
 # 总宽 TARGET_WIDTH_CM。参考原点 = 去畸变图底边中点经 H0 映射到地平面的那个点，
 # 它只是人为选定的坐标参考点，**不代表摄像头、车辆几何中心或保险杠位置**，
 # 所以界面与文档一律写"参考点前方 N cm"，不写"车前 N cm"。
@@ -248,7 +248,7 @@ PICK_RADIUS = 12        # 端点拾取半径（显示坐标下的像素）
 
 MIN_QUAD_AREA_PX = 10.0     # 交互标定里判四条线退化重合的面积阈值（业务阈值，不属于 quad_area）
 INIT_MARGIN_RATIO = 0.20    # 四条线初始位置距图像边缘的比例
-INIT_SCALE_RATIO = 0.8      # 目标窗口布局无解时的兜底：取 full_fov_fit_scale 的比例
+INIT_SCALE_RATIO = 0.8      # 目标地面范围布局无解时的兜底：取 full_fov_fit_scale 的比例
 MIN_SCALE = 0.05            # scale 下限（px/cm），防止退化为 0
 
 # trackbar 只支持整数刻度，以下是整数刻度到物理量的换算
@@ -928,8 +928,8 @@ def valid_fov_polygon(H0: np.ndarray, ground_tf: np.ndarray,
     最后按前向/横向距离上限截断。sign 由 horizon_sign 给出。
 
     ground_tf 是 H0 之后、scale/canvas 之前的那一段齐次变换，即
-    ``R(heading) @ T(-ref)``。只传 R 会让多边形停在标定矩形坐标系，而目标窗口已经
-    在逆透视参考坐标系里；自动布局若拿两套原点的数做 min，结果没有物理意义。
+    ``R(heading) @ T(-ref)``。只传 R 会让多边形停在标定矩形坐标系，而目标地面范围
+    已经在逆透视坐标系里；自动布局若拿两套原点的数做 min，结果没有物理意义。
     地平线裁剪仍然只看 H0 的第三行：T 与 R 的第三行都是 [0,0,1]，不影响分母。
     """
     w, h = src_size
@@ -1001,8 +1001,8 @@ class IpmCalibrator:
         self.target_width_cm = TARGET_WIDTH_CM
         self.target_forward_cm = TARGET_FORWARD_CM
         # 这一组 (anchor_y, scale) 是怎么定的，随状态一起落盘：
-        #   'target_window'  目标地面窗口贴底 + 最大装入（默认）
-        #   'fallback'       目标窗口无可行布局，退回 full_fov_fit_scale 的比例
+        #   'target_window'  目标地面范围贴底 + 最大装入（默认）
+        #   'fallback'       目标地面范围无可行布局，退回 full_fov_fit_scale 的比例
         #   'manual'         调用方/用户显式指定了 scale
         self.layout_mode = 'target_window'
 
@@ -1017,7 +1017,7 @@ class IpmCalibrator:
         self.corners: Optional[np.ndarray] = None
         self.sign = 1.0
         # 诊断量：完整容纳有效视野（valid_fov_polygon）所需的 scale。**不是上限**。
-        # 新的构图目标是目标地面窗口，它通常远小于整幅有效视野，因此正常情况下
+        # 新的构图目标是目标地面范围，它通常远小于整幅有效视野，因此正常情况下
         # scale > full_fov_fit_scale —— 远处与侧面被裁掉是故意的，不该告警。
         self.full_fov_fit_scale = 0.0
         # 去畸变图底边中点经 H0 映射到地面的坐标（标定矩形坐标系 cm）。
@@ -1060,8 +1060,8 @@ class IpmCalibrator:
     def ground_transform(self) -> np.ndarray:
         """H0 之后、scale/canvas 之前的那一段：R(heading) @ T(-ref)。
 
-        矩阵从右往左作用：先用 ``T(-ref)`` 把逆透视参考原点移到 (0,0)，再绕这个
-        原点旋转。目标窗口、有效视野多边形、自动布局三者必须都在这个坐标系里比较，
+        矩阵从右往左作用：先用 ``T(-ref)`` 把逆透视坐标参考原点移到 (0,0)，再绕这个
+        原点旋转。目标地面范围、有效视野多边形、自动布局三者必须都在这个坐标系里比较，
         否则就是拿两套原点的数在做 min。
         """
         ref = self.ground_ref_marker_cm
@@ -1071,7 +1071,7 @@ class IpmCalibrator:
     def compose(self, H0: np.ndarray) -> np.ndarray:
         """按当前参数组合出完整单应 H = T_canvas @ S @ R @ T_ref @ H0。
 
-        ``T_ref`` 把标定矩形坐标系改成以 IPM 参考点为原点的坐标系。矩阵连乘从右
+        ``T_ref`` 把标定矩形坐标系改成以逆透视坐标参考原点为原点的坐标系。矩阵连乘从右
         往左执行，所以 ``T_ref`` 必须先于 ``R(heading)`` 生效：heading 应绕参考原点
         旋转，而不是绕标定矩形中心旋转，否则参考点会被甩到别的位置。
         """
@@ -1080,7 +1080,7 @@ class IpmCalibrator:
                 @ self.ground_transform() @ H0)
 
     def target_window(self) -> np.ndarray:
-        """以 IPM 参考原点为原点的目标地面窗口（旋转后 cm 坐标，TL,TR,BL,BR）。
+        """以逆透视坐标参考原点为原点的目标地面范围（旋转后 cm 坐标，TL,TR,BL,BR）。
 
         坐标系已经平移到参考原点，窗口就是 x=[-W/2,W/2], y=[-F,0]，
         不需要知道标定矩形的形状或位置。
@@ -1088,7 +1088,7 @@ class IpmCalibrator:
         return target_window_cm(self.target_width_cm, self.target_forward_cm)
 
     def target_layout(self) -> Optional[Tuple[float, float]]:
-        """目标窗口贴底 + 最大装入时的 (anchor_y_px, scale)；无可行解返回 None。
+        """目标地面范围贴底 + 最大装入时的 (anchor_y_px, scale)；无可行解返回 None。
 
         这是**唯一**一处定义自动布局口径的地方：交互标定的初值、网页的预览与导出
         都从这里取。曾经"只改网页的推荐值、交互路径另算一套"的做法让界面显示的
@@ -1141,7 +1141,7 @@ class IpmCalibrator:
                                             flags=cv2.INTER_LINEAR)
 
     def apply_target_layout(self) -> str:
-        """把目标窗口布局写进 anchor_y / scale，返回实际用的 layout_mode。
+        """把目标地面范围布局写进 anchor_y / scale，返回实际用的 layout_mode。
 
         无可行解时退回旧的固定-anchor 口径：保留当前 anchor_y，scale 取
         full_fov_fit_scale 的 INIT_SCALE_RATIO 倍。**不动 anchor_y** 是关键——
@@ -1333,13 +1333,13 @@ class IpmCalibrator:
             cv2.resizeWindow(self.raw_win, int(self.w * self.display_scale),
                              int(self.h * self.display_scale))
 
-            print(f'\n交互标定：物理标定矩形 {self.phys_w:g} x {self.phys_h:g} cm，'
-                  f'目标地面窗口 {self.target_width_cm:g} x {self.target_forward_cm:g} cm')
-            print('  坐标参考原点 = 去畸变图底边中点对应的地面点；'
+            print(f'\n交互标定：地面标定矩形 {self.phys_w:g} x {self.phys_h:g} cm，'
+                  f'目标地面范围 {self.target_width_cm:g} x {self.target_forward_cm:g} cm')
+            print('  逆透视坐标参考原点 = 去畸变图底边中点对应的地面点；'
                   '它只用于定义逆透视坐标，不代表摄像头或车辆实际位置')
             print('  拖动红色端点调整四条线 -> 交点即地平面几何约束')
             print('  滑杆: 横向锚点 / 纵向锚点（位置）, 朝向偏移（转角）, 比例尺（cm -> 像素）')
-            print('  f = 回到目标窗口自动布局, r = 复位四条线, q = 保存退出')
+            print('  f = 回到目标地面范围自动布局, r = 复位四条线, q = 保存退出')
 
             while True:
                 key = cv2.waitKey(20) & 0xFF
@@ -1353,12 +1353,12 @@ class IpmCalibrator:
                     self.line_points[:] = self.line_default
                     self.dirty = True
                 elif key == ord('f'):
-                    # “自动适配”针对目标地面窗口，而不是把整个数学有效视野塞进画布。
+                    # “自动适配”针对目标地面范围，而不是把整个数学有效视野塞进画布。
                     mode = self.apply_target_layout()
                     self.sync_scale_trackbar()
                     self.dirty = True
                     if mode != 'target_window':
-                        print('目标窗口无可行布局，已退回 full_fov_fit_scale 的比例。')
+                        print('目标地面范围无可行布局，已退回 full_fov_fit_scale 的比例。')
                 elif key in (ord('+'), ord('=')):
                     self.display_scale = min(self.display_scale * 1.25, 20.0)
                     self.dirty = True
@@ -2093,9 +2093,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ipm_g.add_argument('--scale', type=float,
                        help='比例尺：地面 cm 到 BirdView 像素的等比换算（px/cm）')
     ipm_g.add_argument('--anchor-x', type=float,
-                       help='横向锚点：逆透视参考原点在 BirdView 中的归一化横向位置 0~1')
+                       help='横向锚点：逆透视坐标参考原点在 BirdView 中的归一化横向位置 0~1')
     ipm_g.add_argument('--anchor-y', type=float,
-                       help='纵向锚点：逆透视参考原点在 BirdView 中的归一化纵向位置 0~1')
+                       help='纵向锚点：逆透视坐标参考原点在 BirdView 中的归一化纵向位置 0~1')
     ipm_g.add_argument('--heading', type=float,
                        help='朝向偏移：标定区相对车辆前进方向的转角（度）')
     ipm_g.add_argument('--max-range-cm', type=float,
@@ -2562,7 +2562,7 @@ def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
         'target_width_cm': cal.target_width_cm,
         'target_forward_cm': cal.target_forward_cm,
         # 诊断量，不是上限：完整容纳 valid_fov_polygon 所需的 scale。
-        # 目标窗口通常远小于整幅有效视野，所以 scale > 这个值是正常且故意的。
+        # 目标地面范围通常远小于整幅有效视野，所以 scale > 这个值是正常且故意的。
         'full_fov_fit_scale_px_per_cm': cal.full_fov_fit_scale,
         'anchor_x': cal.anchor_x,
         'anchor_y': cal.anchor_y,
