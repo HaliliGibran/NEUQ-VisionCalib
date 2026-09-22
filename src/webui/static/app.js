@@ -853,6 +853,8 @@ function previewParams() {
     quad: state.quad,
     phys_w: parseFloat($('in-phys-w').value),
     phys_h: parseFloat($('in-phys-h').value),
+    target_width: parseFloat($('in-target-w').value),
+    target_forward: parseFloat($('in-target-f').value),
     anchor_x: parseFloat($('in-ax').value),
     anchor_y: parseFloat($('in-ay').value),
     heading: parseFloat($('in-hd').value),
@@ -891,14 +893,20 @@ async function runPreview() {
     const data = await api('/api/preview', previewParams());
     state.lastPreview = data;
     await drawPreview(data.birdview);
-    const over = data.over_crop;
-    setChip(chip, over ? '超出不裁切上限' : '正常', over ? 'warn' : 'ok');
+    // A2 之后不再有"超出不裁切上限"这档：裁掉目标窗口以外的远处与侧面是故意的。
+    // 唯一值得单独标出来的是 fallback —— 那说明目标窗口在当前几何下装不进画布。
+    const fb = data.layout_mode === 'fallback';
+    setChip(chip, fb ? '目标窗口装不下，已退回旧口径' : '正常', fb ? 'warn' : 'ok');
     kv($('scale-info'), [
       ['当前 scale', `${data.scale.toFixed(3)} px/cm`],
-      ['不裁切上限', `${data.max_scale.toFixed(3)} px/cm`],
-      ['覆盖范围', `${($('in-phys-w').value / 1)} × ${($('in-phys-h').value / 1)} cm`],
+      ['目标窗口', `${data.target_window.width_cm} × ${data.target_window.forward_cm} cm`],
+      ['标定矩形', `${($('in-phys-w').value / 1)} × ${($('in-phys-h').value / 1)} cm`
+        + ` → ${(data.scale * $('in-phys-w').value).toFixed(0)}`
+        + ` × ${(data.scale * $('in-phys-h').value).toFixed(0)} px`],
+      // 诊断项，不是上限。远小于当前 scale 是正常的，说明整幅有效视野比目标窗口大得多。
+      ['整幅视野容纳尺度', `${data.full_fov_fit_scale.toFixed(3)} px/cm（仅诊断）`],
+      ['布局来源', data.layout_mode],
     ], '');
-    $('scale-info').lastChild.lastChild.className = over ? 'bad' : 'good';
     if ($('in-sc-auto').checked && !state.draggingScale) {
       $('in-sc').value = data.scale.toFixed(2);
       $('out-sc').textContent = data.scale.toFixed(2);
@@ -945,7 +953,7 @@ function drawPreview(dataUrl) {
 }
 
 function bindControls() {
-  ['in-phys-w', 'in-phys-h'].forEach((id) => $(id).addEventListener('input', () => schedulePreview()));
+  ['in-phys-w', 'in-phys-h', 'in-target-w', 'in-target-f'].forEach((id) => $(id).addEventListener('input', () => schedulePreview()));
 
   // 改剔除阈值立刻重画柱状图与数量，让用户先看到"会删多少张"再决定跑不跑标定
   $('in-reproj').addEventListener('input', () => {
@@ -1495,8 +1503,8 @@ function bindActions() {
 
   $('btn-commit').onclick = () => withBusy($('btn-commit'), async () => {
     if (!state.quad) { log('请先选择一张原图并调整四点。', 'err'); return; }
-    if ($('in-sc-auto').checked === false && state.lastPreview && state.lastPreview.over_crop) {
-      log('警告: 当前 scale 超出不裁切上限，导出的表会裁掉部分有效视野。', 'err');
+    if (state.lastPreview && state.lastPreview.layout_mode === 'fallback') {
+      log('警告: 目标地面窗口在当前几何下装不进输出图，已退回旧的固定-anchor 口径。', 'err');
     }
     try {
       const opts = tableOptions();
@@ -1627,6 +1635,11 @@ function bindActions() {
     if (st.phys_init) {
       $('in-phys-w').value = st.phys_init.w;
       $('in-phys-h').value = st.phys_init.h;
+    }
+    // 目标地面窗口同一套优先级（历史 > 默认），也由服务端判完再给。
+    if (st.target_init) {
+      $('in-target-w').value = st.target_init.width_cm;
+      $('in-target-f').value = st.target_init.forward_cm;
     }
 
     // 上次用的原图若还在候选里就优先选它，否则退回第一张

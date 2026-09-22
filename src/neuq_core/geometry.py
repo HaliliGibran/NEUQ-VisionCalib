@@ -263,7 +263,44 @@ def max_scale_for_fov(poly_cm: np.ndarray, anchor_px: Tuple[float, float],
     return max(0.0, float(min(bounds)))
 
 
-def fit_fov_bottom_aligned(
+def target_window_cm(rect_cm: np.ndarray, width_cm: float,
+                     forward_cm: float) -> np.ndarray:
+    """目标地面窗口：从标定矩形的近边向前 forward_cm、横向对称 width_cm 的矩形。
+
+    这是**构图目标**，与 valid_fov_polygon 给出的**有效性边界**是两件不同的事。
+    MAX_RANGE_CM / MAX_LATERAL_CM 存在的理由只是"地平线附近映射到无穷远，必须截
+    断"，属于数学边界；把它当取景目标会让 ±300 cm 的地面被塞进一张 1280x720，
+    实测结果是 48% 的输出像素来自不到 0.04 个源像素——整幅图是放射状拉丝。
+
+    纵向基准刻意取标定矩形的近边而不是"车前若干厘米"：系统并不知道保险杠在哪，
+    现有物理原点就是标定矩形的中心，拿它当 0 再说"车前 150 cm"是假精确。近边是
+    真实存在、用户能指着地面确认的参照物。
+
+    rect_cm 必须是**已经按 heading 旋转过**的标定矩形四角（与 valid_fov_polygon
+    的返回值同一坐标系）；y 向下即朝向车辆，故近边是 y 最大的那条。
+    """
+    rect = np.asarray(rect_cm, dtype=np.float64)
+    if rect.ndim != 2 or rect.shape[1] != 2:
+        raise ValueError(f'标定矩形点集必须是 (N, 2)，收到形状 {rect.shape}。')
+    if not np.isfinite(rect).all():
+        raise ValueError('标定矩形点集含非有限值，无法确定目标窗口。')
+    if not (np.isfinite(width_cm) and width_cm > 0):
+        raise ValueError(f'目标窗口横向宽度必须为正有限值，收到 {width_cm}。')
+    if not (np.isfinite(forward_cm) and forward_cm > 0):
+        raise ValueError(f'目标窗口前向深度必须为正有限值，收到 {forward_cm}。')
+
+    y_near = float(rect[:, 1].max())
+    hw = float(width_cm) / 2.0
+    y_far = y_near - float(forward_cm)
+    return np.array([
+        [-hw, y_far],
+        [+hw, y_far],
+        [-hw, y_near],
+        [+hw, y_near],
+    ], dtype=np.float64)
+
+
+def fit_bottom_aligned(
     poly_cm: np.ndarray,
     anchor_x_px: float,
     out_size: Tuple[int, int],
@@ -272,10 +309,15 @@ def fit_fov_bottom_aligned(
     """返回 (anchor_y_px, scale)；输入合法但无可行布局时返回 None。
 
     要解决的问题与 max_scale_for_fov 不同：那个函数里 anchor 是给定的，只求
-    "不裁切的 scale 上限"；这里 anchor_y 也是自由量，求的是"近场贴住输出图底边、
-    同时把有效视野放到最大且一点不裁切"的那一组 (anchor_y, scale)。
+    "不裁切的 scale 上限"；这里 anchor_y 也是自由量，求的是"近边贴住输出图底边、
+    同时把给定多边形放到最大且一点不裁切"的那一组 (anchor_y, scale)。
 
-    物理 y 向下即朝向车辆，所以多边形的 qy_max 是最近处、qy_min 是最远处。把近场
+    对 poly_cm 是什么刻意不作假设——它只是"这一块 cm 区域要完整装进画布"。调用方
+    传目标地面窗口（target_window_cm）就是构图；传 valid_fov_polygon 就是"完整容纳
+    有效视野"。函数名因此不再带 fov：把调用方的意图写进被调用方的名字，正是上一版
+    默认"完整容纳 valid FOV"这个错误目标能一直藏着不被发现的原因。
+
+    物理 y 向下即朝向车辆，所以多边形的 qy_max 是最近处、qy_min 是最远处。把近边
     钉在 B = H-1-margin 上（这才是"贴底"），scale 就只受三个上界约束：纵向总高
     装得下、横向左右两侧装得下。三者取 min，至少有一个是紧的，因此结果是最大的。
 
@@ -346,7 +388,7 @@ __all__ = [
     'apply_homography',
     'clip_polygon_halfplane',
     'compute_homography',
-    'fit_fov_bottom_aligned',
+    'fit_bottom_aligned',
     'homography_denominator',
     'horizon_sign',
     'is_convex_quad',
@@ -358,5 +400,6 @@ __all__ = [
     'quad_area',
     'rotation_matrix',
     'scale_matrix',
+    'target_window_cm',
     'translation_matrix',
 ]

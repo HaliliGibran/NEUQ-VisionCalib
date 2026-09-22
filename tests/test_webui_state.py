@@ -336,8 +336,8 @@ def main() -> int:
         rec = pv.get('recommended')
         check(isinstance(rec, dict) and sorted(rec) == ['anchor_y', 'scale', 'source'],
               '/api/preview 回包里有 recommended{anchor_y, scale, source}', str(rec))
-        check(rec['source'] in ('auto', 'fallback'),
-              '回包能区分"自动布局给的"还是 fallback', str(rec['source']))
+        check(rec['source'] in ('target_window', 'fallback'),
+              '回包能区分"目标窗口布局给的"还是 fallback', str(rec['source']))
         check(abs(pv['scale'] - rec['scale']) < 1e-9,
               '未指定 scale 时预览用的就是推荐值', f"{pv['scale']:.6f}")
         check(abs(pv['anchor_y'] - rec['anchor_y']) < 1e-9,
@@ -378,8 +378,11 @@ def main() -> int:
 
             pv = server.api_preview(dict(auto))
             rec = pv['recommended']
-            check(rec['source'] == 'auto',
-                  '这组几何下拿到的是自动布局解（不是 fallback）', str(rec))
+            check(rec['source'] == 'target_window',
+                  '这组几何下拿到的是目标窗口布局解（不是 fallback）', str(rec))
+            check(pv['layout_mode'] == 'target_window',
+                  '回包的 layout_mode 与 recommended.source 同一个事实',
+                  str(pv['layout_mode']))
             check(abs(pv['anchor_y'] - rec['anchor_y']) < 1e-12
                   and abs(pv['scale'] - rec['scale']) < 1e-12,
                   'preview 的 BirdView/H 真正采用了 recommended 的 anchor_y + scale',
@@ -387,10 +390,39 @@ def main() -> int:
             check(abs(pv['anchor_y'] - 0.3) > 1e-6,
                   '自动模式下 anchor_y 由服务端决定（旧实现只改 scale，会停在 0.3）',
                   f"{pv['anchor_y']:.6f}")
-            legacy = max(core.MIN_SCALE, pv['max_scale'] * core.INIT_SCALE_RATIO)
+            legacy = max(core.MIN_SCALE,
+                         pv['full_fov_fit_scale'] * core.INIT_SCALE_RATIO)
             check(abs(pv['scale'] - legacy) > 1e-6,
-                  '用的不是旧的 0.8 x max_scale',
+                  '用的不是旧的 0.8 x 整幅视野容纳尺度',
                   f"新={pv['scale']:.6f} 旧口径={legacy:.6f}")
+            # A2 的核心：full_fov_fit_scale 只是诊断，不再是上限。目标窗口远小于
+            # 整幅有效视野时 scale 就该超过它，而且不许有任何地方把它夹回去。
+            check(pv['scale'] > pv['full_fov_fit_scale'],
+                  'scale 允许超过 full_fov_fit_scale（裁掉远处与侧面是故意的）',
+                  f"scale={pv['scale']:.3f} > 诊断值={pv['full_fov_fit_scale']:.3f}")
+            check(pv['target_window'] == {'width_cm': core.TARGET_WIDTH_CM,
+                                          'forward_cm': core.TARGET_FORWARD_CM},
+                  '未指定时目标窗口用模块默认值', str(pv['target_window']))
+
+            # 目标窗口是真参数：缩小前向深度，scale 必须跟着变大，而且要等于闭式解。
+            # 这里 320x240 的画布下把深度砍到 75 后**横向反而成了紧约束**
+            # （(319-1-159.5)/75 < (239-2)/75），所以判据写成"等于 min(三个上界)"，
+            # 不写成"至少涨 1.5 倍"——后者会把一个正确结果判成失败。
+            narrow = server.api_preview({**auto, 'target_forward': 75.0})
+            bounds = [(240 - 1 - 2 * 1.0) / 75.0,          # 纵向
+                      (320 - 1 - 1.0 - 0.5 * 319) / 75.0,  # 右侧
+                      (0.5 * 319 - 1.0) / 75.0]            # 左侧
+            check(narrow['scale'] > pv['scale']
+                  and abs(narrow['scale'] - min(bounds)) < 1e-9,
+                  '砍半前向深度后 scale 变大，且等于 min(三个理论上界)',
+                  f"{pv['scale']:.4f} -> {narrow['scale']:.4f}"
+                  f"（闭式解 {min(bounds):.4f}）")
+            for bad in ({'target_width': 0.0}, {'target_forward': -5.0}):
+                try:
+                    server.api_preview({**auto, **bad})
+                    check(False, f'非法目标窗口 {bad} 必须拒绝')
+                except ValueError as exc:
+                    check(True, f'非法目标窗口 {bad} -> ValueError', str(exc))
 
             # 重置按钮读的还是同一个 recommended_layout，且与当前 anchor_y/scale 无关
             cal = server.make_calibrator(quad_arr, 45.0, 45.0, 0.5, 0.11, 0.0, 3.0)
@@ -412,6 +444,17 @@ def main() -> int:
                   '落盘的 anchor_y / scale 也是自动布局那一组',
                   f"{recorded['extra']['anchor_y']:.6f} "
                   f"{recorded['extra']['scale_px_per_cm']:.6f}")
+            # 构图目标必须可追溯：只看 scale 无法判断"这份表是按多大一块地做的"
+            check(recorded['extra']['layout_mode'] == 'target_window'
+                  and recorded['extra']['target_width_cm'] == core.TARGET_WIDTH_CM
+                  and recorded['extra']['target_forward_cm'] == core.TARGET_FORWARD_CM
+                  and 'full_fov_fit_scale_px_per_cm' in recorded['extra']
+                  and 'max_scale_px_per_cm' not in recorded['extra']
+                  and 'over_crop' not in recorded['extra'],
+                  '落盘 meta 记 layout_mode/target_*/full_fov_fit_scale，不再有 max_scale/over_crop',
+                  str({k: recorded['extra'][k] for k in
+                       ('layout_mode', 'target_width_cm', 'target_forward_cm',
+                        'full_fov_fit_scale_px_per_cm')}))
 
             # 手动模式：显式给的值一个字都不许改
             manual = {**auto, 'anchor_y': 0.42, 'scale': 2.0}
@@ -428,8 +471,8 @@ def main() -> int:
                   f"{recorded['extra']['scale_px_per_cm']}")
 
             # 无可行布局时退回旧口径，但预览不许因此崩掉，且回包标明是 fallback。
-            # anchor_y 必须**保留用户当前值**：cal.max_scale 就是按这个 anchor_y 算的，
-            # 若返回时改成 ANCHOR_Y，那个 scale 就不再对应刚才的上限。
+            # anchor_y 必须**保留用户当前值**：full_fov_fit_scale 就是按这个 anchor_y
+            # 算的，若返回时改成 ANCHOR_Y，那个 scale 就不再对应刚才那个诊断值。
             fb = server.api_preview({**auto, 'anchor_x': 2.0, 'anchor_y': 0.63})
             check(fb['recommended']['source'] == 'fallback',
                   '无可行布局时标明是 fallback，预览仍出图', str(fb['recommended']))
@@ -439,7 +482,7 @@ def main() -> int:
             check(abs(fb['anchor_y'] - 0.63) < 1e-12,
                   'fallback 下实际生效的 anchor_y 也是用户那一个', str(fb['anchor_y']))
 
-            # 幂等：保留 anchor_y 之后 recompute 不改变 max_scale，重复走 fallback
+            # 幂等：保留 anchor_y 之后 recompute 不改变诊断量，重复走 fallback
             # 必须得到同一组值。改回 ANCHOR_Y 的旧实现在这里会漂。
             fb2 = server.api_preview({**auto, 'anchor_x': 2.0, 'anchor_y': 0.63})
             check(abs(fb2['recommended']['anchor_y'] - fb['recommended']['anchor_y']) < 1e-12

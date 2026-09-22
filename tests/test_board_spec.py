@@ -1267,9 +1267,11 @@ def main() -> int:
     check(isinstance(got, np.ndarray) and got.dtype == np.float64,
           '含 nan 的多边形仍按原样处理（不在这一刀扩大数值契约）', f'{got.shape}')
 
-    print('\n[K] fit_fov_bottom_aligned：近场贴底 + 最大不裁切')
+    print('\n[K] fit_bottom_aligned：给定 cm 区域贴底 + 最大装入')
     # 这一段把"原图近场 y=119 却被映射到 BirdView 中部"从主观感受变成算法契约：
-    # 近场必须精确落在 H-1-margin 上，且 scale 恰好是三个理论上界的最小值。
+    # 近边必须精确落在 H-1-margin 上，且 scale 恰好是三个理论上界的最小值。
+    # 喂进去的多边形是什么由调用方决定（A2 之后默认喂目标窗口，见 [L]），
+    # 这里仍用有效视野多边形，因为它形状最不规则，最能压住闭式解。
     margin = 1.0
 
     def fov_poly(out_size, heading=0.0):
@@ -1305,7 +1307,7 @@ def main() -> int:
 
     def audit(poly, ax, out_size, tag):
         w, h = out_size
-        fit = core.fit_fov_bottom_aligned(poly, ax, out_size, margin)
+        fit = core.fit_bottom_aligned(poly, ax, out_size, margin)
         if not check(fit is not None, f'{tag}：有可行布局'):
             return
         ay, k = fit
@@ -1362,7 +1364,7 @@ def main() -> int:
     ]
     for label, poly, ax, size, m in bad_inputs:
         try:
-            got = core.fit_fov_bottom_aligned(poly, ax, size, m)
+            got = core.fit_bottom_aligned(poly, ax, size, m)
             check(False, f'{label} 必须拒绝', f'却返回了 {got}')
         except ValueError as exc:
             check(True, f'{label} -> ValueError', str(exc))
@@ -1375,17 +1377,79 @@ def main() -> int:
         ('只有两个点', np.array([[0., 0.], [1., 1.]]), 80.0, (160, 120)),
     ]
     for label, poly, ax, size in none_cases:
-        got = core.fit_fov_bottom_aligned(poly, ax, size, margin)
+        got = core.fit_bottom_aligned(poly, ax, size, margin)
         check(got is None, f'{label} -> None（不是魔法值）', repr(got))
 
     # 不裁切的旧口径没被动过：同一多边形、把自动解出来的 anchor 交给它，
     # max_scale_for_fov 给出的上限不小于自动布局的 scale。
-    fit = core.fit_fov_bottom_aligned(poly_small, 0.5 * 159.0, (160, 120), margin)
+    fit = core.fit_bottom_aligned(poly_small, 0.5 * 159.0, (160, 120), margin)
     ay, k = fit
     cap = core.max_scale_for_fov(poly_small, (0.5 * 159.0, ay), (160, 120))
     check(cap >= k - 1e-9,
           'max_scale_for_fov 语义未变：同一 anchor 下的上限 >= 自动布局的 scale',
           f'cap={cap:.6f} k={k:.6f}')
+
+    # ---- L. A2：目标地面窗口才是构图目标
+    # 真实数据暴露的问题：把 valid_fov_polygon（被 MAX_LATERAL_CM=300 顶成 600x346 cm）
+    # 当构图目标，1280x720 里 48% 的输出像素来自不到 0.04 个源像素，整幅是放射状拉丝。
+    # 下面几条把"构图目标 = 目标窗口，有效性边界 = valid FOV"这个分工钉住。
+    print('\n[L] target_window_cm：构图目标与有效性边界是两件事')
+    rect0 = core.physical_rect(45.0, 45.0)
+    win = core.target_window_cm(rect0, 150.0, 150.0)
+    check(win.shape == (4, 2) and win.dtype == np.float64,
+          '返回 (4,2) float64 的窗口四角', f'{win.shape} {win.dtype}')
+    check(abs(float(win[:, 1].max()) - float(rect0[:, 1].max())) < 1e-12,
+          '窗口近边 == 标定矩形近边（y 最大那条），不是"车前 150 cm"',
+          f"win y_max={float(win[:, 1].max())} rect y_max={float(rect0[:, 1].max())}")
+    check(abs((float(win[:, 1].max()) - float(win[:, 1].min())) - 150.0) < 1e-12,
+          '前向深度精确等于 target_forward_cm',
+          f"{float(win[:, 1].max()) - float(win[:, 1].min())}")
+    check(abs((float(win[:, 0].max()) - float(win[:, 0].min())) - 150.0) < 1e-12
+          and abs(float(win[:, 0].max()) + float(win[:, 0].min())) < 1e-12,
+          '横向总宽等于 target_width_cm，且以标定矩形中线（x=0）对称',
+          f"x [{float(win[:, 0].min())}, {float(win[:, 0].max())}]")
+
+    # heading 非零时近边必须跟着转：拿未旋转的矩形取 y_max 会贴错边
+    rot = core.apply_homography(core.rotation_matrix(30.0), rect0)
+    win_rot = core.target_window_cm(rot, 150.0, 150.0)
+    check(abs(float(win_rot[:, 1].max()) - float(rot[:, 1].max())) < 1e-12
+          and float(win_rot[:, 1].max()) > float(win[:, 1].max()) + 1e-6,
+          'heading=30° 下近边取的是旋转后的 y_max（比未旋转时更远）',
+          f"{float(win_rot[:, 1].max()):.4f} vs {float(win[:, 1].max()):.4f}")
+
+    for label, args_ in (
+        ('rect 形状 (N,3)', (np.zeros((4, 3)), 150.0, 150.0)),
+        ('rect 含 nan', (np.array([[0., 0.], [np.nan, 1.], [1., 1.]]), 150.0, 150.0)),
+        ('宽度为 0', (rect0, 0.0, 150.0)),
+        ('深度为负', (rect0, 150.0, -1.0)),
+        ('深度为 inf', (rect0, 150.0, np.inf)),
+    ):
+        try:
+            got = core.target_window_cm(*args_)
+            check(False, f'{label} 必须拒绝', f'却返回了形状 {np.shape(got)}')
+        except ValueError as exc:
+            check(True, f'{label} -> ValueError', str(exc))
+
+    # 决定性的一条：同一几何、同一画布，喂目标窗口得到的 scale 必须**远大于**
+    # 喂整幅有效视野。这正是 A2 要换掉的那个目标函数，退回去会立刻在这里失败。
+    out_size = (1280, 720)
+    ax_mid = 0.5 * (out_size[0] - 1)
+    fov = fov_poly(out_size)
+    fit_fov = core.fit_bottom_aligned(fov, ax_mid, out_size, margin)
+    fit_win = core.fit_bottom_aligned(win, ax_mid, out_size, margin)
+    check(fit_fov is not None and fit_win is not None, '两种目标都有可行布局')
+    k_fov, k_win = fit_fov[1], fit_win[1]
+    check(k_win > 2.0 * k_fov,
+          '目标窗口的 scale 远大于整幅有效视野的（A2 换掉的就是这个目标函数）',
+          f'窗口 {k_win:.3f} vs 整幅视野 {k_fov:.3f} px/cm')
+
+    # 150x150 装进 1280x720：纵向受限，闭式解应当就是 (H-1-2m)/150
+    check(abs(k_win - (out_size[1] - 1 - 2 * margin) / 150.0) < 1e-12,
+          '150x150 进 1280x720 时纵向是紧约束，scale == (H-1-2m)/150',
+          f'{k_win:.6f} == {(out_size[1] - 1 - 2 * margin) / 150.0:.6f}')
+    check(210.0 < 45.0 * k_win < 220.0,
+          '45 cm 标定方块在 BirdView 里约 215 px（旧口径只有 93 px）',
+          f'{45.0 * k_win:.1f} px')
 
     print()
     if FAILED:

@@ -180,6 +180,18 @@
     </article>
 
     <article class="card compact">
+      <div class="card-head"><h3>目标地面窗口 · BirdView 要看多大一块地</h3></div>
+      <div class="pair">
+        <label>横向宽 cm <input id="in-target-w" type="number" step="5" min="1" value="150"></label>
+        <label>前向深 cm <input id="in-target-f" type="number" step="5" min="1" value="150"></label>
+      </div>
+      <p class="hint">这是<b>构图目标</b>：自标定矩形<b>近边</b>向前覆盖「前向深」，
+        横向以标定矩形中线为轴、总宽「横向宽」。自动布局把这一块完整装进输出图并贴住底边。</p>
+      <p class="hint">刻意不写「车前多少 cm」：物理原点是标定矩形中心，程序并不知道保险杠在哪。
+        窗口超出相机实际可见范围的部分留黑（无效），不会为了填满而把远场拉成放射状。</p>
+    </article>
+
+    <article class="card compact">
       <div class="card-head"><h3>四个自由度</h3></div>
       <div class="slider-row">
         <label class="slider" for="in-ax">anchor x <output id="out-ax">0.500</output></label>
@@ -213,7 +225,7 @@
                   title="重置到服务端按当前几何给出的推荐值">重置</button>
         </div>
       </div>
-      <label class="row"><input id="in-sc-auto" type="checkbox" checked> 自动布局：近场贴底 + 最大不裁切</label>
+      <label class="row"><input id="in-sc-auto" type="checkbox" checked> 自动布局：目标窗口贴底 + 最大装入</label>
       <p class="hint">鼠标悬停或聚焦某一项时：<kbd>←</kbd>/<kbd>→</kbd> 与滚轮走一小步，
         按住 <kbd>Shift</kbd> 变 10 倍。手动改 anchor y 或 scale 会自动退出上面的自动布局。</p>
       <div id="scale-info" class="kv"></div>

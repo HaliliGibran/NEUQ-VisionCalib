@@ -143,7 +143,8 @@ def ensure_calibration() -> None:
     STATE.update(K=K, D=D, Knew=Knew, img_size=img_size)
 
 
-def make_calibrator(quad, phys_w, phys_h, anchor_x, anchor_y, heading, scale=None):
+def make_calibrator(quad, phys_w, phys_h, anchor_x, anchor_y, heading, scale=None,
+                    target_width=None, target_forward=None):
     """按给定参数构造标定器并算好 H 与 BirdView。
 
     直接复用主脚本的 IpmCalibrator，四条线由四点反推，因此网页上拖出来的结果与
@@ -157,9 +158,15 @@ def make_calibrator(quad, phys_w, phys_h, anchor_x, anchor_y, heading, scale=Non
     cal.anchor_x = float(anchor_x)
     cal.anchor_y = float(anchor_y)
     cal.heading = float(heading)
+    # 目标地面窗口要在 recompute 之前设好：recompute 里的自动布局就是按它解的
+    if target_width is not None:
+        cal.target_width_cm = float(target_width)
+    if target_forward is not None:
+        cal.target_forward_cm = float(target_forward)
     if scale is not None:
         cal.scale = max(core.MIN_SCALE, float(scale))
         cal.scale_initialized = True
+        cal.layout_mode = 'manual'
     cal.recompute()
     return cal
 
@@ -199,25 +206,41 @@ def guess_quad(img: np.ndarray) -> list:
 
 # ---------------------------------------------------------------- 各接口实现
 
-def initial_phys_size() -> tuple[float, float]:
-    """网页上「物理尺寸」两个输入框的初值：已保存的 ipm_state 优先于默认值。
+def _state_pair(key_a: str, key_b: str,
+                default: tuple[float, float]) -> tuple[float, float]:
+    """从已保存的 ipm_state 里取一对正数；取不到或非正就用默认值。
 
-    优先级只在这里判一次。若让前端自己"有历史就用历史、否则用 HTML 里的 value"，
-    默认值一改（30 → 45）就会出现两套语义：Python 侧 fallback 与页面上的 value
-    各说一套，而用户上次实测的 45×45 还可能被新默认顶掉。
-
-    ipm_state 里的尺寸是上一次真的量过、并且已经出表的那一组，只要它是正数就采信；
-    读不出数或不是正数才退回模块默认（core.PHYS_W_CM / PHYS_H_CM）。
+    优先级只在服务端判一次。若让前端自己"有历史就用历史、否则用 HTML 里的 value"，
+    默认值一改就会出现两套语义：Python 侧 fallback 与页面上的 value 各说一套，
+    而用户上次实测/调好的那一组还可能被新默认顶掉。
     """
     state = core.load_ipm_state() or {}
     try:
-        w = float(state['phys_w_cm'])
-        h = float(state['phys_h_cm'])
+        a = float(state[key_a])
+        b = float(state[key_b])
     except (KeyError, TypeError, ValueError):
-        return core.PHYS_W_CM, core.PHYS_H_CM
-    if w <= 0 or h <= 0:
-        return core.PHYS_W_CM, core.PHYS_H_CM
-    return w, h
+        return default
+    if a <= 0 or b <= 0:
+        return default
+    return a, b
+
+
+def initial_phys_size() -> tuple[float, float]:
+    """网页上「物理尺寸」两个输入框的初值：已保存的 ipm_state 优先于默认值。
+
+    ipm_state 里的尺寸是上一次真的量过、并且已经出表的那一组，只要它是正数就采信。
+    """
+    return _state_pair('phys_w_cm', 'phys_h_cm', (core.PHYS_W_CM, core.PHYS_H_CM))
+
+
+def initial_target_window() -> tuple[float, float]:
+    """网页上「目标地面窗口」两个输入框的初值：(横向宽度, 前向深度)。
+
+    与物理尺寸同一套口径。老的 ipm_state 里没有这两个键（A2 之前的版本），
+    取不到就退回模块默认，不去猜。
+    """
+    return _state_pair('target_width_cm', 'target_forward_cm',
+                       (core.TARGET_WIDTH_CM, core.TARGET_FORWARD_CM))
 
 
 def api_status() -> dict:
@@ -277,6 +300,7 @@ def api_status() -> dict:
         for direction in ('forward', 'reverse'))
 
     phys_w, phys_h = initial_phys_size()
+    target_w, target_f = initial_target_window()
 
 
     # 报告上次导出用的表格式，让"交付给 C 端的到底是什么"一眼可见
@@ -309,6 +333,8 @@ def api_status() -> dict:
         'ipm_state': core.load_ipm_state(),
         # 物理尺寸初值：优先级（历史 > 默认）在服务端判完再给前端，页面直接照填
         'phys_init': {'w': phys_w, 'h': phys_h},
+        # 目标地面窗口初值，同一套优先级。这是**构图目标**，不是有效性边界。
+        'target_init': {'width_cm': target_w, 'forward_cm': target_f},
 
         'ipm_candidates': [p.name for p in core.list_images(core.DIR_IPM_IN)],
         'ipm_source': safe_rel(STATE['src_path']) if STATE['src_path'] else None,
@@ -864,11 +890,17 @@ def _preview_inputs(body: dict):
     phys_h = float(body.get('phys_h', core.PHYS_H_CM))
     if phys_w <= 0 or phys_h <= 0:
         raise ValueError('标定矩形的物理尺寸必须为正数。')
+    target_w = float(body.get('target_width', core.TARGET_WIDTH_CM))
+    target_f = float(body.get('target_forward', core.TARGET_FORWARD_CM))
+    if target_w <= 0 or target_f <= 0:
+        raise ValueError('目标地面窗口的宽度与前向深度必须为正数。')
     scale = body.get('scale')
     return {
         'quad': quad,
         'phys_w': phys_w,
         'phys_h': phys_h,
+        'target_width': target_w,
+        'target_forward': target_f,
         'anchor_x': float(body.get('anchor_x', core.ANCHOR_X)),
         'anchor_y': float(body.get('anchor_y', core.ANCHOR_Y)),
         'heading': float(body.get('heading', core.HEADING_DEG)),
@@ -883,39 +915,36 @@ def recommended_layout(cal) -> dict:
     采用"，绝不把常量抄进 JS）；二是自动布局模式下 preview 与 commit 都从这里取
     参数，眼睛看到的 BirdView 与最终导出的 H/LUT 因此同源。
 
-    口径就是 fit_fov_bottom_aligned：近场贴输出图底边、同时取最大的不裁切 scale，
-    anchor_y 与 scale 一起解出来。
+    口径是 IpmCalibrator.target_layout()：把**目标地面窗口**（自标定矩形近边向前
+    target_forward_cm、横向 target_width_cm）贴住输出图底边并最大化装入，anchor_y
+    与 scale 一起解出来。A2 之前这里装的是整幅 valid FOV，实测把 ±300 cm 的地面
+    压进 1280x720，48% 的输出像素来自不到 0.04 个源像素——整幅图是放射状拉丝。
 
     source 字段区分两种来源：
-      'auto'      算出了可行布局，anchor_y 与 scale 都是它给的；
-      'fallback'  当前几何没有可行布局（多边形退化、anchor_x 越界等）。这时**保留
-                  当前 anchor_y**，只把 scale 退回旧的固定-anchor 口径：不裁切上限的
-                  INIT_SCALE_RATIO 倍（上限为 0 时退回 1.0，与 recompute() 同分支）。
-                  语义是"联合布局求不出来，我不再擅自动你的纵向布局"，而不是"顺便把
-                  anchor_y 抹回出厂值"——无解的原因可能只是 anchor_x 靠边、有效视野
-                  太小或某个临界几何，都推不出 anchor_y 必须等于 ANCHOR_Y。
-                  之所以要有 fallback：预览不能因为"自动布局不可用"整个崩掉。
+      'target_window'  算出了可行布局，anchor_y 与 scale 都是它给的；
+      'fallback'       当前几何没有可行布局（窗口比画布还大、anchor_x 越界等）。这时
+                       **保留当前 anchor_y**，只把 scale 退回旧的固定-anchor 口径：
+                       full_fov_fit_scale 的 INIT_SCALE_RATIO 倍（为 0 时退回 1.0）。
+                       语义是"联合布局求不出来，我不再擅自动你的纵向布局"，而不是
+                       "顺便把 anchor_y 抹回出厂值"——无解的原因可能只是 anchor_x
+                       靠边或某个临界几何，都推不出 anchor_y 必须等于 ANCHOR_Y。
+                       之所以要有 fallback：预览不能因为"自动布局不可用"整个崩掉。
     """
     if cal.H0 is not None:
-        poly = core.valid_fov_polygon(cal.H0, core.rotation_matrix(cal.heading),
-                                      (cal.w, cal.h), cal.sign)
-        fit = core.fit_fov_bottom_aligned(poly, cal.anchor_x * (cal.w - 1), cal.out_size)
+        fit = cal.target_layout()
         if fit is not None:
             ay_px, scale = fit
-            return {'anchor_y': float(ay_px / (cal.h - 1)), 'scale': float(scale),
-                    'source': 'auto'}
+            return {'anchor_y': float(ay_px / (cal.h - 1)),
+                    'scale': float(max(core.MIN_SCALE, scale)),
+                    'source': 'target_window'}
 
-    scale = (max(core.MIN_SCALE, cal.max_scale * core.INIT_SCALE_RATIO)
-             if cal.max_scale > 0 else 1.0)
-    # fallback 保留当前 anchor_y，不回退到模块常量。cal.max_scale 本来就是按当前
+    cap = cal.full_fov_fit_scale
+    scale = max(core.MIN_SCALE, cap * core.INIT_SCALE_RATIO) if cap > 0 else 1.0
+    # fallback 保留当前 anchor_y，不回退到模块常量。full_fov_fit_scale 本来就是按当前
     # anchor_y 算出来的，若返回时把 anchor 改成 ANCHOR_Y，这个 scale 就不再对应
-    # 刚才那个上限了——那是契约错误，也正是"再跑一次 fallback 得到另一组值"
-    # 这个不幂等现象的根源。保留 anchor_y 之后 recompute 不改变 max_scale，
+    # 刚才那个诊断值了——那是契约错误，也正是"再跑一次 fallback 得到另一组值"
+    # 这个不幂等现象的根源。保留 anchor_y 之后 recompute 不改变它，
     # 重复调用天然幂等。
-    # 语义上 fallback 只该说"联合布局求不出来，我不再擅自动你的纵向布局，退回
-    # 旧的固定-anchor scale 策略"，而不是"顺便把你的 anchor_y 也抹回出厂值"——
-    # 无解的原因可能只是 anchor_x 靠边、有效视野太小或某个临界几何，都推不出
-    # anchor_y 必须等于 0.708。
     return {'anchor_y': float(cal.anchor_y), 'scale': float(scale),
             'source': 'fallback'}
 
@@ -930,6 +959,7 @@ def apply_auto_layout(cal) -> dict:
     cal.anchor_y = rec['anchor_y']
     cal.scale = rec['scale']
     cal.scale_initialized = True
+    cal.layout_mode = rec['source']
     cal.recompute()
     return rec
 
@@ -939,7 +969,8 @@ def api_preview(body: dict) -> dict:
     """实时预览：按当前四点与三自由度算 H，返回 BirdView 与标定矩形位置。"""
     p = _preview_inputs(body)
     cal = make_calibrator(p['quad'], p['phys_w'], p['phys_h'],
-                          p['anchor_x'], p['anchor_y'], p['heading'], p['scale'])
+                          p['anchor_x'], p['anchor_y'], p['heading'], p['scale'],
+                          p['target_width'], p['target_forward'])
     if cal.H is None or cal.birdview is None or cal.H0 is None:
         raise ValueError('当前四点无法构成有效单应，请调整。')
 
@@ -960,10 +991,14 @@ def api_preview(body: dict) -> dict:
         'birdview': encode_jpeg(view, quality=85),
         'scale': float(cal.scale),
         'anchor_y': float(cal.anchor_y),
-        'max_scale': float(cal.max_scale),
+        # 诊断量，不是上限：完整容纳整幅有效视野所需的 scale。目标窗口远小于有效视野
+        # 时 scale 会明显大于它，那是**故意**裁掉远处与侧面，不是错误。
+        'full_fov_fit_scale': float(cal.full_fov_fit_scale),
+        'layout_mode': str(cal.layout_mode),
+        'target_window': {'width_cm': float(cal.target_width_cm),
+                          'forward_cm': float(cal.target_forward_cm)},
         'recommended': rec,
 
-        'over_crop': bool(cal.is_over_crop()),
         'horizon_sign': float(cal.sign),
         'rect': [[float(v) for v in pt] for pt in rect],
         'valid_ratio': float(np.isfinite(rect).all()),
@@ -1111,7 +1146,8 @@ def api_commit(body: dict) -> dict:
     p = _preview_inputs(body)
     apply_table_options(body)
     cal = make_calibrator(p['quad'], p['phys_w'], p['phys_h'],
-                          p['anchor_x'], p['anchor_y'], p['heading'], p['scale'])
+                          p['anchor_x'], p['anchor_y'], p['heading'], p['scale'],
+                          p['target_width'], p['target_forward'])
     if cal.H is None or cal.birdview is None or cal.H0 is None:
         raise ValueError('当前四点无法构成有效单应，无法导出。')
 
@@ -1126,10 +1162,9 @@ def api_commit(body: dict) -> dict:
     buf = io.StringIO()
     batch = {'ok': False, 'generated': 0, 'error': None}
     with redirect_stdout(buf):
-        over_crop = cal.is_over_crop()
-        if over_crop:
-            print(f'警告: scale={cal.scale:.3f} 超过不裁切视野的上限 '
-                  f'{cal.max_scale:.3f} px/cm，导出的表已裁掉部分有效视野。')
+        print(f'目标地面窗口 {cal.target_width_cm:g} x {cal.target_forward_cm:g} cm'
+              f'（自标定矩形近边向前），scale={cal.scale:.3f} px/cm'
+              f'，布局 {cal.layout_mode}')
 
         # 状态文件与结果图都不单独保存，随 export_all 的事务一起提交，
         # 免得导出失败后留下"新状态/新结果图 + 旧矩阵"。
@@ -1142,8 +1177,10 @@ def api_commit(body: dict) -> dict:
             'phys_w_cm': p['phys_w'],
             'phys_h_cm': p['phys_h'],
             'scale_px_per_cm': cal.scale,
-            'max_scale_px_per_cm': cal.max_scale,
-            'over_crop': bool(over_crop),
+            'layout_mode': cal.layout_mode,
+            'target_width_cm': cal.target_width_cm,
+            'target_forward_cm': cal.target_forward_cm,
+            'full_fov_fit_scale_px_per_cm': cal.full_fov_fit_scale,
             'anchor_x': cal.anchor_x,
             'anchor_y': cal.anchor_y,
             'heading_deg': cal.heading,

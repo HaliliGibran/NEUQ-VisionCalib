@@ -106,7 +106,7 @@ from neuq_core.geometry import (  # noqa: F401
     apply_homography,
     clip_polygon_halfplane,
     compute_homography,
-    fit_fov_bottom_aligned,
+    fit_bottom_aligned,
     homography_denominator,
     horizon_sign,
     is_convex_quad,
@@ -118,6 +118,7 @@ from neuq_core.geometry import (  # noqa: F401
     quad_area,
     rotation_matrix,
     scale_matrix,
+    target_window_cm,
     translation_matrix,
 )
 from neuq_core.io import (
@@ -206,13 +207,24 @@ UNDIST_ALPHA = None
 PHYS_W_CM = 45.0
 PHYS_H_CM = 45.0
 
+# 目标地面窗口（cm）：BirdView 里真正想看到的那一块地面，是**构图目标**。
+# 纵向基准是标定矩形的近边（y 最大的那条边），向前 TARGET_FORWARD_CM；横向以标定
+# 矩形的中线为对称轴，总宽 TARGET_WIDTH_CM。刻意不写成"车前多少 cm"：物理原点是
+# 标定矩形中心，系统并不知道保险杠在哪，那样的标注是假精确。
+#
+# 与 MAX_RANGE_CM / MAX_LATERAL_CM 的分工必须一直分清：后者是**有效性边界**，只为
+# 截断地平线附近映射到无穷远的部分；前者是构图目标。实测教训见 target_window_cm
+# 的 docstring——把有效性边界当构图目标，整幅 BirdView 会变成放射状拉丝。
+TARGET_WIDTH_CM = 150.0
+TARGET_FORWARD_CM = 150.0
+
 # 目标 ROI 三自由度初值
 ANCHOR_X = 0.5      # 归一化，ROI 中心在输出图的横向位置
 ANCHOR_Y = 0.708    # 归一化，沿用原 160x120 方案中下部的布局比例
 HEADING_DEG = 0.0   # 物理标定区相对车辆前进坐标系的转角，正值顺时针
 
 # 有效视野的前向距离上限（cm）。地平线附近像素映射到无穷远，必须截断，
-# 否则"不裁切完整视野"会把最大 scale 逼到 0。
+# 否则"完整容纳有效视野"会把对应的 scale 逼到 0。这是数学截断边界，不是构图目标。
 MAX_RANGE_CM = 300.0
 MAX_LATERAL_CM = 300.0
 
@@ -221,7 +233,7 @@ PICK_RADIUS = 12        # 端点拾取半径（显示坐标下的像素）
 
 MIN_QUAD_AREA_PX = 10.0     # 交互标定里判四条线退化重合的面积阈值（业务阈值，不属于 quad_area）
 INIT_MARGIN_RATIO = 0.20    # 四条线初始位置距图像边缘的比例
-INIT_SCALE_RATIO = 0.8      # 初始 scale 取 max_scale 的比例，留出裕量
+INIT_SCALE_RATIO = 0.8      # 目标窗口布局无解时的兜底：取 full_fov_fit_scale 的比例
 MIN_SCALE = 0.05            # scale 下限（px/cm），防止退化为 0
 
 # trackbar 只支持整数刻度，以下是整数刻度到物理量的换算
@@ -808,6 +820,13 @@ class IpmCalibrator:
         self.heading = HEADING_DEG
         self.scale = 1.0
         self.scale_initialized = False
+        self.target_width_cm = TARGET_WIDTH_CM
+        self.target_forward_cm = TARGET_FORWARD_CM
+        # 这一组 (anchor_y, scale) 是怎么定的，随状态一起落盘：
+        #   'target_window'  目标地面窗口贴底 + 最大装入（默认）
+        #   'fallback'       目标窗口无可行布局，退回 full_fov_fit_scale 的比例
+        #   'manual'         调用方/用户显式指定了 scale
+        self.layout_mode = 'target_window'
 
         self.drag: Optional[Tuple[int, int]] = None
         self.dirty = True
@@ -819,7 +838,10 @@ class IpmCalibrator:
         self.birdview: Optional[np.ndarray] = None
         self.corners: Optional[np.ndarray] = None
         self.sign = 1.0
-        self.max_scale = 0.0
+        # 诊断量：完整容纳有效视野（valid_fov_polygon）所需的 scale。**不是上限**。
+        # 新的构图目标是目标地面窗口，它通常远小于整幅有效视野，因此正常情况下
+        # scale > full_fov_fit_scale —— 远处与侧面被裁掉是故意的，不该告警。
+        self.full_fov_fit_scale = 0.0
 
     # ---- 几何
 
@@ -859,39 +881,81 @@ class IpmCalibrator:
         return (translation_matrix(ax, ay) @ scale_matrix(self.scale)
                 @ rotation_matrix(self.heading) @ H0)
 
+    def target_window(self) -> np.ndarray:
+        """当前 heading 下的目标地面窗口（旋转后 cm 坐标，TL,TR,BL,BR）。
+
+        必须先按 heading 旋转标定矩形再取近边：H = T·S·R·H0，布局那一层看到的
+        永远是旋转后的坐标系，valid_fov_polygon 也是这么约定的。拿未旋转的矩形
+        取 y_max，heading 非零时贴底的就不是真正的近边。
+        """
+        rect = apply_homography(rotation_matrix(self.heading), self.phys_pts)
+        return target_window_cm(rect, self.target_width_cm, self.target_forward_cm)
+
+    def target_layout(self) -> Optional[Tuple[float, float]]:
+        """目标窗口贴底 + 最大装入时的 (anchor_y_px, scale)；无可行解返回 None。
+
+        这是**唯一**一处定义自动布局口径的地方：交互标定的初值、网页的预览与导出
+        都从这里取。曾经"只改网页的推荐值、交互路径另算一套"的做法让界面显示的
+        参数与真正生效的 H 分了家，不能再来一次。
+        """
+        return fit_bottom_aligned(self.target_window(), self.anchor_px()[0],
+                                  self.out_size)
+
     def recompute(self) -> None:
-        """重算 H0、有效视野、max_scale、H 与 BirdView 预览。"""
+        """重算 H0、自动布局、full_fov_fit_scale、H 与 BirdView 预览。"""
         self.corners = self.build_corners()
         if self.corners is None:
             self.H0 = self.H = self.birdview = None
-            self.max_scale = 0.0
+            self.full_fov_fit_scale = 0.0
             return
 
         try:
             self.H0 = compute_homography(self.corners, self.phys_pts)
         except ValueError:
             self.H0 = self.H = self.birdview = None
-            self.max_scale = 0.0
+            self.full_fov_fit_scale = 0.0
             return
 
         self.sign = horizon_sign(self.H0, self.corners)
-        poly = valid_fov_polygon(self.H0, rotation_matrix(self.heading),
-                                 (self.w, self.h), self.sign)
-        self.max_scale = max_scale_for_fov(poly, self.anchor_px(), self.out_size)
 
+        # 自动布局必须在 full_fov_fit_scale 之前：它会改 anchor_y，而那个诊断量是
+        # 按 anchor 算的。顺序反了就会落盘一个对不上当前 anchor 的诊断值。
         if not self.scale_initialized:
-            self.scale = (max(MIN_SCALE, self.max_scale * INIT_SCALE_RATIO)
-                          if self.max_scale > 0 else 1.0)
+            self.apply_target_layout()
             self.scale_initialized = True
             self.sync_scale_trackbar()
+
+        poly = valid_fov_polygon(self.H0, rotation_matrix(self.heading),
+                                 (self.w, self.h), self.sign)
+        self.full_fov_fit_scale = max_scale_for_fov(poly, self.anchor_px(),
+                                                    self.out_size)
 
         self.H = self.compose(self.H0)
         self.birdview = cv2.warpPerspective(self.img, self.H, self.out_size,
                                             flags=cv2.INTER_LINEAR)
 
-    def is_over_crop(self) -> bool:
-        """当前 scale 是否已经超过不裁切视野的上限。"""
-        return self.max_scale > 0 and self.scale > self.max_scale
+    def apply_target_layout(self) -> str:
+        """把目标窗口布局写进 anchor_y / scale，返回实际用的 layout_mode。
+
+        无可行解时退回旧的固定-anchor 口径：保留当前 anchor_y，scale 取
+        full_fov_fit_scale 的 INIT_SCALE_RATIO 倍。**不动 anchor_y** 是关键——
+        诊断量就是按当前 anchor 算的，顺手把 anchor 改掉会让这个 scale 不再对应
+        任何东西，也是"重复调用得到不同结果"的老根源。
+        """
+        fit = self.target_layout()
+        if fit is not None:
+            ay_px, scale = fit
+            self.anchor_y = ay_px / (self.h - 1)
+            self.scale = max(MIN_SCALE, scale)
+            self.layout_mode = 'target_window'
+            return self.layout_mode
+
+        poly = valid_fov_polygon(self.H0, rotation_matrix(self.heading),
+                                 (self.w, self.h), self.sign)
+        cap = max_scale_for_fov(poly, self.anchor_px(), self.out_size)
+        self.scale = max(MIN_SCALE, cap * INIT_SCALE_RATIO) if cap > 0 else 1.0
+        self.layout_mode = 'fallback'
+        return self.layout_mode
 
     # ---- 交互
 
@@ -972,8 +1036,9 @@ class IpmCalibrator:
         self.dirty = True
 
     def on_scale(self, v: int) -> None:
-        """scale trackbar 回调。"""
+        """scale trackbar 回调。手动拖过就算 manual，不再自称自动布局。"""
         self.scale = max(MIN_SCALE, v / SCALE_TICKS_PER_UNIT)
+        self.layout_mode = 'manual'
         self.dirty = True
 
     # ---- 绘制
@@ -1029,10 +1094,9 @@ class IpmCalibrator:
         cv2.arrowedLine(view, (self.w // 2, self.h - 6), (self.w // 2, self.h - 26),
                         (255, 255, 255), 1, tipLength=0.4)
 
-        over = ' OVER-CROP' if self.is_over_crop() else ''
-        cv2.putText(view, f'scale={self.scale:.2f} max={self.max_scale:.2f}{over}',
-                    (6, 14), cv2.FONT_HERSHEY_PLAIN, 1.0,
-                    (0, 0, 255) if over else (0, 255, 0), 1)
+        cv2.putText(view, f'scale={self.scale:.2f} fullfov={self.full_fov_fit_scale:.2f} '
+                          f'[{self.layout_mode}]',
+                    (6, 14), cv2.FONT_HERSHEY_PLAIN, 1.0, (0, 255, 0), 1)
         cv2.putText(view, f'anchor=({self.anchor_x:.3f},{self.anchor_y:.3f}) '
                           f'head={self.heading:.1f}deg',
                     (6, 28), cv2.FONT_HERSHEY_PLAIN, 1.0, (0, 255, 0), 1)
@@ -1063,10 +1127,12 @@ class IpmCalibrator:
             cv2.resizeWindow(self.raw_win, int(self.w * self.display_scale),
                              int(self.h * self.display_scale))
 
-            print(f'\n交互标定：物理标定矩形 {self.phys_w:g} x {self.phys_h:g} cm')
+            print(f'\n交互标定：物理标定矩形 {self.phys_w:g} x {self.phys_h:g} cm，'
+                  f'目标地面窗口 {self.target_width_cm:g} x {self.target_forward_cm:g} cm'
+                  '（自标定矩形近边向前）')
             print('  拖动红色端点调整四条线 -> 交点即地平面几何约束')
             print('  trackbar: anchor_x/anchor_y 位置, heading 转角, scale 物理->像素尺度')
-            print('  f = scale 吸附到不裁切视野的最大值, r = 复位四条线, q = 保存退出')
+            print('  f = 回到目标窗口自动布局, r = 复位四条线, q = 保存退出')
 
             while True:
                 key = cv2.waitKey(20) & 0xFF
@@ -1080,12 +1146,13 @@ class IpmCalibrator:
                     self.line_points[:] = self.line_default
                     self.dirty = True
                 elif key == ord('f'):
-                    if self.max_scale > 0:
-                        self.scale = self.max_scale
-                        self.sync_scale_trackbar()
-                        self.dirty = True
-                    else:
-                        print('当前几何下无有效视野，无法吸附 scale。')
+                    # 语义随 A2 一起变了：以前是"吸附到完整视野的上限"，那个上限
+                    # 已经不再是目标；现在是"回到目标窗口的自动布局"。
+                    mode = self.apply_target_layout()
+                    self.sync_scale_trackbar()
+                    self.dirty = True
+                    if mode != 'target_window':
+                        print('目标窗口无可行布局，已退回 full_fov_fit_scale 的比例。')
                 elif key in (ord('+'), ord('=')):
                     self.display_scale = min(self.display_scale * 1.25, 20.0)
                     self.dirty = True
@@ -2197,7 +2264,13 @@ def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
         'H0': cal.H0.tolist(),
         'horizon_sign': cal.sign,
         'scale_px_per_cm': cal.scale,
-        'max_scale_px_per_cm': cal.max_scale,
+        # 构图目标：这一组 scale/anchor_y 是按哪块地面窗口定的。
+        'layout_mode': cal.layout_mode,
+        'target_width_cm': cal.target_width_cm,
+        'target_forward_cm': cal.target_forward_cm,
+        # 诊断量，不是上限：完整容纳 valid_fov_polygon 所需的 scale。
+        # 目标窗口通常远小于整幅有效视野，所以 scale > 这个值是正常且故意的。
+        'full_fov_fit_scale_px_per_cm': cal.full_fov_fit_scale,
         'anchor_x': cal.anchor_x,
         'anchor_y': cal.anchor_y,
         'heading_deg': cal.heading,
@@ -2262,7 +2335,8 @@ def make_calibrator_from_quad(img: np.ndarray, quad: np.ndarray, phys_w: float,
     cal.line_default = cal.line_points.copy()
     if scale is not None:
         cal.scale = max(MIN_SCALE, float(scale))
-        cal.scale_initialized = True   # 阻止 recompute 用 max_scale 比例覆盖指定值
+        cal.scale_initialized = True   # 阻止 recompute 用自动布局覆盖指定值
+        cal.layout_mode = 'manual'
     cal.recompute()
     return cal
 
@@ -2507,14 +2581,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         H = np.asarray(state['H'], dtype=np.float64).reshape(3, 3)
         H0 = np.asarray(state['H0'], dtype=np.float64).reshape(3, 3)
         sign = float(state.get('horizon_sign', 1.0))
-        scale = float(state.get('scale_px_per_cm', 1.0))
-        max_scale = float(state.get('max_scale_px_per_cm', 0.0))
-        over_crop = max_scale > 0 and scale > max_scale
-        if over_crop:
-            print(f'警告: scale={scale:.3f} 超过不裁切视野的上限 {max_scale:.3f} px/cm，'
-                  '导出的表已裁掉部分有效视野。')
         pair = export_all(K, D, Knew, H, H0, sign,
-                          dict(state, over_crop=bool(over_crop),
+                          dict(state,
                                max_range_cm=MAX_RANGE_CM,
                                max_lateral_cm=MAX_LATERAL_CM),
                           img_size)
@@ -2550,12 +2618,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     # 不影响 C 端，但会让人以为导出成了。只有 --stage ipm 不导出时才就地写。
     ipm_state = build_ipm_state(calibrator, phys_w, phys_h, img_size, src_path)
 
-    over_crop = calibrator.is_over_crop()
-    if over_crop:
-        print(f'警告: scale={calibrator.scale:.3f} 超过不裁切视野的上限 '
-              f'{calibrator.max_scale:.3f} px/cm，导出的表已裁掉部分有效视野。'
-              '如需保留完整视野，重跑并按 f 吸附到 max_scale。')
-
     if stage == 'ipm':
         safe_imwrite(IPM_RESULT, calibrator.birdview)
         print('去畸变逆透视结果图已保存:', IPM_RESULT)
@@ -2568,8 +2630,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         'phys_w_cm': phys_w,
         'phys_h_cm': phys_h,
         'scale_px_per_cm': calibrator.scale,
-        'max_scale_px_per_cm': calibrator.max_scale,
-        'over_crop': bool(over_crop),
+        'layout_mode': calibrator.layout_mode,
+        'target_width_cm': calibrator.target_width_cm,
+        'target_forward_cm': calibrator.target_forward_cm,
+        'full_fov_fit_scale_px_per_cm': calibrator.full_fov_fit_scale,
         'anchor_x': calibrator.anchor_x,
         'anchor_y': calibrator.anchor_y,
         'heading_deg': calibrator.heading,
