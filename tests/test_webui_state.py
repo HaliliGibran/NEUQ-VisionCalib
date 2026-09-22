@@ -394,12 +394,25 @@ def main() -> int:
                   f"{recorded['extra']['anchor_y']} "
                   f"{recorded['extra']['scale_px_per_cm']}")
 
-            # 无可行布局时退回旧口径，但预览不许因此崩掉，且回包标明是 fallback
-            fb = server.api_preview({**auto, 'anchor_x': 2.0})
-            check(fb['recommended']['source'] == 'fallback'
-                  and abs(fb['recommended']['anchor_y'] - core.ANCHOR_Y) < 1e-12,
-                  'anchor_x 越界时退回 fallback（ANCHOR_Y + 旧 scale 口径），预览仍出图',
-                  str(fb['recommended']))
+            # 无可行布局时退回旧口径，但预览不许因此崩掉，且回包标明是 fallback。
+            # anchor_y 必须**保留用户当前值**：cal.max_scale 就是按这个 anchor_y 算的，
+            # 若返回时改成 ANCHOR_Y，那个 scale 就不再对应刚才的上限。
+            fb = server.api_preview({**auto, 'anchor_x': 2.0, 'anchor_y': 0.63})
+            check(fb['recommended']['source'] == 'fallback',
+                  '无可行布局时标明是 fallback，预览仍出图', str(fb['recommended']))
+            check(abs(fb['recommended']['anchor_y'] - 0.63) < 1e-12,
+                  'fallback 保留当前 anchor_y，不抹回模块常量 ANCHOR_Y',
+                  f"{fb['recommended']['anchor_y']} (ANCHOR_Y={core.ANCHOR_Y})")
+            check(abs(fb['anchor_y'] - 0.63) < 1e-12,
+                  'fallback 下实际生效的 anchor_y 也是用户那一个', str(fb['anchor_y']))
+
+            # 幂等：保留 anchor_y 之后 recompute 不改变 max_scale，重复走 fallback
+            # 必须得到同一组值。改回 ANCHOR_Y 的旧实现在这里会漂。
+            fb2 = server.api_preview({**auto, 'anchor_x': 2.0, 'anchor_y': 0.63})
+            check(abs(fb2['recommended']['anchor_y'] - fb['recommended']['anchor_y']) < 1e-12
+                  and abs(fb2['recommended']['scale'] - fb['recommended']['scale']) < 1e-12,
+                  'fallback 幂等：再求一次得到同一组 (anchor_y, scale)',
+                  f"{fb['recommended']['scale']:.9f} -> {fb2['recommended']['scale']:.9f}")
         finally:
             for name, fn in originals.items():
                 setattr(core, name, fn)

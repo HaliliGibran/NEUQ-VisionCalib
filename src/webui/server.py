@@ -859,9 +859,12 @@ def recommended_layout(cal) -> dict:
 
     source 字段区分两种来源：
       'auto'      算出了可行布局，anchor_y 与 scale 都是它给的；
-      'fallback'  当前几何没有可行布局（多边形退化、anchor_x 越界等）。这时退回旧
-                  口径——anchor_y 取模块默认 ANCHOR_Y、scale 取不裁切上限的
+      'fallback'  当前几何没有可行布局（多边形退化、anchor_x 越界等）。这时**保留
+                  当前 anchor_y**，只把 scale 退回旧的固定-anchor 口径：不裁切上限的
                   INIT_SCALE_RATIO 倍（上限为 0 时退回 1.0，与 recompute() 同分支）。
+                  语义是"联合布局求不出来，我不再擅自动你的纵向布局"，而不是"顺便把
+                  anchor_y 抹回出厂值"——无解的原因可能只是 anchor_x 靠边、有效视野
+                  太小或某个临界几何，都推不出 anchor_y 必须等于 ANCHOR_Y。
                   之所以要有 fallback：预览不能因为"自动布局不可用"整个崩掉。
     """
     if cal.H0 is not None:
@@ -875,7 +878,16 @@ def recommended_layout(cal) -> dict:
 
     scale = (max(core.MIN_SCALE, cal.max_scale * core.INIT_SCALE_RATIO)
              if cal.max_scale > 0 else 1.0)
-    return {'anchor_y': float(core.ANCHOR_Y), 'scale': float(scale),
+    # fallback 保留当前 anchor_y，不回退到模块常量。cal.max_scale 本来就是按当前
+    # anchor_y 算出来的，若返回时把 anchor 改成 ANCHOR_Y，这个 scale 就不再对应
+    # 刚才那个上限了——那是契约错误，也正是"再跑一次 fallback 得到另一组值"
+    # 这个不幂等现象的根源。保留 anchor_y 之后 recompute 不改变 max_scale，
+    # 重复调用天然幂等。
+    # 语义上 fallback 只该说"联合布局求不出来，我不再擅自动你的纵向布局，退回
+    # 旧的固定-anchor scale 策略"，而不是"顺便把你的 anchor_y 也抹回出厂值"——
+    # 无解的原因可能只是 anchor_x 靠边、有效视野太小或某个临界几何，都推不出
+    # anchor_y 必须等于 0.708。
+    return {'anchor_y': float(cal.anchor_y), 'scale': float(scale),
             'source': 'fallback'}
 
 
