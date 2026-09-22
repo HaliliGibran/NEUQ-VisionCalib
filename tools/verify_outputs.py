@@ -388,16 +388,21 @@ def compare_images(a: np.ndarray, b: np.ndarray,
 
 
 def check_homography(matrices: dict) -> bool:
-    """检查 1: H 把源四点映射成矩形，且尺寸、旋转、锚点都与标定参数一致。
+    """检查 1: H 把源四点映射成矩形，且尺寸、旋转、参考原点都与标定参数一致。
 
-    H = T(anchor) @ S(scale) @ R(heading) @ H0，所以只要 heading != 0，输出矩形
-    本来就是旋转的——用"轴对齐"当判据在非零 heading 下必然误判（本项目实测
-    heading=-1.6°，旧判据一直报失败）。这里改为验证四个对任意旋转都成立的不变量：
+    H = T_canvas @ S(scale) @ R(heading) @ T(-ref) @ H0，所以只要 heading != 0，输出
+    矩形本来就是旋转的——用"轴对齐"当判据在非零 heading 下必然误判。这里验证四个对
+    任意旋转都成立的不变量：
 
-      1. 中心 == anchor（归一化锚点换算到像素）
-      2. |TL->TR| == 物理宽 × scale，|TL->BL| == 物理高 × scale
-      3. 邻边垂直：(TL->TR) · (TL->BL) == 0
-      4. atan2(TR-TL) == heading（矩形对边平行，角度在模 180° 意义下比较）
+      1. |TL->TR| == 物理宽 × scale，|TL->BL| == 物理高 × scale
+      2. 邻边垂直：(TL->TR) · (TL->BL) == 0
+      3. atan2(TR-TL) == heading（矩形对边平行，角度在模 180° 意义下比较）
+      4. **去畸变图底边中点** 经 H 之后正好落在 anchor 上
+
+    第 4 条是 A3 换掉的那一条。以前验的是"四点中心 == anchor"，那只在 marker 原点
+    兼任坐标原点时才成立；A3 在 H0 之后插了 T(-ref)，落在 anchor 上的已经是
+    **逆透视坐标参考原点**（底边中点对应的地面点），不再是标定矩形中心。改完之后
+    这条判据反而更硬：它直接钉住"画面最底下中点 -> BirdView 底部锚点"这条链路。
     """
     H = np.asarray(matrices['H'], dtype=np.float64).reshape(3, 3)
     quad = np.asarray(matrices['src_quad_tl_tr_bl_br'], dtype=np.float64).reshape(4, 2)
@@ -426,19 +431,23 @@ def check_homography(matrices: dict) -> bool:
 
     canvas_w, canvas_h = IMAGE_SIZE
     want_cx, want_cy = anchor_x * (canvas_w - 1), anchor_y * (canvas_h - 1)
-    cx, cy = out.mean(axis=0)
-    anchor_ok = abs(cx - want_cx) < 0.5 and abs(cy - want_cy) < 0.5
+    # 参考原点的像素位置优先取 matrices.json 记录的那一份；老文件没有就按约定算。
+    px = matrices.get('ground_origin_image_px')
+    ref_px = (np.asarray(px, dtype=np.float64).reshape(1, 2) if px
+              else np.array([[(canvas_w - 1) / 2.0, float(canvas_h - 1)]]))
+    ox, oy = apply_homography(H, ref_px)[0]
+    origin_ok = abs(ox - want_cx) < 0.5 and abs(oy - want_cy) < 0.5
 
     return report(
-        'H 映射源四点成矩形（尺寸/垂直/旋转/锚点）',
-        size_ok and ortho_ok and rot_ok and anchor_ok,
+        'H 映射源四点成矩形（尺寸/垂直/旋转/参考原点）',
+        size_ok and ortho_ok and rot_ok and origin_ok,
         f'尺寸 {w_px:.1f}x{h_px:.1f} 期望 {expect_w:.1f}x{expect_h:.1f} '
         f'{"OK" if size_ok else "不符"}；'
         f'邻边 |cos|={abs(cos):.2e} {"OK" if ortho_ok else "不垂直"}；'
         f'旋转 {rot_deg:.2f}° 期望 {heading:.2f}°（偏差 {delta:+.3f}°）'
         f'{"OK" if rot_ok else "不符"}；'
-        f'中心 ({cx:.1f},{cy:.1f}) 期望 ({want_cx:.1f},{want_cy:.1f})'
-        f'{"OK" if anchor_ok else "不符"}')
+        f'参考原点 ({ox:.1f},{oy:.1f}) 期望 anchor ({want_cx:.1f},{want_cy:.1f})'
+        f'{"OK" if origin_ok else "不符"}')
 
 
 def check_undistort_tables(root: Path, calib: dict) -> bool:

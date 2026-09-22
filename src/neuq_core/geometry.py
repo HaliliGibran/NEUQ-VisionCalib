@@ -263,40 +263,88 @@ def max_scale_for_fov(poly_cm: np.ndarray, anchor_px: Tuple[float, float],
     return max(0.0, float(min(bounds)))
 
 
-def target_window_cm(rect_cm: np.ndarray, width_cm: float,
-                     forward_cm: float) -> np.ndarray:
-    """目标地面窗口：从标定矩形的近边向前 forward_cm、横向对称 width_cm 的矩形。
+def ground_reference_origin(H0: np.ndarray, src_size: Tuple[int, int],
+                            sign: float) -> Optional[np.ndarray]:
+    """去畸变图**底边中点**经 H0 映射到地平面得到的点（marker frame，cm）。
+
+    这个点是**逆透视坐标系的参考原点**，人为选定，语义仅此而已：
+
+      它不代表相机光心，不代表车辆几何中心，也不代表保险杠位置。
+
+    为什么必须单列一条：源图底边中点 (W/2, H-1) 对应的是"从光心出发、穿过这个像素
+    的视线与地面的交点"，通常落在车前一小段距离处；相机光心本身根本没有有限的像素
+    坐标（它是所有成像射线的起点）。所以"画面最底下就是车"这个**构图直觉**是对的，
+    "底边中点就是摄像头位置"这个**物理解释**是错的，两者极易混。
+
+    也不能拿标定矩形中心当业务原点：那只是为了求 H0、表达 45x45 尺度而设的
+    marker frame 原点，凭什么代表车？真要拿到车辆位置得用 solvePnP 恢复相机位姿再
+    取光心的地面投影，再叠一个安装偏置——那属于车辆安装参数，不该让标定矩形承担。
+    本工具刻意不走那条路，只要一个**说得清**的坐标参考点。
+
+    返回 None 的情形：底边中点落在地平线的无穷远侧（sign*den < DEN_EPS），此时没有
+    有限的地面交点。调用方应当退回 marker frame 原点并把这件事落盘说明，而不是
+    硬取一个 1e15 量级的坐标。
+    """
+    H = np.asarray(H0, dtype=np.float64)
+    if H.shape != (3, 3):
+        raise ValueError(f'H0 必须是 3x3，收到形状 {H.shape}。')
+    if not np.isfinite(H).all():
+        raise ValueError('H0 含非有限值，无法求地面参考原点。')
+    w, h = int(src_size[0]), int(src_size[1])
+    if w <= 0 or h <= 0:
+        raise ValueError(f'源图尺寸必须为正，收到 {src_size}。')
+    if not np.isfinite(sign) or sign == 0:
+        raise ValueError(f'horizon_sign 必须是非零有限值，收到 {sign}。')
+
+    px = reference_origin_px((w, h))
+    den = float(H[2, 0] * px[0] + H[2, 1] * px[1] + H[2, 2])
+    if not np.isfinite(den) or float(sign) * den < DEN_EPS:
+        return None
+    out = np.array([(H[0, 0] * px[0] + H[0, 1] * px[1] + H[0, 2]) / den,
+                    (H[1, 0] * px[0] + H[1, 1] * px[1] + H[1, 2]) / den],
+                   dtype=np.float64)
+    return out if np.isfinite(out).all() else None
+
+
+def reference_origin_px(src_size: Tuple[int, int]) -> np.ndarray:
+    """逆透视坐标参考原点在去畸变图上的像素位置：底边中点。
+
+    单独成函数是为了让"底边中点"只有一个定义处——UI 上要画这个点、落盘要记它、
+    校验脚本要拿它验"H 把它映到 anchor"，三处各写一遍 (w-1)/2 迟早会漂。
+    """
+    w, h = int(src_size[0]), int(src_size[1])
+    return np.array([(w - 1) / 2.0, float(h - 1)], dtype=np.float64)
+
+
+def target_window_cm(width_cm: float, forward_cm: float) -> np.ndarray:
+    """目标地面窗口：以逆透视参考原点为原点，x 对称 width_cm、向前 forward_cm。
+
+    坐标系是**已经平移到参考原点、并按 heading 旋转后**的 cm 坐标，所以窗口就是
+
+        x in [-width/2, +width/2]
+        y in [-forward, 0]
+
+    y 向下即朝向车辆，故 y=0 这条边（近边）正是参考原点所在的那条。因此不需要任何
+    形状参数——A2 那版还要传"旋转后的标定矩形"进来取近边，那是因为当时把 marker
+    frame 的矩形近边当成了业务基准，属于坐标语义没分清。
 
     这是**构图目标**，与 valid_fov_polygon 给出的**有效性边界**是两件不同的事。
     MAX_RANGE_CM / MAX_LATERAL_CM 存在的理由只是"地平线附近映射到无穷远，必须截
     断"，属于数学边界；把它当取景目标会让 ±300 cm 的地面被塞进一张 1280x720，
     实测结果是 48% 的输出像素来自不到 0.04 个源像素——整幅图是放射状拉丝。
-
-    纵向基准刻意取标定矩形的近边而不是"车前若干厘米"：系统并不知道保险杠在哪，
-    现有物理原点就是标定矩形的中心，拿它当 0 再说"车前 150 cm"是假精确。近边是
-    真实存在、用户能指着地面确认的参照物。
-
-    rect_cm 必须是**已经按 heading 旋转过**的标定矩形四角（与 valid_fov_polygon
-    的返回值同一坐标系）；y 向下即朝向车辆，故近边是 y 最大的那条。
     """
-    rect = np.asarray(rect_cm, dtype=np.float64)
-    if rect.ndim != 2 or rect.shape[1] != 2:
-        raise ValueError(f'标定矩形点集必须是 (N, 2)，收到形状 {rect.shape}。')
-    if not np.isfinite(rect).all():
-        raise ValueError('标定矩形点集含非有限值，无法确定目标窗口。')
     if not (np.isfinite(width_cm) and width_cm > 0):
         raise ValueError(f'目标窗口横向宽度必须为正有限值，收到 {width_cm}。')
     if not (np.isfinite(forward_cm) and forward_cm > 0):
         raise ValueError(f'目标窗口前向深度必须为正有限值，收到 {forward_cm}。')
 
-    y_near = float(rect[:, 1].max())
     hw = float(width_cm) / 2.0
-    y_far = y_near - float(forward_cm)
+    far = -float(forward_cm)
     return np.array([
-        [-hw, y_far],
-        [+hw, y_far],
-        [-hw, y_near],
-        [+hw, y_near],
+        [-hw, far],
+        [+hw, far],
+        [-hw, 0.0],
+        [+hw, 0.0],
     ], dtype=np.float64)
 
 
@@ -389,6 +437,7 @@ __all__ = [
     'clip_polygon_halfplane',
     'compute_homography',
     'fit_bottom_aligned',
+    'ground_reference_origin',
     'homography_denominator',
     'horizon_sign',
     'is_convex_quad',
@@ -398,6 +447,7 @@ __all__ = [
     'order_corners_tl_tr_bl_br',
     'physical_rect',
     'quad_area',
+    'reference_origin_px',
     'rotation_matrix',
     'scale_matrix',
     'target_window_cm',

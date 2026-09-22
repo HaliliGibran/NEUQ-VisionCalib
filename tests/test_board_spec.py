@@ -1281,6 +1281,7 @@ def main() -> int:
                 * np.array([w / 160.0, h / 120.0]))
         H0 = core.compute_homography(quad, core.physical_rect(45., 45.))
         sign = core.horizon_sign(H0, quad)
+        # ground_tf 这里只给 R：本段验的是 fit/裁剪的数学，参考原点平移另见 [L]。
         return core.valid_fov_polygon(H0, core.rotation_matrix(heading), out_size, sign)
 
     def placed(poly, ax, ay, k):
@@ -1389,51 +1390,100 @@ def main() -> int:
           'max_scale_for_fov 语义未变：同一 anchor 下的上限 >= 自动布局的 scale',
           f'cap={cap:.6f} k={k:.6f}')
 
-    # ---- L. A2：目标地面窗口才是构图目标
-    # 真实数据暴露的问题：把 valid_fov_polygon（被 MAX_LATERAL_CM=300 顶成 600x346 cm）
-    # 当构图目标，1280x720 里 48% 的输出像素来自不到 0.04 个源像素，整幅是放射状拉丝。
-    # 下面几条把"构图目标 = 目标窗口，有效性边界 = valid FOV"这个分工钉住。
-    print('\n[L] target_window_cm：构图目标与有效性边界是两件事')
-    rect0 = core.physical_rect(45.0, 45.0)
-    win = core.target_window_cm(rect0, 150.0, 150.0)
+    # ---- L. A3：逆透视坐标参考原点 + 目标地面窗口
+    # 两件事在这里一起钉住：
+    #   构图目标 = 目标窗口，有效性边界 = valid FOV（A2 抓到的那个错目标）；
+    #   坐标原点 = 去畸变图底边中点对应的地面点，**不是**标定矩形中心（A3）。
+    # 后者不是文案问题：marker frame 原点只是为了求 H0 和表达 45x45 尺度而设的，
+    # 凭什么代表车？而"源图底边中点就是摄像头位置"同样不成立——那是光心出发穿过该
+    # 像素的视线与地面的交点，通常在车前一小段距离处。所以这个点只承诺一件事：
+    # 它是**人为选定、可复现**的逆透视坐标参考点。
+    print('\n[L] A3：坐标参考原点与目标地面窗口')
+    for size in ((160, 120), (1280, 720)):
+        px = core.reference_origin_px(size)
+        check(abs(px[0] - (size[0] - 1) / 2.0) < 1e-12 and abs(px[1] - (size[1] - 1)) < 1e-12,
+              f'{size[0]}x{size[1]}：参考原点像素 = 底边中点', f'{px.tolist()}')
+
+    win = core.target_window_cm(150.0, 150.0)
     check(win.shape == (4, 2) and win.dtype == np.float64,
           '返回 (4,2) float64 的窗口四角', f'{win.shape} {win.dtype}')
-    check(abs(float(win[:, 1].max()) - float(rect0[:, 1].max())) < 1e-12,
-          '窗口近边 == 标定矩形近边（y 最大那条），不是"车前 150 cm"',
-          f"win y_max={float(win[:, 1].max())} rect y_max={float(rect0[:, 1].max())}")
-    check(abs((float(win[:, 1].max()) - float(win[:, 1].min())) - 150.0) < 1e-12,
-          '前向深度精确等于 target_forward_cm',
-          f"{float(win[:, 1].max()) - float(win[:, 1].min())}")
+    check(abs(float(win[:, 1].max())) < 1e-12,
+          '窗口近边就是 y=0，即参考原点所在那条边（不再依赖标定矩形近边）',
+          f"y_max={float(win[:, 1].max())}")
+    check(abs(float(win[:, 1].min()) + 150.0) < 1e-12,
+          '远边 y = -forward_cm（车辆前进为 -y）', f"y_min={float(win[:, 1].min())}")
     check(abs((float(win[:, 0].max()) - float(win[:, 0].min())) - 150.0) < 1e-12
           and abs(float(win[:, 0].max()) + float(win[:, 0].min())) < 1e-12,
-          '横向总宽等于 target_width_cm，且以标定矩形中线（x=0）对称',
+          '横向总宽 = width_cm，且以参考原点对称',
           f"x [{float(win[:, 0].min())}, {float(win[:, 0].max())}]")
-
-    # heading 非零时近边必须跟着转：拿未旋转的矩形取 y_max 会贴错边
-    rot = core.apply_homography(core.rotation_matrix(30.0), rect0)
-    win_rot = core.target_window_cm(rot, 150.0, 150.0)
-    check(abs(float(win_rot[:, 1].max()) - float(rot[:, 1].max())) < 1e-12
-          and float(win_rot[:, 1].max()) > float(win[:, 1].max()) + 1e-6,
-          'heading=30° 下近边取的是旋转后的 y_max（比未旋转时更远）',
-          f"{float(win_rot[:, 1].max()):.4f} vs {float(win[:, 1].max()):.4f}")
-
-    for label, args_ in (
-        ('rect 形状 (N,3)', (np.zeros((4, 3)), 150.0, 150.0)),
-        ('rect 含 nan', (np.array([[0., 0.], [np.nan, 1.], [1., 1.]]), 150.0, 150.0)),
-        ('宽度为 0', (rect0, 0.0, 150.0)),
-        ('深度为负', (rect0, 150.0, -1.0)),
-        ('深度为 inf', (rect0, 150.0, np.inf)),
-    ):
+    for label, args_ in (('宽度为 0', (0.0, 150.0)), ('深度为负', (150.0, -1.0)),
+                         ('深度为 inf', (150.0, np.inf))):
         try:
             got = core.target_window_cm(*args_)
             check(False, f'{label} 必须拒绝', f'却返回了形状 {np.shape(got)}')
         except ValueError as exc:
             check(True, f'{label} -> ValueError', str(exc))
 
-    # 决定性的一条：同一几何、同一画布，喂目标窗口得到的 scale 必须**远大于**
-    # 喂整幅有效视野。这正是 A2 要换掉的那个目标函数，退回去会立刻在这里失败。
+    # 参考原点：H0 把底边中点映到哪儿，函数就必须给出那一个点
     out_size = (1280, 720)
     ax_mid = 0.5 * (out_size[0] - 1)
+    quad_ref = (np.array([[50., 45.], [110., 45.], [20., 100.], [140., 100.]])
+                * np.array([out_size[0] / 160.0, out_size[1] / 120.0]))
+    H0_ref = core.compute_homography(quad_ref, core.physical_rect(45., 45.))
+    sign_ref = core.horizon_sign(H0_ref, quad_ref)
+    ref_cm = core.ground_reference_origin(H0_ref, out_size, sign_ref)
+    check(ref_cm is not None and ref_cm.shape == (2,) and np.isfinite(ref_cm).all(),
+          '正常几何下能求出参考原点', None if ref_cm is None else f'{ref_cm.round(4).tolist()}')
+    manual = core.apply_homography(H0_ref, core.reference_origin_px(out_size).reshape(1, 2))[0]
+    check(np.allclose(ref_cm, manual, rtol=0, atol=1e-9),
+          '参考原点 == apply_homography(H0, 底边中点)',
+          f'最大差 {np.abs(ref_cm - manual).max():.3e}')
+    check(abs(float(ref_cm[1]) - 22.5) > 1.0,
+          '参考原点明显不等于标定矩形近边（y=22.5），两者本来就是不同的点',
+          f'ref_y={float(ref_cm[1]):.3f} vs rect y_near=22.5')
+
+    # 底边中点落在地平线无穷远侧 -> None（不硬取一个 1e15 的坐标）
+    H0_bad = np.array([[1., 0., 0.], [0., 1., 0.], [0., -1., 100.]])
+    check(core.ground_reference_origin(H0_bad, out_size, 1.0) is None,
+          '底边中点在地平线无穷远侧 -> None', 'den = -719+100 < 0')
+    for label, args_ in (
+        ('H0 不是 3x3', (np.zeros((2, 2)), out_size, 1.0)),
+        ('H0 含 nan', (np.array([[1., 0., 0.], [0., np.nan, 0.], [0., 0., 1.]]), out_size, 1.0)),
+        ('尺寸含 0', (H0_ref, (0, 720), 1.0)),
+        ('sign 为 0', (H0_ref, out_size, 0.0)),
+    ):
+        try:
+            got = core.ground_reference_origin(*args_)
+            check(False, f'{label} 必须拒绝', f'却返回了 {got}')
+        except ValueError as exc:
+            check(True, f'{label} -> ValueError', str(exc))
+
+    # 端到端：H 必须把底边中点精确映到 anchor。这条比旧的"四点中心 == anchor"更硬，
+    # 它直接钉住"画面最底下中点 -> BirdView 底部锚点"这条链路。heading 非零也要成立——
+    # T(-ref) 必须排在 R 之前，反了的话旋转会把参考点甩走。
+    img_ref = np.zeros((out_size[1], out_size[0], 3), dtype=np.uint8)
+    ref_px = core.reference_origin_px(out_size).reshape(1, 2)
+    for heading in (0.0, -12.0, 25.0):
+        cal = core.make_calibrator_from_quad(img_ref, quad_ref, 45.0, 45.0)
+        cal.heading = heading
+        cal.scale_initialized = False
+        cal.recompute()
+        got = core.apply_homography(cal.H, ref_px)[0]
+        want = np.array(cal.anchor_px())
+        check(np.allclose(got, want, rtol=0, atol=1e-6),
+              f'heading={heading}：H(底边中点) == anchor',
+              f'{got.round(4).tolist()} vs {want.round(4).tolist()}')
+    # 自动布局下 anchor_y 就该把参考原点压到输出图底边（margin=1）
+    cal = core.make_calibrator_from_quad(img_ref, quad_ref, 45.0, 45.0)
+    got = core.apply_homography(cal.H, ref_px)[0]
+    check(cal.layout_mode == 'target_window'
+          and abs(got[1] - (out_size[1] - 1 - 1.0)) < 1e-6
+          and abs(got[0] - ax_mid) < 1e-6,
+          '自动布局把参考原点放到输出图底边中央 (639.5, 718)',
+          f'{got.round(3).tolist()} layout={cal.layout_mode}')
+
+    # 决定性的一条：同一几何、同一画布，喂目标窗口得到的 scale 必须**远大于**
+    # 喂整幅有效视野。这正是 A2 要换掉的那个目标函数，退回去会立刻在这里失败。
     fov = fov_poly(out_size)
     fit_fov = core.fit_bottom_aligned(fov, ax_mid, out_size, margin)
     fit_win = core.fit_bottom_aligned(win, ax_mid, out_size, margin)
@@ -1448,7 +1498,7 @@ def main() -> int:
           '150x150 进 1280x720 时纵向是紧约束，scale == (H-1-2m)/150',
           f'{k_win:.6f} == {(out_size[1] - 1 - 2 * margin) / 150.0:.6f}')
     check(210.0 < 45.0 * k_win < 220.0,
-          '45 cm 标定方块在 BirdView 里约 215 px（旧口径只有 93 px）',
+          '45 cm 标定方块在 BirdView 里约 215 px（A2 之前只有 93 px）',
           f'{45.0 * k_win:.1f} px')
 
     print()

@@ -899,7 +899,13 @@ async function runPreview() {
     setChip(chip, fb ? '目标窗口装不下，已退回旧口径' : '正常', fb ? 'warn' : 'ok');
     kv($('scale-info'), [
       ['当前 scale', `${data.scale.toFixed(3)} px/cm`],
-      ['目标窗口', `${data.target_window.width_cm} × ${data.target_window.forward_cm} cm`],
+      ['目标窗口', `横向 ${data.target_window.width_cm} cm`
+        + ` × 参考点前方 ${data.target_window.forward_cm} cm`],
+      ['坐标参考原点', `去畸变图 (${data.ground_origin.ground_origin_image_px[0]},`
+        + ` ${data.ground_origin.ground_origin_image_px[1]}) → marker`
+        + ` (${data.ground_origin.ground_origin_marker_cm[0].toFixed(1)},`
+        + ` ${data.ground_origin.ground_origin_marker_cm[1].toFixed(1)}) cm`
+        + `；不代表摄像头/车辆位置`],
       ['标定矩形', `${($('in-phys-w').value / 1)} × ${($('in-phys-h').value / 1)} cm`
         + ` → ${(data.scale * $('in-phys-w').value).toFixed(0)}`
         + ` × ${(data.scale * $('in-phys-h').value).toFixed(0)} px`],

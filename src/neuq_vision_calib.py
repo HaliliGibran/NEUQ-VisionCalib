@@ -107,6 +107,7 @@ from neuq_core.geometry import (  # noqa: F401
     clip_polygon_halfplane,
     compute_homography,
     fit_bottom_aligned,
+    ground_reference_origin,
     homography_denominator,
     horizon_sign,
     is_convex_quad,
@@ -116,6 +117,7 @@ from neuq_core.geometry import (  # noqa: F401
     order_corners_tl_tr_bl_br,
     physical_rect,
     quad_area,
+    reference_origin_px,
     rotation_matrix,
     scale_matrix,
     target_window_cm,
@@ -758,12 +760,18 @@ def load_calibration() -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int]
 
 # ---------------------------------------------------------------- 单应与几何
 
-def valid_fov_polygon(H0: np.ndarray, R: np.ndarray, src_size: Tuple[int, int],
+def valid_fov_polygon(H0: np.ndarray, ground_tf: np.ndarray,
+                      src_size: Tuple[int, int],
                       sign: float) -> np.ndarray:
-    """源图有效视野在旋转后物理坐标系下的多边形。
+    """源图有效视野在**最终地面坐标系**下的多边形。
 
     先在源图裁掉地平线另一侧（那里映射到无穷远），再映射到 cm 坐标，
     最后按前向/横向距离上限截断。sign 由 horizon_sign 给出。
+
+    ground_tf 是 H0 之后、scale/canvas 之前的那一段齐次变换，A3 之后它是
+    `R(heading) @ T(-ref)`——只传 R 会让多边形停在 marker frame，而目标窗口已经
+    在参考原点系里，两者不同源，自动布局就会拿两个坐标系的数去比。
+    地平线裁剪仍然只看 H0 的第三行：T 与 R 的第三行都是 [0,0,1]，不影响分母。
     """
     w, h = src_size
     poly = np.array([[0.0, 0.0], [w - 1.0, 0.0], [w - 1.0, h - 1.0], [0.0, h - 1.0]],
@@ -774,7 +782,7 @@ def valid_fov_polygon(H0: np.ndarray, R: np.ndarray, src_size: Tuple[int, int],
     if poly.shape[0] < 3:
         return np.zeros((0, 2), dtype=np.float64)
 
-    poly_cm = apply_homography(R @ H0, poly)
+    poly_cm = apply_homography(ground_tf @ H0, poly)
     if not np.isfinite(poly_cm).all():
         return np.zeros((0, 2), dtype=np.float64)
 
@@ -842,6 +850,10 @@ class IpmCalibrator:
         # 新的构图目标是目标地面窗口，它通常远小于整幅有效视野，因此正常情况下
         # scale > full_fov_fit_scale —— 远处与侧面被裁掉是故意的，不该告警。
         self.full_fov_fit_scale = 0.0
+        # A3: 去畸变图底边中点经 H0 映射到地平面的坐标（marker frame cm）。
+        # 这是逆透视坐标系的参考原点——compose() 里的 T_ref 就是平移它到 (0,0)。
+        # None 表示尚未算出或底边中点落在地平线无穷远侧。
+        self.ground_ref_marker_cm: Optional[np.ndarray] = None
 
     # ---- 几何
 
@@ -875,21 +887,34 @@ class IpmCalibrator:
         """anchor 的归一化坐标换算到输出图像素坐标。"""
         return self.anchor_x * (self.w - 1), self.anchor_y * (self.h - 1)
 
+    def ground_transform(self) -> np.ndarray:
+        """H0 之后、scale/canvas 之前的那一段：R(heading) @ T(-ref)。
+
+        目标窗口、有效视野多边形、自动布局三者必须都在这个坐标系里比，否则就是
+        拿两套原点的数在做 min。
+        """
+        ref = self.ground_ref_marker_cm
+        T_ref = translation_matrix(-ref[0], -ref[1]) if ref is not None else np.eye(3)
+        return rotation_matrix(self.heading) @ T_ref
+
     def compose(self, H0: np.ndarray) -> np.ndarray:
-        """按当前三自由度组合出完整单应 H = T @ S @ R @ H0。"""
+        """按当前参数组合出完整单应 H = T_canvas @ S @ R @ T_ref @ H0。
+
+        A3 新增的 T_ref 把 marker frame 原点平移到 IPM 参考原点——去畸变图底边中点
+        对应的那个地面点。平移必须发生在 R(heading) 之前：heading 围绕的是**参考
+        原点**而不是 marker 原点，否则旋转会把参考点甩到别的地方去。
+        """
         ax, ay = self.anchor_px()
         return (translation_matrix(ax, ay) @ scale_matrix(self.scale)
-                @ rotation_matrix(self.heading) @ H0)
+                @ self.ground_transform() @ H0)
 
     def target_window(self) -> np.ndarray:
-        """当前 heading 下的目标地面窗口（旋转后 cm 坐标，TL,TR,BL,BR）。
+        """以 IPM 参考原点为原点的目标地面窗口（旋转后 cm 坐标，TL,TR,BL,BR）。
 
-        必须先按 heading 旋转标定矩形再取近边：H = T·S·R·H0，布局那一层看到的
-        永远是旋转后的坐标系，valid_fov_polygon 也是这么约定的。拿未旋转的矩形
-        取 y_max，heading 非零时贴底的就不是真正的近边。
+        A3 之后坐标系已经平移到参考原点，窗口就是 x=[-W/2,W/2], y=[-F,0]，
+        不需要知道标定矩形的形状或位置。
         """
-        rect = apply_homography(rotation_matrix(self.heading), self.phys_pts)
-        return target_window_cm(rect, self.target_width_cm, self.target_forward_cm)
+        return target_window_cm(self.target_width_cm, self.target_forward_cm)
 
     def target_layout(self) -> Optional[Tuple[float, float]]:
         """目标窗口贴底 + 最大装入时的 (anchor_y_px, scale)；无可行解返回 None。
@@ -902,11 +927,12 @@ class IpmCalibrator:
                                   self.out_size)
 
     def recompute(self) -> None:
-        """重算 H0、自动布局、full_fov_fit_scale、H 与 BirdView 预览。"""
+        """重算 H0、参考原点、自动布局、full_fov_fit_scale、H 与 BirdView 预览。"""
         self.corners = self.build_corners()
         if self.corners is None:
             self.H0 = self.H = self.birdview = None
             self.full_fov_fit_scale = 0.0
+            self.ground_ref_marker_cm = None
             return
 
         try:
@@ -914,9 +940,14 @@ class IpmCalibrator:
         except ValueError:
             self.H0 = self.H = self.birdview = None
             self.full_fov_fit_scale = 0.0
+            self.ground_ref_marker_cm = None
             return
 
         self.sign = horizon_sign(self.H0, self.corners)
+        # A3: 求参考原点。None 表示底边中点落在地平线无穷远侧——极端几何，
+        # compose 里会跳过 T_ref（退回 marker 原点），target_window 照常能用。
+        self.ground_ref_marker_cm = ground_reference_origin(
+            self.H0, (self.w, self.h), self.sign)
 
         # 自动布局必须在 full_fov_fit_scale 之前：它会改 anchor_y，而那个诊断量是
         # 按 anchor 算的。顺序反了就会落盘一个对不上当前 anchor 的诊断值。
@@ -925,7 +956,7 @@ class IpmCalibrator:
             self.scale_initialized = True
             self.sync_scale_trackbar()
 
-        poly = valid_fov_polygon(self.H0, rotation_matrix(self.heading),
+        poly = valid_fov_polygon(self.H0, self.ground_transform(),
                                  (self.w, self.h), self.sign)
         self.full_fov_fit_scale = max_scale_for_fov(poly, self.anchor_px(),
                                                     self.out_size)
@@ -950,7 +981,7 @@ class IpmCalibrator:
             self.layout_mode = 'target_window'
             return self.layout_mode
 
-        poly = valid_fov_polygon(self.H0, rotation_matrix(self.heading),
+        poly = valid_fov_polygon(self.H0, self.ground_transform(),
                                  (self.w, self.h), self.sign)
         cap = max_scale_for_fov(poly, self.anchor_px(), self.out_size)
         self.scale = max(MIN_SCALE, cap * INIT_SCALE_RATIO) if cap > 0 else 1.0
@@ -1128,8 +1159,9 @@ class IpmCalibrator:
                              int(self.h * self.display_scale))
 
             print(f'\n交互标定：物理标定矩形 {self.phys_w:g} x {self.phys_h:g} cm，'
-                  f'目标地面窗口 {self.target_width_cm:g} x {self.target_forward_cm:g} cm'
-                  '（自标定矩形近边向前）')
+                  f'目标地面窗口 {self.target_width_cm:g} x {self.target_forward_cm:g} cm')
+            print('  坐标参考原点 = 去畸变图底边中点对应的地面点；'
+                  '它只用于定义逆透视坐标，不代表摄像头或车辆实际位置')
             print('  拖动红色端点调整四条线 -> 交点即地平面几何约束')
             print('  trackbar: anchor_x/anchor_y 位置, heading 转角, scale 物理->像素尺度')
             print('  f = 回到目标窗口自动布局, r = 复位四条线, q = 保存退出')
@@ -2249,6 +2281,26 @@ def board_conflict(meta: Optional[dict],
             '请改回已有规格，或勾选"强制重新标定"（命令行加 --force-calib）重标一次。')
 
 
+def ground_origin_meta(cal: 'IpmCalibrator') -> dict:
+    """逆透视坐标参考原点的落盘描述。
+
+    单列一函数是为了让 ipm_state.json、matrices.json、网页三处拿到的是同一份事实。
+    note 字段刻意写进文件里：拿到 (0,0) 的人最容易顺手把它当成摄像头或车辆位置，
+    而它只是"去畸变图底边中点对应的地面点"。
+    """
+    ref = cal.ground_ref_marker_cm
+    px = reference_origin_px((cal.w, cal.h))
+    return {
+        'ground_origin_mode': ('undistorted_bottom_center' if ref is not None
+                               else 'marker_center'),
+        'ground_origin_note': ('IPM coordinate reference only; '
+                               'not camera or vehicle position'),
+        'ground_origin_image_px': [float(px[0]), float(px[1])],
+        'ground_origin_marker_cm': ([float(ref[0]), float(ref[1])]
+                                    if ref is not None else [0.0, 0.0]),
+    }
+
+
 def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
                     img_size: Tuple[int, int],
                     src_path: Optional[Path] = None) -> dict:
@@ -2261,6 +2313,8 @@ def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
         'schema_version': SCHEMA_VERSION,
         'tool_version': TOOL_VERSION,
         'H': cal.H.tolist(),
+        # H0 始终是"图像 -> marker frame（45x45 中心为原点）"那一段，不含 T_ref。
+        # T_ref/R/S/T_canvas 全部已经并进 H，单独留 H0 只为地平线分母与重算。
         'H0': cal.H0.tolist(),
         'horizon_sign': cal.sign,
         'scale_px_per_cm': cal.scale,
@@ -2280,6 +2334,7 @@ def build_ipm_state(cal: 'IpmCalibrator', phys_w: float, phys_h: float,
         'src_image_width': int(img_size[0]),
         'src_image_height': int(img_size[1]),
     }
+    payload.update(ground_origin_meta(cal))
     if src_path is not None:
         payload.update(recorded_source(src_path))
     return payload
@@ -2625,7 +2680,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print('\n逆透视标定阶段完成。运行 --stage tables 可继续导出矩阵与查找表。')
         return
 
-    pair = export_all(K, D, Knew, H, calibrator.H0, calibrator.sign, {
+    pair = export_all(K, D, Knew, H, calibrator.H0, calibrator.sign, dict({
         'H0': calibrator.H0.tolist(),
         'phys_w_cm': phys_w,
         'phys_h_cm': phys_h,
@@ -2641,7 +2696,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         'horizon_sign': calibrator.sign,
         'max_range_cm': MAX_RANGE_CM,
         'max_lateral_cm': MAX_LATERAL_CM,
-    }, img_size, ipm_state=ipm_state)
+    }, **ground_origin_meta(calibrator)), img_size, ipm_state=ipm_state)
 
     # 导出已经成功，这时才写结果图：它和矩阵、查找表属于同一批产物
     safe_imwrite(IPM_RESULT, calibrator.birdview)

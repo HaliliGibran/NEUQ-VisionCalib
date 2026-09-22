@@ -403,6 +403,12 @@ def main() -> int:
             check(pv['target_window'] == {'width_cm': core.TARGET_WIDTH_CM,
                                           'forward_cm': core.TARGET_FORWARD_CM},
                   '未指定时目标窗口用模块默认值', str(pv['target_window']))
+            # A3：回包要说清 (0,0) 是什么、以及它**不是**什么
+            og = pv['ground_origin']
+            check(og['ground_origin_mode'] == 'undistorted_bottom_center'
+                  and og['ground_origin_image_px'] == [159.5, 239.0]
+                  and 'not camera or vehicle position' in og['ground_origin_note'],
+                  '回包带参考原点：底边中点 (159.5,239) + 明确的免责说明', str(og))
 
             # 目标窗口是真参数：缩小前向深度，scale 必须跟着变大，而且要等于闭式解。
             # 这里 320x240 的画布下把深度砍到 75 后**横向反而成了紧约束**

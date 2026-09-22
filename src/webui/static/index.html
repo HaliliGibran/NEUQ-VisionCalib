@@ -183,12 +183,15 @@
       <div class="card-head"><h3>目标地面窗口 · BirdView 要看多大一块地</h3></div>
       <div class="pair">
         <label>横向宽 cm <input id="in-target-w" type="number" step="5" min="1" value="150"></label>
-        <label>前向深 cm <input id="in-target-f" type="number" step="5" min="1" value="150"></label>
+        <label>参考点前方 cm <input id="in-target-f" type="number" step="5" min="1" value="150"></label>
       </div>
-      <p class="hint">这是<b>构图目标</b>：自标定矩形<b>近边</b>向前覆盖「前向深」，
-        横向以标定矩形中线为轴、总宽「横向宽」。自动布局把这一块完整装进输出图并贴住底边。</p>
-      <p class="hint">刻意不写「车前多少 cm」：物理原点是标定矩形中心，程序并不知道保险杠在哪。
-        窗口超出相机实际可见范围的部分留黑（无效），不会为了填满而把远场拉成放射状。</p>
+      <p class="hint">这是<b>构图目标</b>：以<b>坐标参考原点</b>为原点，
+        横向 ±(横向宽/2)、向前「参考点前方」这么一块地。自动布局把它完整装进输出图并贴住底边。</p>
+      <p class="hint"><b>坐标参考原点 = 去畸变图底边中点对应的那个地面点</b>（预览图里的橙色十字）。
+        它只是人为选定的逆透视坐标参考点，<b>不代表摄像头位置、不代表车辆几何中心、也不代表保险杠位置</b>——
+        源图底边中点对应的是「光心出发穿过该像素的视线与地面的交点」，通常在车前一小段距离处；
+        光心本身没有有限的像素坐标。所以这里写「参考点前方」而不是「车前」。</p>
+      <p class="hint">窗口超出相机实际可见范围的部分留黑（无效），不会为了填满而把远场拉成放射状。</p>
     </article>
 
     <article class="card compact">

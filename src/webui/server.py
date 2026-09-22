@@ -983,10 +983,13 @@ def api_preview(body: dict) -> dict:
         view = cv2.cvtColor(view, cv2.COLOR_GRAY2BGR)
     rect = core.apply_homography(cal.H, cal.corners)
     cv2.polylines(view, [rect[[0, 1, 3, 2]].astype(np.int32)], True, (0, 255, 0), 2)
+    # anchor 十字正好就是逆透视坐标参考原点（去畸变图底边中点对应的地面点）：
+    # A3 之后 H 把那个点精确映到 anchor，所以不用再单独画一个标记。
     ax, ay = cal.anchor_px()
     cv2.drawMarker(view, (int(round(ax)), int(round(ay))), (0, 140, 255),
                    cv2.MARKER_CROSS, 18, 2)
 
+    origin = core.ground_origin_meta(cal)
     return {
         'birdview': encode_jpeg(view, quality=85),
         'scale': float(cal.scale),
@@ -997,6 +1000,7 @@ def api_preview(body: dict) -> dict:
         'layout_mode': str(cal.layout_mode),
         'target_window': {'width_cm': float(cal.target_width_cm),
                           'forward_cm': float(cal.target_forward_cm)},
+        'ground_origin': origin,
         'recommended': rec,
 
         'horizon_sign': float(cal.sign),
@@ -1162,9 +1166,12 @@ def api_commit(body: dict) -> dict:
     buf = io.StringIO()
     batch = {'ok': False, 'generated': 0, 'error': None}
     with redirect_stdout(buf):
+        origin = core.ground_origin_meta(cal)
         print(f'目标地面窗口 {cal.target_width_cm:g} x {cal.target_forward_cm:g} cm'
-              f'（自标定矩形近边向前），scale={cal.scale:.3f} px/cm'
-              f'，布局 {cal.layout_mode}')
+              f'，scale={cal.scale:.3f} px/cm，布局 {cal.layout_mode}')
+        print('坐标参考原点 = 去畸变图底边中点对应的地面点 '
+              f"{origin['ground_origin_marker_cm']} cm（marker frame）；"
+              '仅用于定义逆透视坐标，不代表摄像头或车辆实际位置')
 
         # 状态文件与结果图都不单独保存，随 export_all 的事务一起提交，
         # 免得导出失败后留下"新状态/新结果图 + 旧矩阵"。
@@ -1172,7 +1179,7 @@ def api_commit(body: dict) -> dict:
                                          img_size, STATE['src_path'])
 
         # 事务式导出，并把同一份最终表交给批量测试——写盘与验证同源
-        pair = core.export_all(K, D, Knew, H, cal.H0, cal.sign, {
+        pair = core.export_all(K, D, Knew, H, cal.H0, cal.sign, dict({
             'H0': cal.H0.tolist(),
             'phys_w_cm': p['phys_w'],
             'phys_h_cm': p['phys_h'],
@@ -1188,7 +1195,7 @@ def api_commit(body: dict) -> dict:
             'horizon_sign': cal.sign,
             'max_range_cm': core.MAX_RANGE_CM,
             'max_lateral_cm': core.MAX_LATERAL_CM,
-        }, img_size, ipm_state=ipm_state)
+        }, **origin), img_size, ipm_state=ipm_state)
         # 导出已成功，这时才写结果图（与矩阵、查找表同属一批产物）
         core.safe_imwrite(core.IPM_RESULT, cal.birdview)
         print('去畸变逆透视结果图已保存:', core.IPM_RESULT)
