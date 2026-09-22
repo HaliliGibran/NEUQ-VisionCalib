@@ -1,301 +1,372 @@
 # NEUQ 相机标定程序（NEUQ-VisionCalib）
 
-智能车视觉标定一体化工具：相机内参标定 → 畸变矫正 → 逆透视（BirdView）标定 →
-导出 **6 个线性矩阵 + 畸变系数 + 两套去畸变/复合查找表（LUT）** → 批量验证，
-全部流程可在本地 Web 控制台中完成。
+把一个普通摄像头拍到的**透视地面图**，变成可以直接量距离的**俯视图**，并把整条
+变换链导出成嵌入式端能直接查表使用的产物。全流程在本地网页控制台里完成，
+不需要 MATLAB。
 
-> 说明：去畸变是非线性变换，无法写成矩阵。交付给 C 端的是「6 个矩阵 + 畸变系数
-> （`dist_coeffs`）」，原图到 BirdView 的复合变换则以查找表形式给出。
+```
+棋盘照 + 地面照
+      │
+      ├─ 相机标定 ──────► 内参 K、畸变系数 D
+      │
+      ├─ 去畸变 ────────► 去畸变图（Knew）
+      │
+      ├─ 逆透视（IPM，把透视图变成地面俯视图）
+      │     地面上取 4 个点 + 实测矩形尺寸 ──► 单应 H
+      │
+      ├─ 导出 ──────────► 6 个矩阵 + 畸变系数 + 4 套查找表（LUT）
+      │
+      └─ 批量验证 ──────► 用交付的那份表逐张跑俯视图，肉眼与数值一起核
+```
 
-核心几何逻辑只实现一份（`src/neuq_vision_calib.py`），命令行与网页调用同一批函数，
-因此网页上看到的结果与命令行跑出来的完全一致。
+适用场景：单目摄像头固定安装、只关心**地面**的测量任务（智能车循迹、车道线、
+地面标记）。前提是被测目标在地面上——离地的物体不满足平面假设，俯视图里会畸变。
+
+> 去畸变是非线性的，写不成矩阵。所以交付物是「6 个矩阵 + 畸变系数」，
+> 而「原图 → 俯视图」这条复合变换以查找表形式给出。
 
 ---
 
-## 目录结构
+## 1. 快速开始
 
-```
-.
-├── app.py                  桌面入口（双击/打包用），等价于启动 Web 控制台
-├── build_exe.py            用 PyInstaller 打包成 dist/NEUQ-VisionCalib/
-├── start_webui.bat         Windows 一键启动脚本（自动挑解释器、自动补依赖）
-├── src/
-│   ├── neuq_vision_calib.py   核心算法 + 命令行入口（唯一权威实现）
-│   └── webui/
-│       ├── server.py          本地 HTTP 控制台（无第三方 Web 框架依赖）
-│       └── static/            前端页面（index.html / app.js / style.css）
-├── tools/
-│   ├── scan_dataset.py        标定前摸清素材：分辨率分布 + 棋盘检出率
-│   └── verify_outputs.py      校验导出的矩阵与查找表是否自洽
-├── assets/
-│   └── checkerboard/          12x9 方格、20mm 棋盘靶标（PDF/PNG/DOCX，打印用）
-├── data/                      只放两类东西（均不入库）
-│   ├── import/                导入前的原始素材（网页上传的落点）
-│   └── backups/               「备份并清空」产生的归档
-├── calib_input/               相机标定照片，_incomplete/ 存检不出完整棋盘的
-├── calib_preview/             标定图去畸变验收图
-├── calib_data/                calib.json —— 相机内参与畸变系数
-├── ipm_input/                 逆透视标定原图
-├── ipm_output/                去畸变图 + BirdView 结果
-├── matrix/                    六矩阵、逆透视状态
-├── lookup_table/              undistort/ 与 undistort_ipm/ 两套正反向查找表
-├── test_input/                批量测试输入
-├── test_output/               批量测试输出
-└── dist/                      打包产物（不入库）
-```
+**Windows 最省事**：双击 `start_webui.bat`（自动挑解释器、缺依赖自动装）。
 
-**约定**：工作目录平铺在工程根，跑起来才会产生、不写就不建（写入时各函数自己
-`mkdir(parents=True)`，不需要提前铺空文件夹）。`data/` 是唯一的例外，它只装
-"不属于流水线产物"的两样东西：导入前的原始素材和备份压缩包。
-
-素材导入有两种方式：在网页里用「选择文件夹…」**直接上传**（推荐，文件夹改名、
-放在哪个盘都无所谓），或在输入框里填路径让服务端按 `工程根 → data/import/` 查找。
-
-### 代码分层
-
-`neuq_core/` 是可复用底层，`neuq_vision_calib.py` 是应用编排层（CLI 入口 + 兼容
-facade）。外部调用方式始终是 `import neuq_vision_calib as core`，底层模块拆分
-不影响它——facade 把底层符号原名转发出来，`core.compute_homography`、
-`core.safe_imread` 这些名字指向的就是底层模块里的同一个函数对象，不是副本。
-
-```
-neuq_core/
-├── io.py            图像读写（绕开 OpenCV 的非 ASCII 路径坑）
-├── config.py        标定板规格、project.json、素材库状态机
-├── geometry.py      单应、多边形裁剪、有效视野尺度的纯几何运算
-├── calibration.py   棋盘检出与 calibrateCamera 的算法核
-└── lut.py           查找表的数学核（BirdView 像素 → 原图采样坐标）
-
-依赖方向（单向，无环）：
-  io / config / geometry -> 无项目内依赖
-  calibration            -> config
-  lut                    -> geometry
-  neuq_vision_calib.py   -> 以上全部
-```
-
-留在编排层的是**目录读写、运行时参数、用户交互、CLI、落盘、事务**这几类——它们
-本来就属于顶层，不是"还没拆完"。判据是"有没有粘着会被运行时改写的全局"：
-`configure_paths()` / `configure_board()` / `apply_options()` 会重新赋值 17 个路径
-全局和 13 个运行时开关（`BOARD`、`UNDIST_ALPHA`、`MAX_REPROJ_ERR`、`TABLE_FORMAT`
-等），读这些全局的函数一旦搬进底层模块，就得为它们再做一份镜像——那会把"一份
-权威状态"变成"到处都是镜像"，所以刻意停在这里。
-
-过渡期有一个已知妥协：`config.py` 持有 `SCRIPT_DIR` / `DIR_CALIB_IN` /
-`DIR_IPM_IN` / `BOARD` 的**镜像**，由 `configure_paths()` 与 `configure_board()`
-这两个唯一写入点同步过去。因此正式 API 只认这两个函数——直接 `core.BOARD = spec`
-赋值不会同步到底层模块，那是过渡形态的固有弱点，不是可依赖的用法。
-
----
-
-## 环境要求
-
-- Python 3.10 及以上
-- `opencv-python`、`numpy`
+其他情况：
 
 ```bash
 python -m venv .venv
 ".venv/Scripts/python.exe" -m pip install -r requirements.txt   # Windows
-source .venv/bin/activate && pip install -r requirements.txt     # macOS/Linux
+source .venv/bin/activate && pip install -r requirements.txt     # macOS / Linux
+
+python app.py                    # 启动网页控制台，浏览器自动打开
+python src/webui/server.py --port 9000 --no-browser   # 换端口 / 不开浏览器
 ```
+
+默认地址 `http://127.0.0.1:8770`。需要 Python 3.10+、`opencv-python`、`numpy`。
+
+不想装 Python：见第 11 节打包成 exe，整个文件夹拷走即可运行。
 
 ---
 
-## 运行
+## 2. 标准工作流程
 
-### 方式一：Web 控制台（推荐）
+网页上从上到下 5 步，顺序不能乱：
 
-Windows 直接双击 `start_webui.bat`，或：
+| 步 | 做什么 | 关键点 |
+|---|---|---|
+| 0 | 填**标定板规格** | 填**方格数**（数格子），不是内角点数。必须在导入之前设对 |
+| 1 | **导入素材** | 棋盘照和地面照混在一个目录里丢进来，程序按"能否检出棋盘"自动分拣 |
+| 2 | **运行相机标定** | 先不填阈值跑一次看误差分布，再填阈值（例如 `1.5`）+ 勾「强制重新标定」跑第二次 |
+| 3 | **选地面标定原图**，拖 4 个角点 | 挑白纸摆位最正、边缘最清楚的那张 |
+| — | 填**地面标定矩形实际尺寸**、**目标地面范围** | 尺寸必须实测；范围决定俯视图覆盖多大一块地 |
+| 4 | **导出矩阵与查找表** | 表格式选 `bin`、定点小数位 `4`、降采样倍率 `4×`；导出后自动跑一遍批量测试 |
 
-```bash
-python app.py                    # 桌面入口
-python src/webui/server.py       # 等价，默认 http://127.0.0.1:8770
-python src/webui/server.py --port 9000 --no-browser
-```
+导出完成后点「查看逆透视成果」逐张核对俯视图，再跑一次
+`python tools/verify_outputs.py`（第 9 节）。
 
-浏览器会自动打开。功能：素材导入、相机标定、逆透视四点拖拽、实时 BirdView 预览、
-矩阵与查找表导出、批量测试、备份并清空。
-
-### 方式二：命令行
-
-```bash
-python src/neuq_vision_calib.py --list                  # 查看各目录现状
-python src/neuq_vision_calib.py --import-dir <混合目录>  # 按能否检出棋盘拆分素材入库
-python src/neuq_vision_calib.py --stage calib           # 只跑相机标定
-python src/neuq_vision_calib.py                         # 跑全流程（含交互标定逆透视）
-python src/neuq_vision_calib.py --stage tables --quad "<四点>"   # 无 GUI 跑完整链路
-```
+命令行等价流程见第 12 节。
 
 ---
 
-## 标定流程
+## 3. 数据采集要求
 
-1. 打印 `assets/checkerboard/` 里的棋盘靶标（12x9 方格，边长 20mm）
-2. 从多个角度拍摄 15 张以上棋盘照片，放入 `calib_input/`
-3. 拍摄一张地面（车道）照片放入 `ipm_input/`
-4. 打开控制台，依次执行「相机标定 → 逆透视标定 → 导出」
-5. 产物落在 `matrix/`（矩阵）与 `lookup_table/`（查找表）
+这一节决定标定精度上限，**比任何代码调整都重要**。
+
+### 棋盘照（放 `calib_input/`，由第 1 步自动分拣）
+
+- 打印 `assets/checkerboard/` 里的靶标（12×9 方格、边长 20 mm），贴在硬质平板上，
+  **不能卷边、不能反光**。
+- 20 张以上，多个倾角、多个距离。
+- **必须让棋盘覆盖到画面四角与边缘**。这是最容易忽略、后果也最大的一条：
+  镜头的畸变主要体现在画面边缘，如果棋盘始终在画面中央，畸变参数就**没有数据约束**
+  —— 此时 RMS 可能很好看，但边缘去畸变结果不可信。判断方法见第 5 节。
+
+### 地面照（放 `ipm_input/`）
+
+- 地面上放一张**实测过尺寸**的矩形白纸（例如 45×45 cm），四角清晰可见。
+- 摄像头**必须已经固定在最终位置**，拍完不能再动。
+- 想用多张地面照做跨帧一致性检查的话：**相机必须全程不动**，只改变场景。
+  相机动过的一组照片无法用来验证 H 的稳定性——俯视图里的差异来自输入本身，
+  不是标定的问题。
+
+### 地面标定矩形
+
+必须用尺子量，填的是**四点框住那块地面矩形的外框边长**。它与第 0 步棋盘的
+方格边长是两件完全不同的事，不要互相照抄。这一项直接决定比例尺（px/cm）和车上
+所有距离测量的正确性。
 
 ---
 
-## 标定板规格
+## 4. 相机标定
 
-导入素材的第一步就是判断"这张是棋盘照还是地面照"，而这一步用的正是棋盘规格。
-所以规格属于**当前标定工程的前置配置**，必须在导入之前设好。
+### 产出的三个矩阵
 
-界面（以及命令行）只问**方格数**，内角点数由程序换算——"我打印的是 12×9，
-程序为什么让我填 11×8"是这一环最经典的填错来源。默认是仓库自带的 12×9 / 20 mm。
-
-```bash
-# 命令行（推荐用方格数）
-python src/neuq_vision_calib.py --board-squares 12 9 --square-size-mm 20
-python src/neuq_vision_calib.py --board-corners 11 8      # 兼容用法，与上面互斥
-
-# 扫描素材用的也是同一套参数与同一份检测实现
-python tools/scan_dataset.py <图片目录> --board-squares 12 9
-```
-
-在线拍摄的预览窗口顶部会一直显示当前规格——换了棋盘却忘了改参数时，
-画面会持续 `detected=False`，用户很容易去怀疑相机或代码，其实只是规格没切过来。
-
-规格会完整写进 `calib.json` 的 `board` 段，事后能追溯"这份内参是哪块棋盘算出来的"；
-旧版只写了 `chessboard_corners` 的文件仍可读，会自动换算回方格数。
-
-**换了棋盘必须重标**：复用已有 `calib.json` 前会先核对规格，不一致时直接拒绝并说明
-（否则会出现"界面写着 12×9、运行标定成功"，实际复用 9×7 旧参数，
-provenance 被写错且事后说不清）。确实要换板就用 `--force-calib`，
-或在网页上勾选"强制重新标定"。
-
-规格存在工程根的 **`project.json`** 里，属于项目级配置：设好一次，关掉程序再打开
-仍然是它。启动时的恢复顺序是 `project.json` → `calib.json` → 仓库自带的 12×9/20mm；
-从 `calib.json` 恢复出来时会顺手把规格**写进** `project.json`（只在它没有 `board` 段时做，
-不覆盖用户显式设过的值），否则"备份并清空"删掉 `calib.json` 之后规格就无声退回默认值了。
-
-命令行上只给其中一项时，**没给的字段沿用当前工程的规格**，不是仓库默认值：
-
-```bash
-# 工程里存的是 9×7 / 25 mm
-python src/neuq_vision_calib.py --square-size-mm 30   # → 9×7 / 30 mm（只改边长）
-python src/neuq_vision_calib.py --board-squares 10 8  # → 10×8 / 25 mm（只改方格数）
-```
-
-### 素材库按哪块棋盘分类
-
-规格还参与"这张是棋盘照还是地面照"的判定，所以 `calib_input/`（含 `_incomplete/`）
-+ `ipm_input/` 这**一整套**素材必然是在某一块棋盘规格下分拣出来的。这个事实单独记在
-`project.json` 的 `material_set.board` 里，与"最近一次导入"（`last_import`）分开——
-记在后者上的话，一次增量导入就能把它改写掉，混合了两套规格的素材库会被认成
-整套都是新规格，脏状态被洗白。
-
-| 操作 | 规则 |
+| 名字 | 含义 |
 |---|---|
-| 素材库为空 | 任何规格都可以，导入后 `material_set.board` = 当前规格 |
-| 增量添加 `add` | 要求当前规格 == `material_set.board`，否则**直接拒绝** |
-| 覆盖导入 `replace` | 允许换规格，全部成功后才改写 `material_set.board` |
-| 备份并清空 / 仅清空 | `material_set` 一并作废，下一次导入重新确立 |
+| `K` | 原始相机内参（对应**带畸变**的原图） |
+| `D` | 畸变系数 `[k1, k2, p1, p2, k3]` |
+| `Knew` | **去畸变图**的内参。默认与 `K` 相同；用 `--undist-alpha` 时会不同 |
 
-"素材库为空"的判定必须把 `calib_input/_incomplete/` 也算进去：一批棋盘照全都只匹配到
-局部子网格时，`calib_input/` 与 `ipm_input/` 恰好都是空的，而库里明明躺着按旧规格分拣
-出来的东西。
+三者都写进 `calib_data/calib.json`。注意 `Knew` 是独立的一项：地面 4 个点是在
+**去畸变图**上点的，`Knew` 一变，那套点的坐标含义就变了（见第 12 节的标定基准）。
 
-规格与素材库不一致（stale）时，除了界面上两张卡片常驻显示醒目告警，**相机标定与逆透视
-取图都会被中止**：`calib_input/` 里那批图是按旧标准挑进来的，用新规格逐张重检会悄悄
-剔掉一大半，剩下两三张也标得出参数，只是精度和 provenance 都对不上；`ipm_input/` 同样
-不可信——"这张检不出棋盘，算地面照"本身就是旧规格判出来的结论。要换板子，就得按新规格
-重新导入。`--ipm-source` 的放行范围只到**素材库之外**：指定 `ipm_input/` 里的某一张
-（包括只写文件名、它会被解析到 `ipm_input/` 下）仍要过素材状态检查——文件躺在那个目录里
-本身就是过去分拣的结论，写得出文件名并不能让它重新可信；真正不依赖分拣结果的外部文件
-才放行。同理，素材依据未知（没有 `material_set`）时也拦：那时同样证明不了它是地面照。
-相机标定不受这一条约束，它逐张重检，检不出会被剔除并报错。
+### 误差怎么读
 
-覆盖导入走**暂存目录事务**，与矩阵/查找表导出同一套做法：新素材先完整地准备进
-`calib_input.staging/`、`ipm_input.staging/`，全部分拣复制成功后才整体换装。中途磁盘满、
-权限出错、坏图时正式的素材库一个文件都不会少（`--move` 时暂存目录会被保留下来，
-因为里面是从用户目录搬走的原件）。
+程序同时报两个数，因为它们口径不同：
 
-保留下来的暂存目录还要**防住下一次覆盖导入**：新的 `replace` 开始前会检查
-`*.staging` 与 `*.old` 残留，只要存在就直接拒绝并列出路径，不自动删除、不猜"这是
-copy 模式留下的删了也没事"。少了这道闸，"失败 → 修好问题 → 再点一次覆盖导入"
-会在开头把上一轮保住的唯一原件 rmtree 掉——等于这一次没丢、重试时丢了。
+- **RMS**（OpenCV 口径）：均方根，受大误差帧拉动明显，数值偏大。
+- **平均欧氏重投影误差**（MATLAB `cameraCalibrator` 口径）：数值更小。
 
-两种模式对坏图的态度刻意不同：
+拿本工程的实测数据举例：`RMS = 1.0516 px`、`平均欧氏误差 = 0.8795 px`。
+比较不同标定结果时务必用同一个口径。
 
-- `add` = best effort，坏图跳过、其余照常入库（它只往库里追加，不删任何既有素材）
-- `replace` = all-or-nothing，**有一张读不出就整批放弃**。放过去的话，"19 张好图 +
-  1 张坏图"会把旧素材库整套换成那 19 张，与上面那句承诺直接矛盾
+界面上的柱状图给出**每一张**照片的 RMS，由大到小排列——这是挑阈值的依据。
 
-`project.json` 读不动时（JSON 损坏、或 `schema_version` 比本程序新）程序**直接中止**，
-不会把它当空配置绕过去：那样下一次"应用规格"就会拿空配置覆盖写，把新版文件降级、
-把 `material_set` 抹掉，正好与加 `schema_version` 闸门的目的相反。
+### 自动剔帧
 
-「备份并清空」的 `manifest.json` 里带一份 `project_config` 快照，记下这批素材当时是按
-什么规格分类的——活的 `project.json` 会被下一轮导入改写，只有备份里那份才是永久记录。
+在「剔除重投影误差超过（px）」里填一个值（常用 `1.5`），程序会：
+
+```
+全部照片标一次 → 剔掉超过阈值的 → 用剩下的重标 → 落盘
+```
+
+建议做法是**跑两次**：第一次留空，看柱状图里误差怎么分布；第二次按看到的分布填阈值。
+
+被剔掉的照片不会生成去畸变预览，所以画廊里它们右侧是空的，并标注
+「未参与本次标定」——这不是文件丢了。
+
+### calib.json 记录了什么（provenance）
+
+```json
+{
+  "rms_px": 1.0516,
+  "mean_reprojection_error_px": 0.8795,
+  "max_reproj_err": 1.5,
+  "used_images": ["...21 张..."],
+  "dropped_images": [{ "name": "...", "rms_px": 2.3550 }],
+  "opencv_version": "4.13.0",
+  "calibration_basis_hash": "b1cb1995..."
+}
+```
+
+有了这几项，事后拿到一份 `calib.json` 就能直接回答"它是用哪些照片、剔了哪几张、
+什么版本的 OpenCV 算出来的"，不必靠重算去反推。`calib_data/` 与 `calib_preview/`
+作为**一个事务**一起写入，不会出现"新预览配旧参数"。
 
 ---
 
-## 代码检查
+## 5. 判断标定够不够好
 
-```bash
-# 装一次（独立 venv，不污染装 opencv 的那个解释器）
-python -m venv .venv-lint && .venv-lint/Scripts/python -m pip install -r requirements-dev.txt
+RMS 只说明"模型在**有数据的地方**拟合得好"，不能说明边缘可信。真正要看的是
+**角点的径向覆盖**：把每个角点到画面中心的距离除以半对角线长度，看分布。
 
-.venv-lint/Scripts/ruff check .        # 静态检查
-python tests/run_all.py                # 回归测试（需要 cv2）
+本工程当前数据的实测结果：
+
+```
+最大覆盖 r = 0.738      87% 的角点在 r < 0.4      r > 0.7 只有 0.2%
 ```
 
-两条链是分开的：ruff 不需要导入 OpenCV，所以可以装在任何解释器里；
-测试仍然跑在装了 cv2/numpy 的那个上。
+这意味着画面边缘的畸变参数缺乏约束。验证方法：**丢掉误差最大的 3 帧重标一次**，
+如果 `k1` 大幅跳变（本工程实测变化 36%）、边缘去畸变位移摆动几十像素，那就是
+欠约束的确证——而不是"有几张坏照片"。这种情况下**不要**靠设阈值把 RMS 修好看，
+只有重拍（棋盘覆盖到四角）能真正改善。
 
-`pyproject.toml` 里的规则集是挑过的，只留"真的可能出错"的规则
-（F/E/W/I/SIM/B/PLW/RUF/DTZ）。刻意没开 pyupgrade 的注解现代化——那会把 130 多处
-`Optional[X]` 一次性改成 `X | None`，属于独立的一次风格重构。
-另外关掉了 RUF001-003：本项目是中文代码库，注释里的全角标点是正确的。
+好消息是：只要地面 4 个点落在受约束区域内（本工程是 `r = 0.35 ~ 0.6`），
+当前内参用于**近场**逆透视是够用的。
 
 ---
 
-## 测试
+## 6. 逆透视与坐标定义
 
-```bash
-python tests/run_all.py              # 跑全部
-python tests/test_static_names.py    # 静态检查：不允许出现未定义的名字
-python tests/test_board_spec.py      # 标定板规格 + 真的跑一次相机标定
-python tests/test_lut_roundtrip.py   # 打表链路，60 组参数组合
-python tests/test_export_transaction.py   # 导出事务、回滚、重启后读表
+### 四点与单应
+
+在去畸变图上拖 4 个角点框住那块实测矩形，程序解出单应：
+
+```
+H = T(画布锚点) · S(比例尺) · R(朝向偏移) · T(−参考原点) · H0
 ```
 
-零依赖，不需要 pytest——只要有 cv2 和 numpy 就行。四组测试都只用**合成数据**
-（合成相机参数、合成单应、程序画出来的棋盘），不需要任何真实照片。
+- `H0`：去畸变图 → **标定矩形坐标系**（以矩形中心为原点，cm 为单位）
+- `T(−参考原点)`：把原点平移到下面说的逆透视坐标参考原点
+- `R / S / T`：朝向偏移、比例尺、在俯视图画布上的位置
 
-`test_static_names.py` 值得单独说一句：本项目真的出过一次
-"把常量批量替换成 `board.corners`，而那个函数里没有 `board`，
-于是运行相机标定直接 NameError"的事故——`compileall` 只查语法不查名字，
-单元测试又恰好没调用那个函数，两个都拦不住。这个检查用标准库 `ast`
-按作用域链解析每个名字的来源，把这类问题在提交前就拦下来。
-它上线时立刻又抓出第二处：校验脚本里 `re` 被误删了导入却仍在使用。
+### 坐标参考原点（重要，容易误解）
 
-`test_lut_roundtrip` 的参数矩阵是刻意铺开的，因为本项目的缺陷几乎都藏在组合里：
+```
+参考原点 = 去畸变图底边中点 (W/2, H−1) 经 H0 映射到地平面得到的那个点
+```
 
-| 维度 | 取值 |
+**它不代表摄像头位置、不代表车辆几何中心、也不代表保险杠位置。**
+
+原因：源图底边中点对应的是"光心出发穿过该像素的视线与地面的交点"，通常落在
+车前一小段距离处；而光心本身根本没有有限的像素坐标。所以界面和文档一律写
+「参考点前方 N cm」，不写「车前 N cm」——后者是假精确，换个俯角偏差就会变。
+
+要真正拿到车辆位置，需要额外用 `solvePnP` 恢复相机位姿、取光心的地面投影，
+再叠加一个安装偏置。那属于**车辆安装参数**，本工具刻意不承担。
+
+`matrices.json` / `ipm_state.json` 里如实记录了这一点：
+
+```json
+"ground_origin_mode": "undistorted_bottom_center",
+"ground_origin_note": "IPM coordinate reference only; not camera or vehicle position",
+"ground_origin_image_px": [639.5, 719.0],
+"ground_origin_marker_cm": [-3.9837, 39.7866]
+```
+
+最后一项是参考原点在标定矩形坐标系里的位置，便于日后从 `H` 反推这个 `(0,0)`
+是从哪儿平移过来的。
+
+### 目标地面范围
+
+填两个数：**横向宽**、**参考点前方深度**（默认 150 × 150 cm）。程序把这块地面
+完整装进俯视图并贴住底边，同时把比例尺取到最大。
+
+为什么需要它：不指定的话只能退回"完整容纳理论可见地面"，而理论可见范围受
+`MAX_RANGE_CM / MAX_LATERAL_CM` 截断（±300 cm，存在的理由只是"地平线附近映射到
+无穷远必须截断"）。本工程实测过后果——把 ±300 cm 塞进 1280×720 时，48% 的输出
+像素来自不到 0.04 个源像素，整幅图是放射状拉丝，45 cm 方块只有 93 px。
+改成 150×150 后同一张图里 45 cm 方块是 215 px。
+
+一个几何上的必然结果值得提前知道：16:9 画布上等比装入时纵向先顶住，所以
+`横向宽` 只有在 `宽/深 > 16/9 ≈ 1.78` 时才真正参与求解。150×150 与 200×150
+得到的比例尺是一样的。
+
+### 四个自由度
+
+| 名字 | 含义 |
 |---|---|
-| 表格式 | txt / bin / c |
-| 网格 | 原尺寸 / 320×240 / 160×120 |
-| 定点位数 | Q0 / Q4 |
-| heading | 0° / −1.6° |
-| Knew | 与 K 相同 / alpha=0.5 算出的不同矩阵 |
+| 横向锚点 | 参考原点在俯视图里的横向位置（0~1），0.5 = 居中 |
+| 纵向锚点 | 同上，纵向。自动布局会把它算成"参考原点贴住底边" |
+| 朝向偏移 | 俯视图绕参考原点旋转的角度，用来对正车辆前进方向 |
+| 比例尺 | px/cm。勾了「自动布局」就由程序按目标地面范围解出 |
 
-每个组合都验证：导出网格 == 落盘网格、采样坐标空间仍是源图分辨率、
-读回值与导出值逐值一致、`batch_test` 的输出网格等于最终表网格。
+勾着「自动布局：近场贴底并最大化利用画布」时，纵向锚点与比例尺由程序联合求解；
+手动拖动这两项会自动退出自动布局。
 
 ---
 
-## 验证产物
+## 7. 导出结果
 
-```bash
-python tools/verify_outputs.py            # 默认校验本工程
-python tools/verify_outputs.py <工程根目录>
+### `matrix/`
+
+- `matrices.json` / `matrices.txt`：6 个矩阵 `K / K⁻¹ / Knew / Knew⁻¹ / H / H⁻¹`
+  加畸变系数 `dist_coeffs`，以及这一次导出的全部参数（比例尺、锚点、朝向偏移、
+  4 个源点、目标地面范围、参考原点、标定基准指纹）。
+- `ipm_state.json`：逆透视标定状态。下次打开网页会用它恢复上次的 4 个点。
+
+### `lookup_table/` —— 4 套表
+
+```
+lookup_table/
+├── undistort/        原图 → 去畸变图
+│   ├── reverse/      索引 = 去畸变图像素，取值 = 原始畸变图采样坐标
+│   └── forward/      索引 = 原始畸变图像素，取值 = 去畸变图落点
+└── undistort_ipm/    原图 → 俯视图（去畸变与逆透视合成一步）
+    ├── reverse/      索引 = 俯视图像素，取值 = 原始畸变图采样坐标   ← 运行时用这个
+    └── forward/      索引 = 原始畸变图像素，取值 = 俯视图落点
 ```
 
-逐项检查：单应矩阵正确性、查找表与 `cv2.undistort` / `cv2.warpPerspective` 的一致性、
-正反向表互逆性、无效哨兵分布。全通过才会输出 `N/N 项通过`。
+每套目录下是 `MapW`（x 坐标）、`MapH`（y 坐标）与一份 `metadata.json`。
+
+**方向怎么选**：实时生成俯视图要的是 `reverse` —— 遍历输出像素、去原图取色，
+每个输出像素都有值。`forward` 用于反查"原图某点落到俯视图哪里"，它天然有空洞。
+
+**无效点**一律写 `-1`：映射到无穷远、落在地平线另一侧、或超出图像范围。
+`MapW` 与 `MapH` 的无效位置必须完全同步（校验脚本会检查这一条）。
+
+### 格式与精度
+
+| 格式 | 说明 |
+|---|---|
+| `txt` | 逗号分隔文本，便于肉眼查看；720p 下四套表约 56 MB |
+| `bin` | 裸 `int16` 小端定点，**上车用这个** |
+| `c` | C 头文件，可直接 `#include` |
+
+`bin`/`c` 用定点存储，`Q4` 表示小数部分 4 位（除以 16 还原）。选 Q4 的理由：
+`1279 × 16 = 20464`、`719 × 16 = 11504`，都在 `int16` 范围内；换 Q5 则
+`1279 × 32 = 40928` 直接溢出。所以 **Q4 是 1280 宽坐标下最高的安全档**，
+二维理论最大量化误差 `√2 × 0.5 / 16 ≈ 0.0442 px`。
+
+### 降采样只允许整数倍等比
+
+选「降采样倍率」而不是填宽高，`320×240` 这类组合会被**直接拒绝**。原因：
+1280×720 → 320×240 是横向缩 4 倍、纵向缩 3 倍，俯视图被非等比压成 4:3，
+地面上 45×45 cm 的正方形在小图里变成 53.8 × 71.7 px（宽高比 0.75），
+嵌入式端拿它算角度、曲率、横向偏差全部失真。
+
+1280×720 的可用倍率：`1× / 2× / 4× / 5× / 8× / 10× / 16×`。
+**当前推荐 `4×（320×180）`**，各向同性，四套表合计 900 KiB。
+
+---
+
+## 8. 嵌入式端最小使用方案
+
+实时生成俯视图**只需要一套表**：
+
+```
+lookup_table/undistort_ipm/reverse/{MapW.bin, MapH.bin}
+320×180 × int16 × 2 = 225 KiB
+```
+
+其余三套是开发与验证用的，不必烧进车上。
+
+### 读法
+
+```c
+// MapW.bin / MapH.bin：裸 int16 小端，行优先，形状见同目录 metadata.json
+int16_t mapw[180][320];   // grid_size = [320, 180]
+int16_t maph[180][320];
+// 取值：除以 (1 << fixed_point) 还原；-32768 是无效哨兵，还原后视为 -1
+```
+
+```python
+import numpy as np, json
+meta = json.load(open('metadata.json', encoding='utf-8'))
+w, h = meta['grid_size']          # [320, 180]
+q    = meta['fixed_point']        # 4
+raw  = np.fromfile('MapW.bin', dtype='<i2').reshape(h, w)
+val  = np.where(raw == -32768, -1.0, raw / (1 << q))
+```
+
+### 坐标单位（最容易写错的一处）
+
+表降采样到 320×180 之后，**索引**是 320×180 的网格，但**取值仍然是全分辨率
+（1280×720）坐标**。因为只允许整数倍等比，横纵共用一个倍率 `n`：
+
+```
+full  = (small + 0.5) * n − 0.5
+small = (full  + 0.5) / n − 0.5        n = metadata.json 的 downsample_factor
+```
+
+按像素中心对齐，不是简单的 `full = small * n`。少了这半个像素，320×180 下横向会
+偏 1.5 个全分辨率像素。
+
+---
+
+## 9. 验证
+
+```bash
+python tools/verify_outputs.py            # 校验本工程
+python tools/verify_outputs.py <工程根>
+```
+
+7 项检查，各自证明一件事：
+
+| 检查 | 证明什么 |
+|---|---|
+| H 映射源四点成矩形 | 尺寸 == 实测尺寸 × 比例尺、邻边垂直、旋转角 == 朝向偏移、去畸变图底边中点正好落在锚点 |
+| 表网格为整数倍等比 | 横纵同一倍率，俯视图的公制纵横比没被破坏 |
+| `undistort/reverse` == `cv2.undistort` | 去畸变表的数学正确 |
+| `undistort_ipm/reverse` == `warpPerspective` | 复合表的数学正确 |
+| `forward` 与 `reverse` 互逆 | 两个方向自洽 |
+| 无效哨兵 | 只出现在合法区域之外，`MapW`/`MapH` 完全同步，值都是 `-1` |
+| **落盘表 == 流水线重算** | 算出来的东西原样写进了文件（覆盖重采样与定点量化两步） |
+
+最后一项是**主判据**。前面几项里有两条在降采样后会被跳过（输出尺寸与源图不同，
+逐像素比对无意义），而「`forward`/`reverse` 互逆」在降采样后**只作诊断、不判定
+通过失败**——栅格化、`INTER_AREA` 重采样、定点量化三步都不可逆，把"严格互逆"
+当成必须成立的数学不变量，只会得到一个随网格和比例尺漂移的假失败。
 
 标定前想先摸清素材质量：
 
@@ -305,23 +376,139 @@ python tools/scan_dataset.py <图片目录> --board-squares 12 9
 
 ---
 
-## 打包成 exe
+## 10. 运行目录
+
+```
+calib_input/      相机标定照片（_incomplete/ 放只检出局部棋盘的）
+calib_preview/    参与标定那些照片的去畸变结果，逐张验收用
+calib_data/       calib.json —— 内参、畸变系数、标定 provenance
+ipm_input/        地面标定原图（候选）
+ipm_output/       去畸变图 + 俯视图结果
+matrix/           6 个矩阵、逆透视状态
+lookup_table/     4 套查找表
+test_input/       批量测试输入（_auto_ipm/ 是导出时自动建的测试集）
+test_output/      批量测试输出
+data/import/      导入前的原始素材（网页上传的落点）
+data/backups/     「备份并清空」产生的归档
+project.json      工程级配置：标定板规格、素材库状态
+```
+
+这些目录**跑起来才会创建**，不需要提前铺空文件夹。素材导入有两种方式：网页上
+「选择文件夹…」直接上传（推荐），或填路径让程序按 `工程根 → data/import/` 查找。
+
+「备份并清空」会把产物打包进 `data/backups/`，再清空各目录等待新素材。备份里的
+`manifest.json` 带一份 `project.json` 快照——活的配置会被下一轮导入改写，
+只有备份里那份是永久记录。
+
+---
+
+## 11. 打包成 exe
 
 ```bash
 pip install -r requirements-dev.txt
-python build_exe.py             # 或 python build_exe.py --clean
+python build_exe.py             # 或加 --clean
 ```
 
-产物在 `dist/NEUQ-VisionCalib/`，已预置 `data/` 下的空目录与 `assets/checkerboard/`。
+产物在 `dist/NEUQ-VisionCalib/`，已预置 `data/` 空目录与 `assets/checkerboard/`。
 整个文件夹拷走即可运行，目标机器不需要装 Python。
 
 ---
 
-## 坐标与约定
+## 12. 命令行与开发
 
-- 全程 OpenCV 0-based 像素坐标；物理坐标单位 cm，x 向右、y 向下（朝向车辆），
-  标定矩形中心为原点，BirdView 图正上方为车辆前进方向。
-- 单应分解 `H = T(anchor) @ S(scale) @ R(heading) @ H0`。
-- 查找表：`reverse/` 给出每个输出像素对应的源图采样坐标；`forward/` 反之；
-  无效点统一写 `-1`（映射到无穷远、落在地平线另一侧或超出图像范围）。
-- 查找表支持三种落盘格式：逗号分隔文本、int16 定点二进制、C 头文件。
+### 命令行
+
+```bash
+python src/neuq_vision_calib.py --list                    # 各目录现状
+python src/neuq_vision_calib.py --import-dir <混合目录>    # 分拣入库
+python src/neuq_vision_calib.py --board-squares 12 9 --square-size-mm 20
+python src/neuq_vision_calib.py --stage calib             # 只跑相机标定
+python src/neuq_vision_calib.py                           # 全流程（含交互拖点窗口）
+python src/neuq_vision_calib.py --stage tables --quad "<四点>"    # 无 GUI
+python src/neuq_vision_calib.py --stage tables \
+    --table-format bin --table-size 320 180 --table-fixed-point 4
+```
+
+`--table-size` 同样只接受整数倍等比的网格，不合法会直接报错并列出可用尺寸。
+只给标定板参数中的一项时，没给的字段沿用**当前工程**的规格，不是仓库默认值。
+
+### 标定基准与 stale
+
+`calib.json` / `ipm_state.json` / `matrices.json` 里都有
+`calibration_basis_hash = SHA256(K, D, Knew, 标定分辨率)`。重新标定后只要它变了：
+
+- 网页不再恢复上次那 4 个点（那是在**另一张**去畸变图上点的）
+- 「只重跑批量测试」与 `--stage tables` 复用旧状态都会被拒绝
+
+旧文件**一个都不会被删**，只是不允许继续消费。看到这类提示不是出错，而是提醒
+"这份产物属于上一次标定，需要重做逆透视并重新导出"。
+
+刻意不对 `calib.json` 整个文件取哈希：`rms_px`、`used_images` 这些 provenance
+字段变了并不改变几何，不该让下游全部失效。也刻意包含 `Knew`：4 个点在去畸变图上，
+`--undist-alpha` 改了 `Knew` 就不能复用旧点。
+
+### 测试与静态检查
+
+```bash
+python tests/run_all.py                    # 全部（需要 cv2 / numpy，不需要 pytest）
+python tests/test_static_names.py          # 静态检查：不允许出现未定义的名字
+python tests/test_board_spec.py            # 标定板规格 + 几何契约 + 真跑一次标定
+python tests/test_lut_roundtrip.py         # 打表链路，多组参数组合
+python tests/test_export_transaction.py    # 导出事务、回滚、重启后读表
+python tests/test_webui_state.py           # 网页状态机与自动测试集
+
+python -m venv .venv-lint && .venv-lint/Scripts/python -m pip install -r requirements-dev.txt
+.venv-lint/Scripts/ruff check .
+```
+
+测试全部用**合成数据**（合成相机参数、合成单应、程序画出来的棋盘），
+不需要真实照片。ruff 与测试是两条独立的链：ruff 不需要 OpenCV，可以装在任何解释器上。
+
+### 源码结构
+
+```
+app.py                    桌面入口，等价于启动网页控制台
+build_exe.py              PyInstaller 打包
+start_webui.bat           Windows 一键启动
+src/
+├── neuq_vision_calib.py  应用编排层 + 命令行入口
+├── neuq_core/            可复用底层
+│   ├── io.py             图像读写（绕开 OpenCV 的非 ASCII 路径问题）
+│   ├── config.py         标定板规格、project.json、素材库状态机
+│   ├── geometry.py       单应、多边形裁剪、布局求解的纯几何
+│   ├── calibration.py    棋盘检出与 calibrateCamera 的算法核
+│   ├── lut.py            查找表的数学核
+│   └── fs_transaction.py 目录换装事务（暂存 → 整体替换 → 失败回滚）
+└── webui/                本地 HTTP 控制台（无第三方 Web 框架）
+tools/
+├── scan_dataset.py       标定前摸清素材：分辨率分布 + 棋盘检出率
+└── verify_outputs.py     校验导出产物（第 9 节）
+```
+
+外部调用统一 `import neuq_vision_calib as core`；命令行与网页调用同一批函数，
+所以两边结果一致。
+
+---
+
+## 13. 限制与注意事项
+
+- **标定精度的上限由数据决定**，不由代码决定。棋盘没覆盖画面边缘时，画面边缘的
+  去畸变不可信，设剔除阈值只会让 RMS 好看（见第 5 节）。
+- **只对地面有效**。离地物体不满足平面假设，俯视图里会畸变。
+- **俯视图远处必然是上采样的**。俯视图里远处的一大片像素来自源图里很窄的一条，
+  信息本来就不在那里。缩小「参考点前方」深度可以改善近场分辨率。
+- **查找表与标定绑定**。重新标定后旧的 `ipm_state.json` / `lookup_table/` 会被判为
+  上一次标定的产物并禁止消费（见第 12 节）。
+- **跨帧一致性需要相机固定**。用相机动过的一组地面照去比较俯视图，差异来自输入，
+  不能用来评价标定。
+
+---
+
+## 坐标与约定速查
+
+- 全程 OpenCV **0-based** 像素坐标。
+- 物理坐标单位 cm，x 向右、y 向下（朝向车辆），俯视图正上方为车辆前进方向。
+- 标定矩形坐标系以矩形中心为原点；逆透视坐标系以第 6 节的参考原点为原点。
+- 单应分解：`H = T(锚点) · S(比例尺) · R(朝向偏移) · T(−参考原点) · H0`。
+- 查找表取值始终是**全分辨率**坐标，即使表本身被降采样；换算见第 8 节。
+- 无效点一律 `-1`（定点格式里是哨兵 `-32768`）。

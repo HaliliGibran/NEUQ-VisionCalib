@@ -101,7 +101,8 @@
 
     <article class="card" id="step-source">
       <div class="card-head"><span class="num">3</span><h3>选择地面标定原图</h3></div>
-      <p class="hint">从 <code>ipm_input/</code> 里挑一张白纸摆位最正、边缘最清楚的。</p>
+      <p class="hint">接下来做<b>逆透视</b>（IPM，把这张透视图变成地面俯视图）。
+        从 <code>ipm_input/</code> 里挑一张白纸摆位最正、边缘最清楚的。</p>
       <div id="candidates" class="thumbs"></div>
       <div id="source-info" class="kv"></div>
       <button id="btn-ipm-gallery" class="ghost" type="button" disabled>查看逆透视成果<span
@@ -174,7 +175,7 @@
     </div>
 
     <article class="card compact">
-      <div class="card-head"><h3>地面逆透视矩形 · 物理尺寸</h3></div>
+      <div class="card-head"><h3>地面标定矩形 · 实际尺寸</h3></div>
       <div class="pair">
         <label>宽 cm <input id="in-phys-w" type="number" step="0.5" min="0.1" value="45"></label>
         <label>高 cm <input id="in-phys-h" type="number" step="0.5" min="0.1" value="45"></label>
