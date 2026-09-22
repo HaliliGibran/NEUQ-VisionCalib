@@ -892,7 +892,7 @@ function fillTableFactors(options) {
     // 结果只修好了"未标定 → 标定"，"已标定 → 清空"反过来会残留：calib.json 已经
     // 没了、options 变空，而下拉框里还挂着「1/4：320×180」，看着像还能选，
     // 实际上工程已经没有标定基础。状态同步必须双向。
-    sel.innerHTML = '<option value="1">标定后可选</option>';
+    sel.innerHTML = '<option value="1">完成相机标定后可选</option>';
     sel.disabled = true;
     return;
   }
@@ -927,30 +927,30 @@ async function runPreview() {
     const data = await api('/api/preview', previewParams());
     state.lastPreview = data;
     await drawPreview(data.birdview);
-    // A2 之后不再有"超出不裁切上限"这档：裁掉目标窗口以外的远处与侧面是故意的。
-    // 唯一值得单独标出来的是 fallback —— 那说明目标窗口在当前几何下装不进画布。
+    // A2 之后不再有"超出不裁切上限"这档：裁掉目标地面范围以外的远处与侧面是故意的。
+    // 唯一值得单独标出来的是兼容布局 —— 那说明目标范围在当前几何下装不进画布。
     const fb = data.layout_mode === 'fallback';
-    setChip(chip, fb ? '目标窗口装不下，已退回旧口径' : '正常', fb ? 'warn' : 'ok');
+    setChip(chip, fb ? '目标范围装不下，已用兼容布局' : '正常', fb ? 'warn' : 'ok');
     kv($('scale-info'), [
-      ['当前 scale', `${data.scale.toFixed(3)} px/cm`],
-      ['目标窗口', `横向 ${data.target_window.width_cm} cm`
+      ['比例尺', `${data.scale.toFixed(3)} px/cm`],
+      ['目标地面范围', `横向 ${data.target_window.width_cm} cm`
         + ` × 参考点前方 ${data.target_window.forward_cm} cm`],
       ['坐标参考原点', `去畸变图 (${data.ground_origin.ground_origin_image_px[0]},`
-        + ` ${data.ground_origin.ground_origin_image_px[1]}) → marker`
-        + ` (${data.ground_origin.ground_origin_marker_cm[0].toFixed(1)},`
+        + ` ${data.ground_origin.ground_origin_image_px[1]})`
+        + ` → 标定矩形坐标系 (${data.ground_origin.ground_origin_marker_cm[0].toFixed(1)},`
         + ` ${data.ground_origin.ground_origin_marker_cm[1].toFixed(1)}) cm`
         + `；不代表摄像头/车辆位置`],
       ['标定矩形', `${($('in-phys-w').value / 1)} × ${($('in-phys-h').value / 1)} cm`
         + ` → ${(data.scale * $('in-phys-w').value).toFixed(0)}`
         + ` × ${(data.scale * $('in-phys-h').value).toFixed(0)} px`],
-      // 诊断项，不是上限。远小于当前 scale 是正常的，说明整幅有效视野比目标窗口大得多。
-      ['整幅视野容纳尺度', `${data.full_fov_fit_scale.toFixed(3)} px/cm（仅诊断）`],
-      ['布局来源', data.layout_mode],
+      // 诊断项，不是上限。远小于当前比例尺是正常的，说明整幅有效视野比目标范围大得多。
+      ['完整有效视野容纳比例', `${data.full_fov_fit_scale.toFixed(3)} px/cm（仅诊断）`],
+      ['布局方式', fb ? '自动布局不可用，已采用兼容布局' : '目标地面范围自动适配'],
     ], '');
     if ($('in-sc-auto').checked && !state.draggingScale) {
       $('in-sc').value = data.scale.toFixed(2);
       $('out-sc').textContent = data.scale.toFixed(2);
-      // 自动布局由服务端同时定 anchor y 与 scale，两个滑块都要跟着回显。
+      // 自动布局由程序同时定纵向锚点与比例尺，两个滑块都要跟着回显。
       // setDofValue 是程序赋值、不派发 input 事件，所以不会触发新一轮预览。
       if (data.recommended) setDofValue('in-ay', data.recommended.anchor_y);
     }
@@ -1017,7 +1017,7 @@ function bindControls() {
   });
   $('in-sc-auto').addEventListener('change', () => schedulePreview());
 
-  // 四项各自一个重置。anchor x / heading 有固定的中性值；anchor y 与 scale 没有——
+  // 四项各自一个重置。横向锚点 / 朝向偏移有固定的中性值；纵向锚点与比例尺没有——
   // 它们的推荐值取决于当前几何，只能向服务端问（/api/preview 的 recommended），
   // 前端只负责采用。以后换推荐算法时这四行不用动。
   $('btn-reset-ax').onclick = () => { setDofValue('in-ax', 0.5); schedulePreview(true); };
@@ -1027,14 +1027,14 @@ function bindControls() {
     if (!rec) return;
     setDofValue('in-ay', rec.anchor_y);
     schedulePreview(true);
-    log(`anchor y 已重置到当前几何下的推荐值 ${rec.anchor_y.toFixed(3)}。`);
+    log(`纵向锚点已重置到当前几何下的推荐值 ${rec.anchor_y.toFixed(3)}。`);
   };
   $('btn-reset-sc').onclick = async () => {
     const rec = await fetchRecommended();
     if (!rec) return;
     setDofValue('in-sc', rec.scale);
     schedulePreview(true);
-    log(`scale 已重置到当前几何下的推荐值 ${rec.scale.toFixed(3)} px/cm。`);
+    log(`比例尺已重置到当前几何下的推荐值 ${rec.scale.toFixed(3)} px/cm。`);
   };
 
   // 滚轮精调：监听器绑在**每个自由度自己那一行**（.slider-row）上，所以只有指针
@@ -1213,7 +1213,7 @@ async function openGallery() {
     label: null,
     leftUrl: it.raw_url,
     rightUrl: it.undistorted_url,
-    thumbNote: it.undistorted_url ? null : '缺去畸变',
+    thumbNote: it.undistorted_url ? null : '未参与本次标定',
   }));
   renderGallery({
     title: '标定去畸变成果',
@@ -1221,11 +1221,14 @@ async function openGallery() {
     emptyText: 'calib_preview/ 还是空的。跑一次「运行标定」就会在这里生成每张标定图的去畸变结果。',
     leftCaption: '原图（带畸变）',
     rightCaption: '去畸变后',
-    rightMissing: '去畸变图缺失',
+    // 右侧没有图**不等于**文件丢了：只有真正参与本次标定的照片才会生成去畸变结果。
+    // 被"剔除重投影误差超过…"剔掉的、或者没检出棋盘的，本来就没有，说成"缺失"是误导。
+    rightMissing: '未参与本次标定（已剔除或未检出棋盘），没有去畸变结果',
   });
   log(`打开成果图画廊：${items.length} 组对照，`
     + `其中 ${data.paired} 组两侧齐全`
-    + `（缺原图 ${data.missing_raw}，缺去畸变 ${data.missing_undistorted}）。`);
+    + `（原图已不在 calib_input/：${data.missing_raw} 张；`
+    + `未参与本次标定：${data.missing_undistorted} 张）。`);
 }
 
 // 成果记录里的角色 → 界面上的说法。第一项是真正参与四点标定的那张基准图，
@@ -1250,12 +1253,12 @@ async function openIpmGallery() {
     thumbNote: IPM_ROLE_LABEL[it.role] || it.role,
   }));
   renderGallery({
-    title: '逆透视成果（原图 ↔ BirdView）',
+    title: '逆透视成果（原图 ↔ 俯视图）',
     items,
     emptyText: '暂无成果，先完成导出。',
     leftCaption: '原图（带畸变）',
-    rightCaption: 'BirdView（逆透视）',
-    rightMissing: 'BirdView 缺失',
+    rightCaption: '俯视图（逆透视）',
+    rightMissing: '这一张没有生成俯视图',
   });
   const cal = raw.filter((it) => it.role === 'calibration').length;
   const test = raw.filter((it) => it.role === 'test').length;
@@ -1544,7 +1547,7 @@ function bindActions() {
   $('btn-commit').onclick = () => withBusy($('btn-commit'), async () => {
     if (!state.quad) { log('请先选择一张原图并调整四点。', 'err'); return; }
     if (state.lastPreview && state.lastPreview.layout_mode === 'fallback') {
-      log('警告: 目标地面窗口在当前几何下装不进输出图，已退回旧的固定-anchor 口径。', 'err');
+      log('警告: 目标地面范围在当前几何下装不进俯视图，已采用兼容布局。', 'err');
     }
     try {
       const opts = tableOptions();
@@ -1670,7 +1673,7 @@ function bindActions() {
     // 变了之后，那套四点是在**另一张去畸变图**上点的，照原样贴回来会悄悄错位。
     if (st.ipm_state && st.ipm_basis_stale) {
       log('警告: ' + st.ipm_basis_stale, 'err');
-      log('已跳过恢复上次的四点 / anchor / scale，请重新确认逆透视标定。', 'err');
+      log('已跳过恢复上次的四点 / 锚点 / 比例尺，请重新确认逆透视标定。', 'err');
     }
     const saved = (st.ipm_basis_stale ? null : st.ipm_state) || null;
     const savedName = saved && saved.src_image

@@ -110,16 +110,16 @@
 
     <article class="card" id="step-export">
       <div class="card-head"><span class="num">4</span><h3>导出</h3></div>
-      <p class="hint">落盘六矩阵、两套查找表（正/反向），并跑一遍批量测试。</p>
+      <p class="hint">落盘六个矩阵、两套查找表（正向映射 / 反向映射），并跑一遍批量测试。</p>
       <div class="pair">
         <label>表格式
           <select id="in-table-format">
-            <option value="txt">txt 文本</option>
-            <option value="bin">bin 定点二进制</option>
-            <option value="c">c 头文件</option>
+            <option value="txt">文本表（txt）</option>
+            <option value="bin">二进制定点表（bin）</option>
+            <option value="c">C 头文件（.h）</option>
           </select>
         </label>
-        <label>定点位 <input id="in-table-fp" type="number" min="0" max="15" value="4"></label>
+        <label>定点小数位（Q） <input id="in-table-fp" type="number" min="0" max="15" value="4"></label>
       </div>
       <div class="pair">
         <label>降采样倍率
@@ -127,11 +127,11 @@
         </label>
       </div>
       <p class="hint">只允许<b>整数倍等比</b>降采样。<code>320×240</code> 这类组合是非法的：
-        它让 x 缩 4 倍、y 缩 3 倍，16:9 的 BirdView 被压成 4:3，物理上 45×45 cm 的正方形
-        会变成宽高比 0.75 的竖长矩形，C 端拿它算角度、曲率、横向误差全部失真。</p>
+        它让横向缩 4 倍、纵向缩 3 倍，16:9 的俯视图被压成 4:3，地面上 45×45 cm 的正方形
+        会变成宽高比 0.75 的竖长矩形，嵌入式端拿它算角度、曲率、横向偏差全部失真。</p>
       <p class="hint">全尺寸文本表在 720p 下约 56 MB，单片机放不下。
-        <code>bin</code> + <code>4×（320×180）</code> 约 0.9 MB，是能上车的量级。
-        等比之后 C 端只需一个倍率 n：<code>full = (small + 0.5) × n − 0.5</code>。</p>
+        <code>二进制定点表</code> + <code>4×（320×180）</code> 约 0.9 MB，是能上车的量级。
+        等比之后嵌入式端只需一个倍率 n：<code>full = (small + 0.5) × n − 0.5</code>。</p>
       <button id="btn-commit" class="primary">导出矩阵与查找表</button>
       <button id="btn-batch" class="ghost">只重跑批量测试</button>
     </article>
@@ -166,7 +166,7 @@
 
   <section class="col col-right">
     <div class="canvas-head">
-      <h2>BirdView 预览</h2>
+      <h2>俯视图预览（BirdView）</h2>
       <span id="preview-state" class="chip sm">待预览</span>
     </div>
     <div class="canvas-wrap small" id="preview-wrap">
@@ -179,46 +179,46 @@
         <label>宽 cm <input id="in-phys-w" type="number" step="0.5" min="0.1" value="45"></label>
         <label>高 cm <input id="in-phys-h" type="number" step="0.5" min="0.1" value="45"></label>
       </div>
-      <p class="hint">必须实测。这一项直接决定 px/cm 与车上距离测量的正确性。</p>
+      <p class="hint">必须实测。这一项直接决定比例尺（px/cm）与车上距离测量的正确性。</p>
       <p class="hint">量的是地面上那个矩形（四点框住的那一块）的外框边长，
         与第 0 步「相机标定板规格」的棋盘格内角点数、方格边长是两回事，不要互相照抄。</p>
     </article>
 
     <article class="card compact">
-      <div class="card-head"><h3>目标地面窗口 · BirdView 要看多大一块地</h3></div>
+      <div class="card-head"><h3>目标地面范围 · 俯视图要看多大一块地</h3></div>
       <div class="pair">
         <label>横向宽 cm <input id="in-target-w" type="number" step="5" min="1" value="150"></label>
         <label>参考点前方 cm <input id="in-target-f" type="number" step="5" min="1" value="150"></label>
       </div>
-      <p class="hint">这是<b>构图目标</b>：以<b>坐标参考原点</b>为原点，
-        横向 ±(横向宽/2)、向前「参考点前方」这么一块地。自动布局把它完整装进输出图并贴住底边。</p>
+      <p class="hint">以<b>坐标参考原点</b>为原点，横向 ±(横向宽/2)、向前「参考点前方」这么一块地。
+        自动布局会把它完整装进俯视图并贴住底边。</p>
       <p class="hint"><b>坐标参考原点 = 去畸变图底边中点对应的那个地面点</b>（预览图里的橙色十字）。
         它只是人为选定的逆透视坐标参考点，<b>不代表摄像头位置、不代表车辆几何中心、也不代表保险杠位置</b>——
         源图底边中点对应的是「光心出发穿过该像素的视线与地面的交点」，通常在车前一小段距离处；
         光心本身没有有限的像素坐标。所以这里写「参考点前方」而不是「车前」。</p>
-      <p class="hint">窗口超出相机实际可见范围的部分留黑（无效），不会为了填满而把远场拉成放射状。</p>
+      <p class="hint">超出相机实际可见范围的部分留黑（无效），不会为了填满而把远处拉成放射状。</p>
     </article>
 
     <article class="card compact">
       <div class="card-head"><h3>四个自由度</h3></div>
       <div class="slider-row">
-        <label class="slider" for="in-ax">anchor x <output id="out-ax">0.500</output></label>
+        <label class="slider" for="in-ax">横向锚点 <output id="out-ax">0.500</output></label>
         <div class="slider-line">
           <input id="in-ax" type="range" min="0" max="1" step="0.001" value="0.5">
           <button id="btn-reset-ax" class="ghost sm" type="button"
-                  title="重置到 0.500（输出图横向居中）">重置</button>
+                  title="重置到 0.500（俯视图横向居中）">重置</button>
         </div>
       </div>
       <div class="slider-row">
-        <label class="slider" for="in-ay">anchor y <output id="out-ay">0.708</output></label>
+        <label class="slider" for="in-ay">纵向锚点 <output id="out-ay">0.708</output></label>
         <div class="slider-line">
           <input id="in-ay" type="range" min="0" max="1" step="0.001" value="0.708">
           <button id="btn-reset-ay" class="ghost sm" type="button"
-                  title="重置到服务端按当前几何给出的推荐值">重置</button>
+                  title="重置到程序按当前几何给出的推荐值">重置</button>
         </div>
       </div>
       <div class="slider-row">
-        <label class="slider" for="in-hd">heading ° <output id="out-hd">0.0</output></label>
+        <label class="slider" for="in-hd">朝向偏移 ° <output id="out-hd">0.0</output></label>
         <div class="slider-line">
           <input id="in-hd" type="range" min="-180" max="180" step="0.1" value="0">
           <button id="btn-reset-hd" class="ghost sm" type="button"
@@ -226,16 +226,16 @@
         </div>
       </div>
       <div class="slider-row">
-        <label class="slider" for="in-sc">scale px/cm <output id="out-sc">自动</output></label>
+        <label class="slider" for="in-sc">比例尺 px/cm <output id="out-sc">自动</output></label>
         <div class="slider-line">
           <input id="in-sc" type="range" min="0.05" max="20" step="0.01" value="1">
           <button id="btn-reset-sc" class="ghost sm" type="button"
-                  title="重置到服务端按当前几何给出的推荐值">重置</button>
+                  title="重置到程序按当前几何给出的推荐值">重置</button>
         </div>
       </div>
-      <label class="row"><input id="in-sc-auto" type="checkbox" checked> 自动布局：目标窗口贴底 + 最大装入</label>
+      <label class="row"><input id="in-sc-auto" type="checkbox" checked> 自动布局：近场贴底并最大化利用画布</label>
       <p class="hint">鼠标悬停或聚焦某一项时：<kbd>←</kbd>/<kbd>→</kbd> 与滚轮走一小步，
-        按住 <kbd>Shift</kbd> 变 10 倍。手动改 anchor y 或 scale 会自动退出上面的自动布局。</p>
+        按住 <kbd>Shift</kbd> 变 10 倍。手动改纵向锚点或比例尺会自动退出上面的自动布局。</p>
       <div id="scale-info" class="kv"></div>
     </article>
   </section>
@@ -263,12 +263,12 @@
         <div class="viewer-stage">
           <figure class="viewer-pane">
             <img id="viewer-source" alt="原图">
-            <p id="viewer-source-missing" class="pane-missing" hidden>原图缺失</p>
+            <p id="viewer-source-missing" class="pane-missing" hidden>原图已不在 calib_input/</p>
             <figcaption id="viewer-source-caption">原图（带畸变）</figcaption>
           </figure>
           <figure class="viewer-pane">
             <img id="viewer-preview" alt="处理结果">
-            <p id="viewer-preview-missing" class="pane-missing" hidden>去畸变图缺失</p>
+            <p id="viewer-preview-missing" class="pane-missing" hidden>未参与本次标定，没有去畸变结果</p>
             <figcaption id="viewer-preview-caption">去畸变后</figcaption>
           </figure>
         </div>

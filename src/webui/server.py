@@ -1216,10 +1216,13 @@ def api_commit(body: dict) -> dict:
     batch = {'ok': False, 'generated': 0, 'error': None}
     with redirect_stdout(buf):
         origin = core.ground_origin_meta(cal)
-        print(f'目标地面窗口 {cal.target_width_cm:g} x {cal.target_forward_cm:g} cm'
-              f'，scale={cal.scale:.3f} px/cm，布局 {cal.layout_mode}')
+        layout = ('目标地面范围自动适配' if cal.layout_mode == 'target_window'
+                  else ('自动布局不可用，已采用兼容布局'
+                        if cal.layout_mode == 'fallback' else '手动指定比例尺'))
+        print(f'目标地面范围 {cal.target_width_cm:g} x {cal.target_forward_cm:g} cm'
+              f'，比例尺 {cal.scale:.3f} px/cm，布局方式：{layout}')
         print('坐标参考原点 = 去畸变图底边中点对应的地面点 '
-              f"{origin['ground_origin_marker_cm']} cm（marker frame）；"
+              f"{origin['ground_origin_marker_cm']} cm（标定矩形坐标系）；"
               '仅用于定义逆透视坐标，不代表摄像头或车辆实际位置')
 
         # 状态文件与结果图都不单独保存，随 export_all 的事务一起提交，

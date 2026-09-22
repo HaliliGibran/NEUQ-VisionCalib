@@ -772,12 +772,13 @@ def calibration_basis_stale(recorded: Optional[str]) -> Optional[str]:
     """
     current = current_calibration_basis()
     if current is None:
-        return '读不出当前标定数据，无法确认产物属于哪一版标定'
+        return '读不出当前的相机标定数据，无法确认这份产物属于哪一次标定'
     if not recorded:
-        return '产物里没有记录标定基准指纹（CAL2 之前导出的），无法证明它属于当前标定'
+        return ('这份产物没有记录它对应的相机标定（早期版本导出的），'
+                '无法确认它属于当前标定')
     if recorded != current:
-        return (f'产物属于另一版标定（记录 {recorded[:12]}…，当前 {current[:12]}…）：'
-                'K/D/Knew 或标定分辨率已经变了')
+        return ('相机标定已变化，这份产物属于上一次标定'
+                f'（产物记 {recorded[:12]}…，当前 {current[:12]}…）')
     return None
 
 
@@ -1292,7 +1293,7 @@ class IpmCalibrator:
             print('  坐标参考原点 = 去畸变图底边中点对应的地面点；'
                   '它只用于定义逆透视坐标，不代表摄像头或车辆实际位置')
             print('  拖动红色端点调整四条线 -> 交点即地平面几何约束')
-            print('  trackbar: anchor_x/anchor_y 位置, heading 转角, scale 物理->像素尺度')
+            print('  滑杆: 横向锚点 / 纵向锚点（位置）, 朝向偏移（转角）, 比例尺（cm -> 像素）')
             print('  f = 回到目标窗口自动布局, r = 复位四条线, q = 保存退出')
 
             while True:
