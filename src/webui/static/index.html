@@ -25,7 +25,7 @@
     <h2>流程</h2>
 
     <article class="card" id="step-board">
-      <div class="card-head"><span class="num">0</span><h3>标定板规格</h3></div>
+      <div class="card-head"><span class="num">0</span><h3>相机标定板规格</h3></div>
       <p class="hint">填你手上那块棋盘的<strong>方格数</strong>（数格子），不是内角点数——
         程序会自动换算成 OpenCV 需要的角点数。导入素材时靠它判断"这张是棋盘照还是地面照"，
         所以必须在导入<strong>之前</strong>设对。</p>
@@ -167,25 +167,53 @@
     </div>
 
     <article class="card compact">
-      <div class="card-head"><h3>标定矩形物理尺寸</h3></div>
+      <div class="card-head"><h3>地面逆透视矩形 · 物理尺寸</h3></div>
       <div class="pair">
-        <label>宽 cm <input id="in-phys-w" type="number" step="0.5" min="0.1" value="200"></label>
-        <label>高 cm <input id="in-phys-h" type="number" step="0.5" min="0.1" value="150"></label>
+        <label>宽 cm <input id="in-phys-w" type="number" step="0.5" min="0.1" value="45"></label>
+        <label>高 cm <input id="in-phys-h" type="number" step="0.5" min="0.1" value="45"></label>
       </div>
       <p class="hint">必须实测。这一项直接决定 px/cm 与车上距离测量的正确性。</p>
+      <p class="hint">量的是地面上那个矩形（四点框住的那一块）的外框边长，
+        与第 0 步「相机标定板规格」的棋盘格内角点数、方格边长是两回事，不要互相照抄。</p>
     </article>
 
     <article class="card compact">
-      <div class="card-head"><h3>三个自由度</h3></div>
-      <label class="slider">anchor x <output id="out-ax">0.500</output>
-        <input id="in-ax" type="range" min="0" max="1" step="0.001" value="0.5"></label>
-      <label class="slider">anchor y <output id="out-ay">0.708</output>
-        <input id="in-ay" type="range" min="0" max="1" step="0.001" value="0.708"></label>
-      <label class="slider">heading ° <output id="out-hd">0.0</output>
-        <input id="in-hd" type="range" min="-180" max="180" step="0.1" value="0"></label>
-      <label class="slider">scale px/cm <output id="out-sc">自动</output>
-        <input id="in-sc" type="range" min="0.05" max="20" step="0.01" value="1"></label>
+      <div class="card-head"><h3>四个自由度</h3></div>
+      <div class="slider-row">
+        <label class="slider" for="in-ax">anchor x <output id="out-ax">0.500</output></label>
+        <div class="slider-line">
+          <input id="in-ax" type="range" min="0" max="1" step="0.001" value="0.5">
+          <button id="btn-reset-ax" class="ghost sm" type="button"
+                  title="重置到 0.500（输出图横向居中）">重置</button>
+        </div>
+      </div>
+      <div class="slider-row">
+        <label class="slider" for="in-ay">anchor y <output id="out-ay">0.708</output></label>
+        <div class="slider-line">
+          <input id="in-ay" type="range" min="0" max="1" step="0.001" value="0.708">
+          <button id="btn-reset-ay" class="ghost sm" type="button"
+                  title="重置到服务端按当前几何给出的推荐值">重置</button>
+        </div>
+      </div>
+      <div class="slider-row">
+        <label class="slider" for="in-hd">heading ° <output id="out-hd">0.0</output></label>
+        <div class="slider-line">
+          <input id="in-hd" type="range" min="-180" max="180" step="0.1" value="0">
+          <button id="btn-reset-hd" class="ghost sm" type="button"
+                  title="重置到 0.0°">重置</button>
+        </div>
+      </div>
+      <div class="slider-row">
+        <label class="slider" for="in-sc">scale px/cm <output id="out-sc">自动</output></label>
+        <div class="slider-line">
+          <input id="in-sc" type="range" min="0.05" max="20" step="0.01" value="1">
+          <button id="btn-reset-sc" class="ghost sm" type="button"
+                  title="重置到服务端按当前几何给出的推荐值">重置</button>
+        </div>
+      </div>
       <label class="row"><input id="in-sc-auto" type="checkbox" checked> scale 自动吸附到不裁切上限</label>
+      <p class="hint">鼠标悬停或聚焦某一项时：<kbd>←</kbd>/<kbd>→</kbd> 与滚轮走一小步，
+        按住 <kbd>Shift</kbd> 变 10 倍。手动改 anchor y 或 scale 会自动退出上面的自动吸附。</p>
       <div id="scale-info" class="kv"></div>
     </article>
   </section>

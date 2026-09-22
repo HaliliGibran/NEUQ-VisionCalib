@@ -15,6 +15,8 @@
   C. 备份目录跟着 --root 现取（不能停在 import 时抄下来的旧根）
   D. /api/preview_gallery 的配对由服务端按真实文件给出，缺哪一侧就是 null，
      且绝不把别的照片的图串到空出来的那一侧
+  E. 物理尺寸初值的优先级（已保存的 ipm_state > 新默认 45x45），以及 /api/preview
+     回包里的"推荐值"——重置按钮靠它做成间接层，前端不抄常量
 """
 from __future__ import annotations
 
@@ -260,6 +262,55 @@ def main() -> int:
         check(g3['count'] == 3 and g3['missing_raw'] == 1 and c['raw_url'] is None
               and rel_of(c['undistorted_url']) == 'calib_preview/shot_c_undist.jpg',
               '缺原图时该组仍在列，只是原图侧为空', str(c))
+
+        # ---- E. 物理尺寸的初值与"推荐值"这个间接层
+        # 默认值统一成 45x45 之后最危险的回归是"新默认把用户上次实测的尺寸顶掉"，
+        # 所以这条优先级要有断言钉住；推荐值则必须由服务端给，前端不许抄常量。
+        print('\n[E] 物理尺寸初值的优先级与 /api/preview 的推荐值')
+        check((core.PHYS_W_CM, core.PHYS_H_CM) == (45.0, 45.0),
+              'Python 侧 fallback 就是 45x45（网页与 CLI/API 同一组默认值）',
+              f'{core.PHYS_W_CM} x {core.PHYS_H_CM}')
+
+        core.configure_paths(root=tmp / 'phys_root')
+        check(server.initial_phys_size() == (45.0, 45.0),
+              '没有 ipm_state 时用默认值', str(server.initial_phys_size()))
+        hist = core.ipm_state_path()
+        hist.parent.mkdir(parents=True, exist_ok=True)
+        hist.write_text(json.dumps({'schema_version': 1, 'phys_w_cm': 33.0,
+                                    'phys_h_cm': 22.0}), encoding='utf-8')
+        check(server.initial_phys_size() == (33.0, 22.0),
+              '有 ipm_state 时历史尺寸优先，新默认不得覆盖',
+              str(server.initial_phys_size()))
+        check(server.api_status()['phys_init'] == {'w': 33.0, 'h': 22.0},
+              '/api/status 把这份初值直接交给前端（页面不再自己判优先级）',
+              str(server.api_status()['phys_init']))
+        hist.write_text(json.dumps({'schema_version': 1, 'phys_w_cm': 0,
+                                    'phys_h_cm': 22.0}), encoding='utf-8')
+        check(server.initial_phys_size() == (45.0, 45.0),
+              '历史里是非正数（脏数据）时退回默认，不把 0 当尺寸用',
+              str(server.initial_phys_size()))
+
+        # 推荐值：服务端算、随预览一起回，且与 recompute() 里 scale 的初值同一口径
+        old_undist = server.STATE['src_undist']
+        server.STATE['src_undist'] = np.full((240, 320, 3), 128, np.uint8)
+        try:
+            pv = server.api_preview({
+                'quad': [[90, 80], [230, 80], [30, 200], [290, 200]],
+                'phys_w': 45.0, 'phys_h': 45.0})
+        finally:
+            server.STATE['src_undist'] = old_undist
+        rec = pv.get('recommended')
+        check(isinstance(rec, dict) and sorted(rec) == ['anchor_y', 'scale'],
+              '/api/preview 回包里有 recommended{anchor_y, scale}', str(rec))
+        check(rec['anchor_y'] == core.ANCHOR_Y,
+              '推荐的 anchor_y 来自服务端（今天就是 ANCHOR_Y）',
+              f"{rec['anchor_y']} vs {core.ANCHOR_Y}")
+        expect = max(core.MIN_SCALE, pv['max_scale'] * core.INIT_SCALE_RATIO)
+        check(abs(rec['scale'] - expect) < 1e-9,
+              '推荐的 scale = max_scale x INIT_SCALE_RATIO（与 recompute() 同口径）',
+              f"{rec['scale']:.6f} vs {expect:.6f}")
+        check(abs(pv['scale'] - rec['scale']) < 1e-9,
+              '未指定 scale 时预览用的就是推荐值', f"{pv['scale']:.6f}")
     finally:
         core.configure_paths(root=old_root)
         core.configure_board(old_board)

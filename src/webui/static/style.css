@@ -224,6 +224,14 @@ input[type="range"] {
   float: right; font-family: var(--mono); font-size: 11px; color: var(--accent-2);
 }
 
+/* 一个自由度一行：名字与读数在上，滑块与它自己的「重置」并排在下。
+   悬停判定与滚轮拦截都挂在 .slider-row 上，所以这一行的边界就是
+   "滚轮归控件、不归页面"的边界。 */
+.slider-row { margin-bottom: 2px; }
+.slider-line { display: flex; align-items: center; gap: 6px; }
+.slider-line input[type="range"] { flex: 1 1 auto; min-width: 0; }
+.slider-line button { flex: 0 0 auto; margin-bottom: 6px; }
+
 button {
   font: inherit; font-size: 12px; padding: 6px 12px; border-radius: 8px;
   border: 1px solid var(--border-2); background: var(--panel); color: var(--text);

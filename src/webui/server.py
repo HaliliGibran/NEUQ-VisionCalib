@@ -194,7 +194,29 @@ def guess_quad(img: np.ndarray) -> list:
 
 # ---------------------------------------------------------------- 各接口实现
 
+def initial_phys_size() -> tuple[float, float]:
+    """网页上「物理尺寸」两个输入框的初值：已保存的 ipm_state 优先于默认值。
+
+    优先级只在这里判一次。若让前端自己"有历史就用历史、否则用 HTML 里的 value"，
+    默认值一改（30 → 45）就会出现两套语义：Python 侧 fallback 与页面上的 value
+    各说一套，而用户上次实测的 45×45 还可能被新默认顶掉。
+
+    ipm_state 里的尺寸是上一次真的量过、并且已经出表的那一组，只要它是正数就采信；
+    读不出数或不是正数才退回模块默认（core.PHYS_W_CM / PHYS_H_CM）。
+    """
+    state = core.load_ipm_state() or {}
+    try:
+        w = float(state['phys_w_cm'])
+        h = float(state['phys_h_cm'])
+    except (KeyError, TypeError, ValueError):
+        return core.PHYS_W_CM, core.PHYS_H_CM
+    if w <= 0 or h <= 0:
+        return core.PHYS_W_CM, core.PHYS_H_CM
+    return w, h
+
+
 def api_status() -> dict:
+
     """工程现状：目录清单、标定摘要、逆透视状态、可选原图。"""
     rows = (
         ('calib_input', core.DIR_CALIB_IN, '相机标定照片'),
@@ -249,6 +271,9 @@ def api_status() -> dict:
         for name in ('undistort', 'undistort_ipm')
         for direction in ('forward', 'reverse'))
 
+    phys_w, phys_h = initial_phys_size()
+
+
     # 报告上次导出用的表格式，让"交付给 C 端的到底是什么"一眼可见
     last_table = None
     if core.MATRIX_JSON.is_file():
@@ -277,6 +302,9 @@ def api_status() -> dict:
         'material_transaction': core.material_transaction_state(),
 
         'ipm_state': core.load_ipm_state(),
+        # 物理尺寸初值：优先级（历史 > 默认）在服务端判完再给前端，页面直接照填
+        'phys_init': {'w': phys_w, 'h': phys_h},
+
         'ipm_candidates': [p.name for p in core.list_images(core.DIR_IPM_IN)],
         'ipm_source': safe_rel(STATE['src_path']) if STATE['src_path'] else None,
         'tables_ready': tables_ready,
@@ -819,7 +847,24 @@ def _preview_inputs(body: dict):
     }
 
 
+def recommended_layout(cal) -> dict:
+    """当前几何下的"自动推荐值"：anchor_y 与 scale 各一个。
+
+    存在的理由是给界面上的「重置」一个**间接**入口：前端只管"问一次、采用",
+    绝不把 0.708 / max_scale x 0.8 这类常量抄进 JS。推荐算法以后换（anchor_y 与
+    scale 联动求解）时只改这一个函数，接线一行都不用动。
+
+    今天的口径与 IpmCalibrator.recompute() 里 scale 的初值完全一致：
+    anchor_y 取模块默认 ANCHOR_Y，scale 取不裁切上限的 INIT_SCALE_RATIO 倍
+    （上限为 0 时退回 1.0，与那边的分支相同）。
+    """
+    scale = (max(core.MIN_SCALE, cal.max_scale * core.INIT_SCALE_RATIO)
+             if cal.max_scale > 0 else 1.0)
+    return {'anchor_y': float(core.ANCHOR_Y), 'scale': float(scale)}
+
+
 def api_preview(body: dict) -> dict:
+
     """实时预览：按当前四点与三自由度算 H，返回 BirdView 与标定矩形位置。"""
     p = _preview_inputs(body)
     cal = make_calibrator(p['quad'], p['phys_w'], p['phys_h'],
@@ -840,6 +885,8 @@ def api_preview(body: dict) -> dict:
         'birdview': encode_jpeg(view, quality=85),
         'scale': float(cal.scale),
         'max_scale': float(cal.max_scale),
+        'recommended': recommended_layout(cal),
+
         'over_crop': bool(cal.is_over_crop()),
         'horizon_sign': float(cal.sign),
         'rect': [[float(v) for v in pt] for pt in rect],

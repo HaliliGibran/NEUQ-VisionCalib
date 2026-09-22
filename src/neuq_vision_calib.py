@@ -197,9 +197,13 @@ CAPTURE_SIZE = None
 # 传 0.0~1.0 则用 getOptimalNewCameraMatrix，0 裁掉全部黑边、1 保留全部像素。
 UNDIST_ALPHA = None
 
-# 标定矩形的真实物理尺寸（cm）。运行时可交互覆盖。
-PHYS_W_CM = 30.0
-PHYS_H_CM = 30.0
+# 地面逆透视标定矩形的真实物理尺寸（cm）。运行时可交互覆盖。
+# 注意这与"相机标定板规格"（棋盘格内角点数 + 方格边长，见 CheckerboardSpec）
+# 是两件不同的事：这里量的是地面上那个矩形的外框边长。
+# 网页、命令行、API 三个入口共用这一组 fallback —— 各自写一份默认值的话，
+# 同一次标定从不同入口进去会得到不同的 px/cm。
+PHYS_W_CM = 45.0
+PHYS_H_CM = 45.0
 
 # 目标 ROI 三自由度初值
 ANCHOR_X = 0.5      # 归一化，ROI 中心在输出图的横向位置

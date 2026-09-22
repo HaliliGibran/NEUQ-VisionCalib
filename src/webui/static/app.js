@@ -15,6 +15,7 @@ const state = {
   previewTimer: null,
   previewing: false,
   draggingScale: false,
+  hoverDof: null,     // 鼠标正悬停在哪个自由度那一行（键盘微调的目标之一）
   lastPreview: null,
   fit: null,          // 最近一次标定的逐帧数据，给柱状图用
 };
@@ -777,6 +778,75 @@ function clearLoupe() {
 
 // ---------------------------------------------------------------- 预览
 
+/** 四个自由度的元数据。
+
+    step 是"一小步"的基础步长，键盘 ← / → 与滚轮一格都按它走，Shift 变 10 倍。
+    它必须与 index.html 里对应 slider 的 step 属性一致，否则键盘调一下会跳一大格
+    （浏览器会把不合 step 的值再吸附回去）。digits 只用于回显与取整。
+ */
+const DOF = {
+  'in-ax': { out: 'out-ax', digits: 3, step: 0.001 },
+  'in-ay': { out: 'out-ay', digits: 3, step: 0.001 },
+  'in-hd': { out: 'out-hd', digits: 1, step: 0.1 },
+  'in-sc': { out: 'out-sc', digits: 2, step: 0.01 },
+};
+
+// 用数组判"这个 id 是不是四个自由度之一"：直接 DOF[id] 会命中 Object 原型上的成员
+const DOF_IDS = Object.keys(DOF);
+
+/** 写入某个自由度的值：夹到 slider 的 min/max，按位数取整并刷新读数。 */
+function setDofValue(id, value) {
+  const el = $(id);
+  const meta = DOF[id];
+  const lo = parseFloat(el.min);
+  const hi = parseFloat(el.max);
+  const v = Math.min(hi, Math.max(lo, value));
+  el.value = v.toFixed(meta.digits);
+  $(meta.out).textContent = parseFloat(el.value).toFixed(meta.digits);
+  return parseFloat(el.value);
+}
+
+/** 人手动改了某个自由度之后的统一收尾（拖滑块 / 键盘 / 滚轮共用）。
+
+    anchor y 与 scale 一经手动就退出「自动吸附」：那个模式的含义是"这两项由
+    服务端的推荐值定"，用户既然自己动了手，就不该在下一次预览回包时被覆盖回去。
+ */
+function afterManualDof(id) {
+  if ((id === 'in-ay' || id === 'in-sc') && $('in-sc-auto').checked) {
+    $('in-sc-auto').checked = false;
+  }
+  schedulePreview();
+}
+
+/** 键盘 / 滚轮的一步微调。dir 为 +1/-1，fast 表示按住了 Shift（10 倍）。 */
+function nudgeDof(id, dir, fast) {
+  const meta = DOF[id];
+  const cur = parseFloat($(id).value);
+  if (!isFinite(cur)) return;
+  setDofValue(id, cur + dir * meta.step * (fast ? 10 : 1));
+  afterManualDof(id);
+}
+
+/** 向服务端问一次"当前几何下的推荐值"；问不到返回 null（绝不在前端猜常量）。
+
+    推荐值是 /api/preview 回包里的 recommended 字段，由服务端算。重置按钮走这条
+    路而不是写死 0.708 / 1.0，是为了以后换推荐算法时这里一行都不用改。
+ */
+async function fetchRecommended() {
+  if (!state.img || !state.quad) {
+    log('还没有原图或四点，取不到推荐值。', 'err');
+    return null;
+  }
+  try {
+    const data = await api('/api/preview', previewParams());
+    state.lastPreview = data;
+    return data.recommended || null;
+  } catch (err) {
+    log('取推荐值失败: ' + err.message, 'err');
+    return null;
+  }
+}
+
 function previewParams() {
   return {
     quad: state.quad,
@@ -879,23 +949,77 @@ function bindControls() {
     drawErrorChart(state.fit, currentThreshold());
   });
 
-  [['in-ax', 'out-ax', 3], ['in-ay', 'out-ay', 3], ['in-hd', 'out-hd', 1]]
-    .forEach(([sid, oid, digits]) => {
-      $(sid).addEventListener('input', () => {
-        $(oid).textContent = parseFloat($(sid).value).toFixed(digits);
-        schedulePreview();
-      });
+  ['in-ax', 'in-ay', 'in-hd'].forEach((id) => {
+    $(id).addEventListener('input', () => {
+      $(DOF[id].out).textContent = parseFloat($(id).value).toFixed(DOF[id].digits);
+      afterManualDof(id);
     });
+  });
 
   const sc = $('in-sc');
   sc.addEventListener('pointerdown', () => { state.draggingScale = true; });
   window.addEventListener('pointerup', () => { state.draggingScale = false; });
   sc.addEventListener('input', () => {
     $('out-sc').textContent = parseFloat(sc.value).toFixed(2);
-    if ($('in-sc-auto').checked) $('in-sc-auto').checked = false;
-    schedulePreview();
+    afterManualDof('in-sc');
   });
   $('in-sc-auto').addEventListener('change', () => schedulePreview());
+
+  // 四项各自一个重置。anchor x / heading 有固定的中性值；anchor y 与 scale 没有——
+  // 它们的推荐值取决于当前几何，只能向服务端问（/api/preview 的 recommended），
+  // 前端只负责采用。以后换推荐算法时这四行不用动。
+  $('btn-reset-ax').onclick = () => { setDofValue('in-ax', 0.5); schedulePreview(true); };
+  $('btn-reset-hd').onclick = () => { setDofValue('in-hd', 0); schedulePreview(true); };
+  $('btn-reset-ay').onclick = async () => {
+    const rec = await fetchRecommended();
+    if (!rec) return;
+    setDofValue('in-ay', rec.anchor_y);
+    schedulePreview(true);
+    log(`anchor y 已重置到当前几何下的推荐值 ${rec.anchor_y.toFixed(3)}。`);
+  };
+  $('btn-reset-sc').onclick = async () => {
+    const rec = await fetchRecommended();
+    if (!rec) return;
+    setDofValue('in-sc', rec.scale);
+    schedulePreview(true);
+    log(`scale 已重置到当前几何下的推荐值 ${rec.scale.toFixed(3)} px/cm。`);
+  };
+
+  // 滚轮精调：监听器绑在**每个自由度自己那一行**（.slider-row）上，所以只有指针
+  // 真的落在这一行里才会触发，preventDefault 也只发生在这里——页面其它任何地方
+  // （包括这张卡片的标题与提示文字）照常滚动。
+  DOF_IDS.forEach((id) => {
+    const row = $(id).closest('.slider-row');
+    row.addEventListener('mouseenter', () => { state.hoverDof = id; });
+    row.addEventListener('mouseleave', () => {
+      if (state.hoverDof === id) state.hoverDof = null;
+    });
+    row.addEventListener('wheel', (e) => {
+      if (!e.deltaY) return;        // 横向滚动不拦，交回页面
+      e.preventDefault();
+      nudgeDof(id, e.deltaY < 0 ? 1 : -1, e.shiftKey);
+    }, { passive: false });
+  });
+
+  // 键盘精调：hover 的那一项优先，其次是焦点所在的那一项。
+  // 走捕获阶段并在真的处理了按键时 stopPropagation，是为了不让 bindCanvas 里那个
+  // window 级方向键监听同时去挪四点——它只按 e.target 判 INPUT，而"悬停但没聚焦"
+  // 时 target 是 body，判不出来。
+  document.addEventListener('keydown', (e) => {
+    const dir = { ArrowLeft: -1, ArrowRight: 1 }[e.key];
+    if (!dir || !$('gallery').hidden) return;
+    const active = document.activeElement;
+    const focused = (active && DOF_IDS.includes(active.id)) ? active.id : null;
+    // 焦点在别的输入框/下拉里时，方向键归它用（移光标、改数字），不抢
+    const typing = active && (active.tagName === 'SELECT'
+      || (active.tagName === 'INPUT' && ['text', 'number'].includes(active.type)));
+    if (!focused && typing) return;
+    const id = state.hoverDof || focused;
+    if (!id) return;
+    e.preventDefault();      // 连原生 range 的一格步进一起吃掉，否则会走两步
+    e.stopPropagation();
+    nudgeDof(id, dir, e.shiftKey);
+  }, true);
 
   $('btn-zoom-fit').onclick = () => { fitView(); drawSource(); };
   $('btn-zoom-100').onclick = () => {
@@ -1405,6 +1529,14 @@ function bindActions() {
     const savedName = saved && saved.src_image
       ? saved.src_image.split(/[\\/]/).pop() : null;
 
+    // 物理尺寸的初值由服务端给（已保存的 ipm_state 优先于默认 45x45）。
+    // 这条优先级只在服务端判一次：前端再判一遍的话，默认值一改两边就会分叉，
+    // 上次实测的尺寸也可能被新默认顶掉。
+    if (st.phys_init) {
+      $('in-phys-w').value = st.phys_init.w;
+      $('in-phys-h').value = st.phys_init.h;
+    }
+
     // 上次用的原图若还在候选里就优先选它，否则退回第一张
     const pick = (savedName && st.ipm_candidates.includes(savedName))
       ? savedName
@@ -1421,9 +1553,8 @@ function bindActions() {
     await loadSource(pick);
 
     // 只有"当前选的正是上次那张图"时，历史参数才适用
+    // （物理尺寸不在这里恢复，它已经按服务端给的初值填好了）
     if (saved && savedName === pick) {
-      $('in-phys-w').value = saved.phys_w_cm;
-      $('in-phys-h').value = saved.phys_h_cm;
       $('in-ax').value = saved.anchor_x;
       $('out-ax').textContent = Number(saved.anchor_x).toFixed(3);
       $('in-ay').value = saved.anchor_y;
