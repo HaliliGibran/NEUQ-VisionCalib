@@ -106,6 +106,7 @@ from neuq_core.geometry import (  # noqa: F401
     apply_homography,
     clip_polygon_halfplane,
     compute_homography,
+    fit_fov_bottom_aligned,
     homography_denominator,
     horizon_sign,
     is_convex_quad,

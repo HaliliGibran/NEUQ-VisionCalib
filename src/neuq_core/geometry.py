@@ -21,6 +21,7 @@ import numpy as np
 LINE_PARALLEL_EPS = 1e-8    # 两直线求交的行列式下限，小于此值视为平行
 DEGENERATE_EPS = 1e-12      # DLT 归一化的平均距离下限，小于此值视为点集退化
 DEN_EPS = 1e-3          # 地平线裁剪余量，|den| 小于此值视为映射到无穷远
+FIT_TOLERANCE_PX = 1e-6     # 自动布局自检的越界容差（像素），只为吸收闭式解的舍入
 
 
 def normalize_points_for_dlt(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -262,13 +263,90 @@ def max_scale_for_fov(poly_cm: np.ndarray, anchor_px: Tuple[float, float],
     return max(0.0, float(min(bounds)))
 
 
+def fit_fov_bottom_aligned(
+    poly_cm: np.ndarray,
+    anchor_x_px: float,
+    out_size: Tuple[int, int],
+    margin_px: float = 1.0,
+) -> Optional[Tuple[float, float]]:
+    """返回 (anchor_y_px, scale)；输入合法但无可行布局时返回 None。
+
+    要解决的问题与 max_scale_for_fov 不同：那个函数里 anchor 是给定的，只求
+    "不裁切的 scale 上限"；这里 anchor_y 也是自由量，求的是"近场贴住输出图底边、
+    同时把有效视野放到最大且一点不裁切"的那一组 (anchor_y, scale)。
+
+    物理 y 向下即朝向车辆，所以多边形的 qy_max 是最近处、qy_min 是最远处。把近场
+    钉在 B = H-1-margin 上（这才是"贴底"），scale 就只受三个上界约束：纵向总高
+    装得下、横向左右两侧装得下。三者取 min，至少有一个是紧的，因此结果是最大的。
+
+    anchor_x 不在本函数的决策范围内：它由用户或调用方给定，越界时直接说"没有可行
+    布局"，绝不偷偷把它挪回画布内——那会让界面上的横向位置莫名其妙地跳。
+
+    失败分两类，刻意不混在一起：
+      输入本身非法（形状不是 (N,2)、含非有限值、out_size 非正、margin 为负）
+        -> ValueError，与 clip_polygon_halfplane / horizon_sign 的先例一致；
+      输入合法但当前几何没有正的可行布局（多边形退化、anchor_x 越界、画布太小）
+        -> None。绝不用 (0, 0) 之类的魔法值表达"无解"。
+    """
+    poly = np.asarray(poly_cm, dtype=np.float64)
+    if poly.ndim != 2 or poly.shape[1] != 2:
+        raise ValueError(f'多边形点集必须是 (N, 2)，收到形状 {poly.shape}。')
+    if not np.isfinite(poly).all():
+        raise ValueError('多边形点集含非有限值，无法求布局。')
+    if not np.isfinite(anchor_x_px):
+        raise ValueError('anchor_x_px 含非有限值，无法求布局。')
+    if not np.isfinite(margin_px) or margin_px < 0:
+        raise ValueError(f'margin_px 必须是非负有限值，收到 {margin_px}。')
+
+    w, h = int(out_size[0]), int(out_size[1])
+    if w <= 0 or h <= 0:
+        raise ValueError(f'输出尺寸必须为正，收到 {out_size}。')
+
+    if poly.shape[0] < 3:
+        return None
+
+    ax = float(anchor_x_px)
+    margin = float(margin_px)
+    if not (margin <= ax <= w - 1 - margin):
+        return None
+
+    qx_min, qy_min = (float(v) for v in poly.min(axis=0))
+    qx_max, qy_max = (float(v) for v in poly.max(axis=0))
+    if qy_max - qy_min <= 0:
+        return None
+
+    bounds: List[float] = [(h - 1 - 2 * margin) / (qy_max - qy_min)]
+    if qx_max > 0:
+        bounds.append((w - 1 - margin - ax) / qx_max)
+    if qx_min < 0:
+        bounds.append((ax - margin) / (-qx_min))
+
+    scale = float(min(bounds))
+    anchor_y = float(h - 1 - margin) - scale * qy_max
+
+    # 自检：上面的闭式解在数值上是否真的落在图内。不满足就老实说无解。
+    if not (np.isfinite(scale) and scale > 0):
+        return None
+    if not np.isfinite(anchor_y) or not (0.0 <= anchor_y <= h - 1):
+        return None
+    out = np.column_stack((ax + scale * poly[:, 0], anchor_y + scale * poly[:, 1]))
+    if not (out[:, 0].min() >= margin - FIT_TOLERANCE_PX
+            and out[:, 0].max() <= w - 1 - margin + FIT_TOLERANCE_PX
+            and out[:, 1].min() >= margin - FIT_TOLERANCE_PX
+            and out[:, 1].max() <= h - 1 - margin + FIT_TOLERANCE_PX):
+        return None
+    return anchor_y, scale
+
+
 __all__ = [
     'DEGENERATE_EPS',
     'DEN_EPS',
+    'FIT_TOLERANCE_PX',
     'LINE_PARALLEL_EPS',
     'apply_homography',
     'clip_polygon_halfplane',
     'compute_homography',
+    'fit_fov_bottom_aligned',
     'homography_denominator',
     'horizon_sign',
     'is_convex_quad',

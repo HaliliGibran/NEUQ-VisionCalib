@@ -848,19 +848,49 @@ def _preview_inputs(body: dict):
 
 
 def recommended_layout(cal) -> dict:
-    """当前几何下的"自动推荐值"：anchor_y 与 scale 各一个。
+    """当前几何下的"自动推荐值"：anchor_y 与 scale 各一个，外加它是怎么来的。
 
-    存在的理由是给界面上的「重置」一个**间接**入口：前端只管"问一次、采用",
-    绝不把 0.708 / max_scale x 0.8 这类常量抄进 JS。推荐算法以后换（anchor_y 与
-    scale 联动求解）时只改这一个函数，接线一行都不用动。
+    存在的理由有两个：一是给界面上的「重置」一个**间接**入口（前端只管"问一次、
+    采用"，绝不把常量抄进 JS）；二是自动布局模式下 preview 与 commit 都从这里取
+    参数，眼睛看到的 BirdView 与最终导出的 H/LUT 因此同源。
 
-    今天的口径与 IpmCalibrator.recompute() 里 scale 的初值完全一致：
-    anchor_y 取模块默认 ANCHOR_Y，scale 取不裁切上限的 INIT_SCALE_RATIO 倍
-    （上限为 0 时退回 1.0，与那边的分支相同）。
+    口径就是 fit_fov_bottom_aligned：近场贴输出图底边、同时取最大的不裁切 scale，
+    anchor_y 与 scale 一起解出来。
+
+    source 字段区分两种来源：
+      'auto'      算出了可行布局，anchor_y 与 scale 都是它给的；
+      'fallback'  当前几何没有可行布局（多边形退化、anchor_x 越界等）。这时退回旧
+                  口径——anchor_y 取模块默认 ANCHOR_Y、scale 取不裁切上限的
+                  INIT_SCALE_RATIO 倍（上限为 0 时退回 1.0，与 recompute() 同分支）。
+                  之所以要有 fallback：预览不能因为"自动布局不可用"整个崩掉。
     """
+    if cal.H0 is not None:
+        poly = core.valid_fov_polygon(cal.H0, core.rotation_matrix(cal.heading),
+                                      (cal.w, cal.h), cal.sign)
+        fit = core.fit_fov_bottom_aligned(poly, cal.anchor_x * (cal.w - 1), cal.out_size)
+        if fit is not None:
+            ay_px, scale = fit
+            return {'anchor_y': float(ay_px / (cal.h - 1)), 'scale': float(scale),
+                    'source': 'auto'}
+
     scale = (max(core.MIN_SCALE, cal.max_scale * core.INIT_SCALE_RATIO)
              if cal.max_scale > 0 else 1.0)
-    return {'anchor_y': float(core.ANCHOR_Y), 'scale': float(scale)}
+    return {'anchor_y': float(core.ANCHOR_Y), 'scale': float(scale),
+            'source': 'fallback'}
+
+
+def apply_auto_layout(cal) -> dict:
+    """把推荐布局真正写进标定器并重算，返回用了哪一组值。
+
+    preview 与 commit 共用这一个入口：只改 preview 会让"看到的 BirdView"和
+    "导出的 H/LUT"分家，那比不做自动布局更糟。
+    """
+    rec = recommended_layout(cal)
+    cal.anchor_y = rec['anchor_y']
+    cal.scale = rec['scale']
+    cal.scale_initialized = True
+    cal.recompute()
+    return rec
 
 
 def api_preview(body: dict) -> dict:
@@ -871,6 +901,10 @@ def api_preview(body: dict) -> dict:
                           p['anchor_x'], p['anchor_y'], p['heading'], p['scale'])
     if cal.H is None or cal.birdview is None or cal.H0 is None:
         raise ValueError('当前四点无法构成有效单应，请调整。')
+
+    # scale 为 None 就是自动布局模式：anchor_y 与 scale 都由服务端定，
+    # 并且与 api_commit 走同一个 apply_auto_layout。
+    rec = apply_auto_layout(cal) if p['scale'] is None else recommended_layout(cal)
 
     view = cal.birdview.copy()
     if view.ndim == 2:
@@ -884,14 +918,16 @@ def api_preview(body: dict) -> dict:
     return {
         'birdview': encode_jpeg(view, quality=85),
         'scale': float(cal.scale),
+        'anchor_y': float(cal.anchor_y),
         'max_scale': float(cal.max_scale),
-        'recommended': recommended_layout(cal),
+        'recommended': rec,
 
         'over_crop': bool(cal.is_over_crop()),
         'horizon_sign': float(cal.sign),
         'rect': [[float(v) for v in pt] for pt in rect],
         'valid_ratio': float(np.isfinite(rect).all()),
     }
+
 
 
 def apply_table_options(body: dict) -> None:
@@ -935,6 +971,10 @@ def api_commit(body: dict) -> dict:
                           p['anchor_x'], p['anchor_y'], p['heading'], p['scale'])
     if cal.H is None or cal.birdview is None or cal.H0 is None:
         raise ValueError('当前四点无法构成有效单应，无法导出。')
+
+    # 与 api_preview 同一条路：自动布局模式下导出的 H/LUT 必须是预览里看到的那一组。
+    if p['scale'] is None:
+        apply_auto_layout(cal)
 
     K, D, Knew, img_size = STATE['K'], STATE['D'], STATE['Knew'], STATE['img_size']
     H = cal.H

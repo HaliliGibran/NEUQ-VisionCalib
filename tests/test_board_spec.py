@@ -1267,6 +1267,126 @@ def main() -> int:
     check(isinstance(got, np.ndarray) and got.dtype == np.float64,
           '含 nan 的多边形仍按原样处理（不在这一刀扩大数值契约）', f'{got.shape}')
 
+    print('\n[K] fit_fov_bottom_aligned：近场贴底 + 最大不裁切')
+    # 这一段把"原图近场 y=119 却被映射到 BirdView 中部"从主观感受变成算法契约：
+    # 近场必须精确落在 H-1-margin 上，且 scale 恰好是三个理论上界的最小值。
+    margin = 1.0
+
+    def fov_poly(out_size, heading=0.0):
+        """按真实链路造一个有效视野多边形：四点 -> H0 -> horizon_sign -> 裁剪。"""
+        w, h = out_size
+        quad = (np.array([[50., 45.], [110., 45.], [20., 100.], [140., 100.]])
+                * np.array([w / 160.0, h / 120.0]))
+        H0 = core.compute_homography(quad, core.physical_rect(45., 45.))
+        sign = core.horizon_sign(H0, quad)
+        return core.valid_fov_polygon(H0, core.rotation_matrix(heading), out_size, sign)
+
+    def placed(poly, ax, ay, k):
+        return np.column_stack((ax + k * poly[:, 0], ay + k * poly[:, 1]))
+
+    def within(poly, ax, ay, k, out_size, tol=1e-9):
+        w, h = out_size
+        p = placed(poly, ax, ay, k)
+        return bool(p[:, 0].min() >= margin - tol and p[:, 0].max() <= w - 1 - margin + tol
+                    and p[:, 1].min() >= margin - tol
+                    and p[:, 1].max() <= h - 1 - margin + tol)
+
+    def theoretical_bounds(poly, ax, out_size):
+        """三个理论上界：纵向总高、右侧、左侧（后两个仅在该侧有延伸时存在）。"""
+        w, h = out_size
+        qx_min, qy_min = (float(v) for v in poly.min(axis=0))
+        qx_max, qy_max = (float(v) for v in poly.max(axis=0))
+        bounds = [(h - 1 - 2 * margin) / (qy_max - qy_min)]
+        if qx_max > 0:
+            bounds.append((w - 1 - margin - ax) / qx_max)
+        if qx_min < 0:
+            bounds.append((ax - margin) / (-qx_min))
+        return bounds
+
+    def audit(poly, ax, out_size, tag):
+        w, h = out_size
+        fit = core.fit_fov_bottom_aligned(poly, ax, out_size, margin)
+        if not check(fit is not None, f'{tag}：有可行布局'):
+            return
+        ay, k = fit
+        qy_min, qy_max = float(poly[:, 1].min()), float(poly[:, 1].max())
+        y_near, y_far = ay + k * qy_max, ay + k * qy_min
+        check(abs(y_near - (h - 1 - margin)) < 1e-9,
+              f'{tag}：近场精确贴到 y={h - 1 - margin}（1e-9 判据，不是"接近"）',
+              f'y_near={y_near!r}')
+        check(y_far >= margin - 1e-9, f'{tag}：远场不越顶边（y_far >= {margin}）',
+              f'y_far={y_far:.6f}')
+        check(within(poly, ax, ay, k, out_size),
+              f'{tag}：全部有效顶点在 margin 内', f'k={k:.6f} ay={ay:.3f}')
+        check(0.0 <= ay / (h - 1) <= 1.0, f'{tag}：anchor_y 归一化后落在 [0,1]',
+              f'{ay / (h - 1):.4f}')
+        check(k > 0, f'{tag}：scale 为正', f'{k:.6f}')
+
+        # 最大性 1：scale 必须等于三个理论上界的最小值（至少一个是紧的）。
+        bounds = theoretical_bounds(poly, ax, out_size)
+        check(abs(k - min(bounds)) < 1e-12,
+              f'{tag}：scale == min(理论上界)，至少一个约束是紧的',
+              f'k={k:.9f} bounds={[round(b, 9) for b in bounds]}')
+        # 最大性 2：**重新允许 anchor_y 优化**后再放大 scale。固定原 anchor_y 加 ε
+        # 只能证明"底边贴住了"，这里必须让 anchor_y 跟着 k2 重算，仍然越界才算最大。
+        k2 = k * (1 + 1e-6)
+        ay2 = h - 1 - margin - k2 * qy_max
+        p2 = placed(poly, ax, ay2, k2)
+        lateral = bool(p2[:, 0].min() < margin - 1e-9
+                       or p2[:, 0].max() > w - 1 - margin + 1e-9)
+        far_top = bool(p2[:, 1].min() < margin - 1e-9)
+        check(lateral or far_top,
+              f'{tag}：scale 再大一点（anchor_y 一起重算）必违反横向或远场上边界',
+              f'横向越界={lateral} 远场越顶={far_top}')
+
+    for size in ((160, 120), (1280, 720)):
+        audit(fov_poly(size), 0.5 * (size[0] - 1), size, f'{size[0]}x{size[1]}')
+
+    poly_small = fov_poly((160, 120))
+    for ratio in (0.3, 0.5, 0.7):
+        audit(poly_small, ratio * 159.0, (160, 120), f'anchor_x={ratio}')
+
+    for heading in (-12.0, 25.0):
+        audit(fov_poly((160, 120), heading), 0.5 * 159.0, (160, 120),
+              f'heading={heading}')
+
+    # 非法输入 -> ValueError（与 clip_polygon_halfplane / horizon_sign 同一档）
+    bad_inputs = [
+        ('形状 (N,3)', np.zeros((4, 3)), 80.0, (160, 120), 1.0),
+        ('形状 (2,)', np.array([1.0, 2.0]), 80.0, (160, 120), 1.0),
+        ('含 nan', np.array([[0., 0.], [np.nan, 1.], [1., 1.]]), 80.0, (160, 120), 1.0),
+        ('含 inf', np.array([[0., 0.], [np.inf, 1.], [1., 1.]]), 80.0, (160, 120), 1.0),
+        ('out_size 含 0', poly_small, 80.0, (160, 0), 1.0),
+        ('out_size 为负', poly_small, 80.0, (-160, 120), 1.0),
+        ('margin_px 为负', poly_small, 80.0, (160, 120), -1.0),
+    ]
+    for label, poly, ax, size, m in bad_inputs:
+        try:
+            got = core.fit_fov_bottom_aligned(poly, ax, size, m)
+            check(False, f'{label} 必须拒绝', f'却返回了 {got}')
+        except ValueError as exc:
+            check(True, f'{label} -> ValueError', str(exc))
+
+    # 输入合法但无可行布局 -> None，绝不用 (0,0) 之类魔法值
+    none_cases = [
+        ('anchor_x 在画布右侧之外', poly_small, 200.0, (160, 120)),
+        ('anchor_x 为负', poly_small, -5.0, (160, 120)),
+        ('空多边形', np.zeros((0, 2)), 80.0, (160, 120)),
+        ('只有两个点', np.array([[0., 0.], [1., 1.]]), 80.0, (160, 120)),
+    ]
+    for label, poly, ax, size in none_cases:
+        got = core.fit_fov_bottom_aligned(poly, ax, size, margin)
+        check(got is None, f'{label} -> None（不是魔法值）', repr(got))
+
+    # 不裁切的旧口径没被动过：同一多边形、把自动解出来的 anchor 交给它，
+    # max_scale_for_fov 给出的上限不小于自动布局的 scale。
+    fit = core.fit_fov_bottom_aligned(poly_small, 0.5 * 159.0, (160, 120), margin)
+    ay, k = fit
+    cap = core.max_scale_for_fov(poly_small, (0.5 * 159.0, ay), (160, 120))
+    check(cap >= k - 1e-9,
+          'max_scale_for_fov 语义未变：同一 anchor 下的上限 >= 自动布局的 scale',
+          f'cap={cap:.6f} k={k:.6f}')
+
     print()
     if FAILED:
         print('失败项:')

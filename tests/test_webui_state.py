@@ -17,6 +17,8 @@
      且绝不把别的照片的图串到空出来的那一侧
   E. 物理尺寸初值的优先级（已保存的 ipm_state > 新默认 45x45），以及 /api/preview
      回包里的"推荐值"——重置按钮靠它做成间接层，前端不抄常量
+  F. 自动布局（近场贴底 + 最大不裁切）在 preview 与 commit 两侧同源：看到的 BirdView
+     与导出的 H 必须是同一组 (anchor_y, scale)
 """
 from __future__ import annotations
 
@@ -290,7 +292,7 @@ def main() -> int:
               '历史里是非正数（脏数据）时退回默认，不把 0 当尺寸用',
               str(server.initial_phys_size()))
 
-        # 推荐值：服务端算、随预览一起回，且与 recompute() 里 scale 的初值同一口径
+        # 推荐值：服务端算、随预览一起回，口径就是自动布局（近场贴底 + 最大不裁切）
         old_undist = server.STATE['src_undist']
         server.STATE['src_undist'] = np.full((240, 320, 3), 128, np.uint8)
         try:
@@ -300,17 +302,108 @@ def main() -> int:
         finally:
             server.STATE['src_undist'] = old_undist
         rec = pv.get('recommended')
-        check(isinstance(rec, dict) and sorted(rec) == ['anchor_y', 'scale'],
-              '/api/preview 回包里有 recommended{anchor_y, scale}', str(rec))
-        check(rec['anchor_y'] == core.ANCHOR_Y,
-              '推荐的 anchor_y 来自服务端（今天就是 ANCHOR_Y）',
-              f"{rec['anchor_y']} vs {core.ANCHOR_Y}")
-        expect = max(core.MIN_SCALE, pv['max_scale'] * core.INIT_SCALE_RATIO)
-        check(abs(rec['scale'] - expect) < 1e-9,
-              '推荐的 scale = max_scale x INIT_SCALE_RATIO（与 recompute() 同口径）',
-              f"{rec['scale']:.6f} vs {expect:.6f}")
+        check(isinstance(rec, dict) and sorted(rec) == ['anchor_y', 'scale', 'source'],
+              '/api/preview 回包里有 recommended{anchor_y, scale, source}', str(rec))
+        check(rec['source'] in ('auto', 'fallback'),
+              '回包能区分"自动布局给的"还是 fallback', str(rec['source']))
         check(abs(pv['scale'] - rec['scale']) < 1e-9,
               '未指定 scale 时预览用的就是推荐值', f"{pv['scale']:.6f}")
+        check(abs(pv['anchor_y'] - rec['anchor_y']) < 1e-9,
+              '未指定 scale 时 anchor_y 也由推荐值定（自动布局同时定两项）',
+              f"{pv['anchor_y']:.6f}")
+
+        # ---- F. 自动布局：preview 与 commit 必须同源
+        # U3 留下的 recommended_layout 只被两个重置按钮读，预览与导出各自还在用
+        # "当前 anchor_y + 0.8 x max_scale"。那样界面上显示的推荐值和真正生效的 H
+        # 是两回事；下面这几条把"显示、预览、导出三者同一组参数"钉住。
+        print('\n[F] 自动布局在 preview / commit 两侧同源')
+        core.configure_paths(root=tmp / 'auto_root')
+        quad = [[90, 80], [230, 80], [30, 200], [290, 200]]
+        quad_arr = core.order_corners_tl_tr_bl_br(np.asarray(quad, dtype=np.float64))
+        auto = {'quad': quad, 'phys_w': 45.0, 'phys_h': 45.0, 'anchor_x': 0.5,
+                'anchor_y': 0.3, 'heading': 0.0, 'scale': None}
+        old_state = {k: server.STATE[k] for k in
+                     ('K', 'D', 'Knew', 'img_size', 'src_path', 'src_undist')}
+        originals = {name: getattr(core, name) for name in
+                     ('export_all', 'build_ipm_state', 'batch_test', 'safe_imwrite')}
+        recorded: dict = {}
+
+        def fake_export_all(K, D, Knew, H, H0, sign, extra, size, ipm_state=None):
+            """只记下导出用的 H 与参数：导出事务本身另有专门的测试文件。"""
+            recorded['H'] = np.asarray(H, dtype=np.float64).copy()
+            recorded['extra'] = dict(extra)
+            return None
+
+        try:
+            server.STATE.update(src_undist=np.full((240, 320, 3), 128, np.uint8),
+                                K=np.eye(3), D=np.zeros((4, 1)), Knew=np.eye(3),
+                                img_size=(320, 240), src_path=None)
+            core.export_all = fake_export_all
+            core.build_ipm_state = lambda *a, **kw: {}
+            core.batch_test = lambda pair: None
+            core.safe_imwrite = lambda *a, **kw: None
+
+            pv = server.api_preview(dict(auto))
+            rec = pv['recommended']
+            check(rec['source'] == 'auto',
+                  '这组几何下拿到的是自动布局解（不是 fallback）', str(rec))
+            check(abs(pv['anchor_y'] - rec['anchor_y']) < 1e-12
+                  and abs(pv['scale'] - rec['scale']) < 1e-12,
+                  'preview 的 BirdView/H 真正采用了 recommended 的 anchor_y + scale',
+                  f"用了 ay={pv['anchor_y']:.6f} k={pv['scale']:.6f}")
+            check(abs(pv['anchor_y'] - 0.3) > 1e-6,
+                  '自动模式下 anchor_y 由服务端决定（旧实现只改 scale，会停在 0.3）',
+                  f"{pv['anchor_y']:.6f}")
+            legacy = max(core.MIN_SCALE, pv['max_scale'] * core.INIT_SCALE_RATIO)
+            check(abs(pv['scale'] - legacy) > 1e-6,
+                  '用的不是旧的 0.8 x max_scale',
+                  f"新={pv['scale']:.6f} 旧口径={legacy:.6f}")
+
+            # 重置按钮读的还是同一个 recommended_layout，且与当前 anchor_y/scale 无关
+            cal = server.make_calibrator(quad_arr, 45.0, 45.0, 0.5, 0.11, 0.0, 3.0)
+            rec2 = server.recommended_layout(cal)
+            check(rec2['source'] == rec['source']
+                  and abs(rec2['anchor_y'] - rec['anchor_y']) < 1e-12
+                  and abs(rec2['scale'] - rec['scale']) < 1e-12,
+                  '两个重置按钮读的 recommended_layout 与预览同一个来源', str(rec2))
+
+            # 最重要的一条：自动模式下 commit 导出的 H 必须是预览那一组参数算出来的
+            server.api_commit({**auto, 'table_format': 'txt'})
+            ref = server.make_calibrator(quad_arr, 45.0, 45.0, 0.5,
+                                         rec['anchor_y'], 0.0, rec['scale'])
+            check(np.allclose(recorded['H'], ref.H, rtol=0, atol=1e-12),
+                  '自动 commit 导出的 H == 用预览那一组 (anchor_y, scale) 算出的 H',
+                  f"最大差 {np.abs(recorded['H'] - ref.H).max():.3e}")
+            check(abs(recorded['extra']['anchor_y'] - rec['anchor_y']) < 1e-12
+                  and abs(recorded['extra']['scale_px_per_cm'] - rec['scale']) < 1e-12,
+                  '落盘的 anchor_y / scale 也是自动布局那一组',
+                  f"{recorded['extra']['anchor_y']:.6f} "
+                  f"{recorded['extra']['scale_px_per_cm']:.6f}")
+
+            # 手动模式：显式给的值一个字都不许改
+            manual = {**auto, 'anchor_y': 0.42, 'scale': 2.0}
+            mv = server.api_preview(dict(manual))
+            check(abs(mv['scale'] - 2.0) < 1e-9 and abs(mv['anchor_y'] - 0.42) < 1e-9,
+                  '手动模式的 preview 完全不覆盖用户值',
+                  f"ay={mv['anchor_y']} k={mv['scale']}")
+            recorded.clear()
+            server.api_commit({**manual, 'table_format': 'txt'})
+            check(abs(recorded['extra']['anchor_y'] - 0.42) < 1e-12
+                  and abs(recorded['extra']['scale_px_per_cm'] - 2.0) < 1e-12,
+                  '手动模式的 commit 也不覆盖用户值',
+                  f"{recorded['extra']['anchor_y']} "
+                  f"{recorded['extra']['scale_px_per_cm']}")
+
+            # 无可行布局时退回旧口径，但预览不许因此崩掉，且回包标明是 fallback
+            fb = server.api_preview({**auto, 'anchor_x': 2.0})
+            check(fb['recommended']['source'] == 'fallback'
+                  and abs(fb['recommended']['anchor_y'] - core.ANCHOR_Y) < 1e-12,
+                  'anchor_x 越界时退回 fallback（ANCHOR_Y + 旧 scale 口径），预览仍出图',
+                  str(fb['recommended']))
+        finally:
+            for name, fn in originals.items():
+                setattr(core, name, fn)
+            server.STATE.update(**old_state)
     finally:
         core.configure_paths(root=old_root)
         core.configure_board(old_board)

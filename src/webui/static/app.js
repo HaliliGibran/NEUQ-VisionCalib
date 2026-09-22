@@ -808,7 +808,7 @@ function setDofValue(id, value) {
 
 /** 人手动改了某个自由度之后的统一收尾（拖滑块 / 键盘 / 滚轮共用）。
 
-    anchor y 与 scale 一经手动就退出「自动吸附」：那个模式的含义是"这两项由
+    anchor y 与 scale 一经手动就退出「自动布局」：那个模式的含义是"这两项由
     服务端的推荐值定"，用户既然自己动了手，就不该在下一次预览回包时被覆盖回去。
  */
 function afterManualDof(id) {
@@ -901,6 +901,9 @@ async function runPreview() {
     if ($('in-sc-auto').checked && !state.draggingScale) {
       $('in-sc').value = data.scale.toFixed(2);
       $('out-sc').textContent = data.scale.toFixed(2);
+      // 自动布局由服务端同时定 anchor y 与 scale，两个滑块都要跟着回显。
+      // setDofValue 是程序赋值、不派发 input 事件，所以不会触发新一轮预览。
+      if (data.recommended) setDofValue('in-ay', data.recommended.anchor_y);
     }
   } catch (err) {
     // 四点退化是拖拽时最常见的即时反馈，其余失败多半是"还没选原图"之类，
