@@ -75,7 +75,8 @@ STATIC_DIR = static_dir()
 
 # 服务端只有一份进程内状态：工具只监听本机、面向单人使用，用锁串行化计算请求即可。
 # 各字段寿命刻意不同：
-#   K/D/Knew/img_size  从 calib.json 载入或重标后缓存，直到服务退出或再次标定；
+#   K/D/img_size       从 calib.json 载入或重标得到；Knew 再由 K/D/UNDIST_ALPHA 现场计算；
+#                      四者缓存到服务退出或再次标定
 #   src_*              只属于当前选中的 IPM 原图，换图或重标就整体清空；
 #   ipm_results        只属于本进程里最近一次“导出后自动批测”，不拿磁盘旧文件冒充。
 # 真正需要跨进程复用的事实都在 calib.json / ipm_state.json / matrices.json，不依赖 STATE。
@@ -141,7 +142,7 @@ def api_shutdown() -> dict:
 
 
 def ensure_calibration() -> None:
-    """确保内存里有 K/D/Knew，没有就从 calib.json 载入或现场标定。"""
+    """确保内存里有 K/D/Knew；K/D 可读 calib.json，Knew 始终按当前视角参数计算。"""
     if STATE['K'] is not None:
         return
     K, D, Knew, img_size = core.load_or_run_calibration()

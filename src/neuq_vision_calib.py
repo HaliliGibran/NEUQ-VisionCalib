@@ -407,7 +407,7 @@ def configure_paths(root: Optional[Path] = None,
 
 # ================================================================ 相机标定
 # 输入：calib_input/ 中同分辨率、不同姿态的棋盘照片。
-# 输出：calib.json（K/D/Knew 的基准）与同一轮参数生成的去畸变预览。
+# 输出：calib.json（保存 K/D，并以哈希绑定现场算出的 Knew）与同一轮参数生成的去畸变预览。
 # 失败通常意味着照片不足、棋盘规格不符、分辨率混杂，或事务无法完整落盘。
 
 
@@ -1082,7 +1082,7 @@ class IpmCalibrator:
     def target_window(self) -> np.ndarray:
         """以逆透视坐标参考原点为原点的目标地面范围（旋转后 cm 坐标，TL,TR,BL,BR）。
 
-        坐标系已经平移到参考原点，窗口就是 x=[-W/2,W/2], y=[-F,0]，
+        坐标系已经平移到参考原点，范围就是 x=[-width/2,width/2], y=[-forward,0]，
         不需要知道标定矩形的形状或位置。
         """
         return target_window_cm(self.target_width_cm, self.target_forward_cm)
@@ -1477,9 +1477,11 @@ def quantize_table(mat: np.ndarray) -> np.ndarray:
     overflow = int(np.count_nonzero(q > limit))
     if overflow:
         raise SystemExit(
-            f'打表溢出: {overflow} 个坐标超出 Q{TABLE_FIXED_POINT} 定点量程 '
-            f'（{limit / scale:.1f} px）。请降低 --table-fixed-point，'
-            '或缩小 --table-size。')
+            f'定点坐标超出 int16 量程: {overflow} 个坐标超出 '
+            f'Q{TABLE_FIXED_POINT} 可表示的 {limit / scale:.1f} px。'
+            '请降低 --table-fixed-point；如果必须保留当前 Q 位数，则需要降低实际图像'
+            '坐标范围或改用更宽的整数类型。缩小 --table-size 只减少表项数量，不会缩小'
+            '表中保存的全分辨率坐标，因此不能解决此溢出。')
     out[valid] = q.astype(np.int16)
     return out
 
@@ -2794,9 +2796,10 @@ def load_exported_reverse_pair(img_size: Tuple[int, int]) -> MapPair:
 
 def load_or_run_calibration(force: bool = False
                             ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]:
-    """取得 (K, D, Knew, img_size)：有 calib.json 就直接用，没有则现场标定并落盘。
+    """取得 (K, D, Knew, img_size)：calib.json 提供 K/D，Knew 按当前参数现场计算。
 
-    复用之前会先核对标定板规格：已有 calib.json 若是用另一块棋盘标的，
+    没有 calib.json 时才现场标定并落盘。复用之前会先核对标定板规格：已有文件若是
+    用另一块棋盘标的，
     直接复用会让后面写出的 matrices.json 记上错误的 provenance
     （K/D 来自旧棋盘，board 段却写着新棋盘）。这种情况一律要求显式重标。
     """

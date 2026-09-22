@@ -17,8 +17,9 @@
 与 reverse 互相证明。第 5 项在全分辨率下能补充检验方向，在降采样后则不能当硬门槛：
 栅格化、面积重采样与定点量化都不可逆，严格互逆本来就不再是数学不变量。
 
-第 6 项只检查哨兵的成对和值域约定，不判断有效区是否连通；几何有效性由第 4、7 项
-及生成阶段的地平线/边界判据覆盖。每项 docstring 还说明了失败通常指向哪一层。
+第 6 项只检查哨兵的成对和值域约定，不判断有效区是否连通。无效区域是否出现在正确
+位置，由第 7 项对流水线重算与落盘表的 mask 逐点比较；这比用连通性作 hard gate
+更直接。每项 docstring 还说明了失败通常指向哪一层。
 
 落盘格式自动识别：逗号分隔文本（MapW.txt）、int16 定点二进制（MapW.bin）、
 C 头文件（Map.h）。读取统一走主脚本的 core.load_map_pair，这样"脚本怎么读表"
@@ -286,7 +287,7 @@ def check_grid_isotropy() -> bool:
 def check_export_fidelity(root: Path, calib: dict, matrices: dict) -> bool:
     """检查 7：落盘的正反两张表是否忠实等于流水线重算的结果。
 
-    覆盖重采样与定点量化两步。检查 2/3 验证的是数学（只有全分辨率下才可比），
+    覆盖重采样与定点量化两步。检查 3/4 验证的是数学（只有全分辨率下才可比），
     这一项验证的是"算出来的东西有没有原样写进文件"，任何网格、任何格式都成立，
     因此它才是降采样交付物的主判据。失败通常落在文件格式、网格重采样、Q 位数或
     哨兵序列化；它与流水线共享数学 helper，所以不能替代第 3、4 项的独立 OpenCV oracle。
@@ -430,8 +431,9 @@ def check_homography(matrices: dict) -> bool:
       3. atan2(TR-TL) == heading（矩形对边平行，角度在模 180° 意义下比较）
       4. **去畸变图底边中点** 经 H 之后正好落在 anchor 上
 
-    第 4 条不能写成“标定矩形中心 == anchor”：H0 之后还有 ``T(-ref)``，落在 anchor
-    上的是**逆透视坐标参考原点**（底边中点对应的地面点），不是标定矩形中心。
+    上述第 4 个不变量不能写成“标定矩形中心 == anchor”：H0 之后还有
+    ``T(-ref)``，落在 anchor 上的是**逆透视坐标参考原点**（底边中点对应的
+    地面点），不是标定矩形中心。
     任一项失败通常说明 H 的组合顺序、角点对应、物理尺寸/比例尺或参考原点语义错了。
     """
     H = np.asarray(matrices['H'], dtype=np.float64).reshape(3, 3)
@@ -571,7 +573,7 @@ def check_forward_reverse(root: Path) -> bool:
       降采样表    -> 只报告。两张表分别经过栅格化、INTER_AREA 重采样与定点
                      量化，这三步都不可逆，"严格互逆"不是必须成立的数学不变量，
                      硬卡阈值只会得到一个随网格与 scale 漂移的假失败。这一档的
-                     正确性由检查 6（落盘 == 流水线重算，正反两张都比）保证。
+                     正确性由检查 7（落盘 == 流水线重算，正反两张都比）保证。
     """
     rev_x, rev_y = load_pair(root / 'lookup_table' / 'undistort_ipm' / 'reverse')
     fwd_x, fwd_y = load_pair(root / 'lookup_table' / 'undistort_ipm' / 'forward')
@@ -617,7 +619,8 @@ def check_sentinel(root: Path) -> bool:
     """检查 6：每组表的 X/Y 无效掩码同步，且解码后统一使用 -1。
 
     X 无效而 Y 有效会让 C 端拼出不存在的二维坐标；出现其它负值则说明定点哨兵还原
-    或文本序列化约定漂移。这项不判断无效区域的几何形状或连通性。
+    或文本序列化约定漂移。这项不判断无效区域的几何形状或连通性；无效区域是否出现
+    在正确位置，由检查 7 的 bad_expect != bad_actual 逐点 mask 比较负责。
     """
     ok = True
     for name in ('undistort', 'undistort_ipm'):
