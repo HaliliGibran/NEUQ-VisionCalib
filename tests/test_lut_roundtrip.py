@@ -38,7 +38,10 @@ import neuq_vision_calib as core  # noqa: E402
 SRC_SIZE = (1280, 720)
 CASES: list[tuple] = []
 for fmt in ('txt', 'bin', 'c'):
-    for size in (None, (320, 240), (160, 120)):
+    # 只能取整数倍等比网格。这里原来写的是 (320,240) 与 (160,120)，它们对 1280x720
+    # 分别是 4x/3x 与 8x/6x —— 非等比，会把 16:9 的 BirdView 压成 4:3，物理上正方的
+    # 标定块在小图里变成竖长矩形。T1 之后 prepare_map_pair 直接拒绝这类网格。
+    for size in (None, (320, 180), (160, 90)):
         for fp in ((0, 4) if fmt != 'txt' else (None,)):
             for heading in (0.0, -1.6):
                 for alpha in (None, 0.5):

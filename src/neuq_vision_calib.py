@@ -132,9 +132,11 @@ from neuq_core.lut import (  # noqa: F401
     MapPair,
     build_composite_reverse_map,
     distort_points,
+    downsample_factor,
     mask_out_of_range,
     pixel_grid,
     resample_map_pair,
+    table_grid_factors,
     table_spaces,
     undistorted_grid,
 )
@@ -594,13 +596,16 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
         obj_points, img_points, used, img_size)
 
     first_names, first_errors = first_pass if first_pass else ([], np.array([]))
+    mean_err = report_reprojection_error(obj_points, img_points, rvecs, tvecs, K, D)
     fit_result = {
         'rms': float(rms),
+        'mean_reprojection_error': float(mean_err),
         'per_view': per_view.tolist() if per_view.size else [],
         'std_int': std_int.tolist() if std_int.size else [],
         'used_names': [p.name for p in used],
         'dropped': [{'name': n, 'error': float(e)} for n, e in dropped],
         'threshold': float(MAX_REPROJ_ERR) if MAX_REPROJ_ERR is not None else None,
+        'opencv_version': str(cv2.__version__),
         # 剔除前的全体视图误差，供前端做"改阈值即时预览会删多少张"
         'all_names': list(first_names),
         'all_errors': np.asarray(first_errors, dtype=np.float64).tolist(),
@@ -609,8 +614,6 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
     print(f'\n标定完成：{len(used)}/{len(files)} 张有效，分辨率 {img_size[0]}x{img_size[1]}')
     print(f'整体重投影误差 RMS = {rms:.4f} px')
     print('（注意：OpenCV 报的是 RMS，MATLAB cameraCalibrator 报的是平均欧氏距离，前者数值偏大）')
-
-    mean_err = report_reprojection_error(obj_points, img_points, rvecs, tvecs, K, D)
     print(f'平均欧氏重投影误差 = {mean_err:.4f} px（这个才和 MATLAB 的口径一致）')
 
     if per_view.size:
@@ -631,16 +634,32 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
 
 def export_undistort_previews(files: List[Path], K: np.ndarray, D: np.ndarray,
                               img_size: Tuple[int, int]) -> None:
-    """把参与标定的每张图去畸变后存盘，等价 cameraCalibrator 的 Show Undistorted。"""
-    DIR_CALIB_PREVIEW.mkdir(parents=True, exist_ok=True)
+    """把参与标定的每张图去畸变后存盘，等价 cameraCalibrator 的 Show Undistorted。
+
+    先写暂存区、全部写完再整体换装，**不在旧目录上增量覆盖**。理由是实测踩到的：
+    29 张全量标定 → 人工剔掉 8 张 → 用剩下 21 张重标，旧实现只写这 21 张的预览，
+    被剔的 8 张 `_undist.jpg` 原样留在目录里。于是 calib_preview/ 同时混着
+    "当前 K/D 生成的 21 张" 与 "上一轮 K/D 生成的 8 张"，界面把它们一视同仁地
+    当当前结果展示——比"图缺失"危险得多，因为看上去完全正常。实测那 8 张与用
+    当前 calib.json 重算的结果差异高达 7.3%~10.5%。
+    """
+    staging = DIR_CALIB_PREVIEW.with_name(DIR_CALIB_PREVIEW.name + '.staging')
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
     Knew = resolve_new_camera_matrix(K, D, img_size)
-    for path in files:
-        img = safe_imread(path)
-        if img is None:
-            continue
-        undist = cv2.undistort(img, K, D, None, Knew)
-        safe_imwrite(DIR_CALIB_PREVIEW / f'{path.stem}_undist.jpg', undist)
-    print(f'标定图去畸变效果已写入: {DIR_CALIB_PREVIEW}')
+    try:
+        for path in files:
+            img = safe_imread(path)
+            if img is None:
+                continue
+            undist = cv2.undistort(img, K, D, None, Knew)
+            safe_imwrite(staging / f'{path.stem}_undist.jpg', undist)
+    except BaseException:
+        # 本轮没写完：暂存区作废，旧预览一个字节都没动过
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    commit_dirs(((staging, DIR_CALIB_PREVIEW),), what='标定去畸变预览')
+    print(f'标定图去畸变效果已写入: {DIR_CALIB_PREVIEW}（{len(files)} 张，整体换装）')
 
 
 def resolve_new_camera_matrix(K: np.ndarray, D: np.ndarray,
@@ -653,12 +672,19 @@ def resolve_new_camera_matrix(K: np.ndarray, D: np.ndarray,
 
 
 def save_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
-                     board: Optional[CheckerboardSpec] = None) -> None:
-    """把内参、畸变系数与标定分辨率写入 calib_data/calib.json。
+                     board: Optional[CheckerboardSpec] = None,
+                     fit_result: Optional[dict] = None) -> None:
+    """把内参、畸变系数、标定分辨率与**这一份参数的来历**写入 calib_data/calib.json。
 
     board 显式传入时以它为准：provenance 必须跟着"实际用于标定的那块板"走，
     不能只读当时的全局状态——否则 calibrate_camera(board=A) 之后再改全局，
     落盘的就会是 A 的参数配 B 的规格。
+
+    fit_result 就是 calibrate_camera 的第四个返回值，给的话把质量与用图记录下来。
+    非可选不可的原因，是实测已经出过一次无法回答的问题：目录里 29 张棋盘照，
+    自动全量标定后人工把 RMS > 1.5 px 的 8 张剔掉、用剩下 21 张重标，而
+    calib.json 里没有任何痕迹——拿到产物的人只能靠"用 29 张重算一遍看对不对得上"
+    去反推，对不上又说不清是少用了几张还是 OpenCV 版本差异。
     """
     spec = BOARD if board is None else board
     DIR_CALIB_DATA.mkdir(parents=True, exist_ok=True)
@@ -674,8 +700,35 @@ def save_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
         'chessboard_corners': list(spec.corners),
         'square_size_mm': spec.square_size_mm,
     }
+    payload.update(calibration_provenance(fit_result))
     write_json_atomic(CALIB_JSON, payload)
     print('标定数据已保存:', CALIB_JSON)
+
+
+def calibration_provenance(fit_result: Optional[dict]) -> dict:
+    """从 fit_result 里提炼出要随 calib.json 落盘的 provenance 字段。
+
+    单列一函数是为了让"哪些键算 provenance"只有一处定义：网页与命令行两条路径都
+    调 save_calibration，键名一旦分叉，日后就又变成"这份 calib.json 是哪套字段"。
+
+    fit_result 为 None（例如只是补写一份旧参数）时返回空 dict，而不是写一堆 null——
+    "字段不存在"与"标定时没记"是两件事，后者会被误读成"真的没有被剔的图"。
+    """
+    if not fit_result:
+        return {}
+    rms = fit_result.get('rms')
+    mean_err = fit_result.get('mean_reprojection_error')
+    dropped = fit_result.get('dropped') or []
+    return {
+        'rms_px': float(rms) if rms is not None else None,
+        'mean_reprojection_error_px': (float(mean_err) if mean_err is not None else None),
+        # 剔除阈值；None 表示这一轮没有启用迭代剔除
+        'max_reproj_err': fit_result.get('threshold'),
+        'used_images': list(fit_result.get('used_names') or []),
+        'dropped_images': [{'name': d.get('name'), 'rms_px': d.get('error')}
+                           for d in dropped],
+        'opencv_version': fit_result.get('opencv_version'),
+    }
 
 
 def calib_board_meta() -> Optional[dict]:
@@ -1436,8 +1489,13 @@ def prepare_map_pair(map_x: np.ndarray, map_y: np.ndarray,
     加工顺序刻意与落盘顺序一致：先按 TABLE_SIZE 重采样，再统一无效哨兵，
     最后按 TABLE_FORMAT 量化。走完这一步，磁盘上的字节与内存里的 `x`/`y`
     就是同一份数据的两种表示——批量测试与校验脚本都只认后者。
+
+    降采样倍率在这里校验（整个流水线只有这一处真的会去改网格），不合法直接抛
+    ValueError：任何写盘之前就拦住，导出事务会整体回滚。理由见
+    lut.downsample_factor —— 非等比会破坏 BirdView 的公制纵横比。
     """
-    if TABLE_SIZE is not None:
+    factor = downsample_factor(source_size, TABLE_SIZE)
+    if TABLE_SIZE is not None and factor > 1:
         map_x, map_y = resample_map_pair(map_x, map_y, TABLE_SIZE)
 
     ok = np.isfinite(map_x) & np.isfinite(map_y) & (map_x >= 0.0) & (map_y >= 0.0)
@@ -1492,6 +1550,9 @@ def serialize_map_pair(pair: MapPair, out_dir: Path, tag: str, desc: str) -> Non
     meta.update(table_spaces(tag))
     # 索引网格可能被 --table-size 降采样，但两侧的完整图像尺寸仍是标定分辨率
     meta['index_full_size'] = list(pair.source_size)
+    # 只允许整数倍等比缩小，所以两个方向共用一个倍率，C 端换算不必再分 step_x/step_y：
+    #   full = (small + 0.5) * downsample_factor - 0.5
+    meta['downsample_factor'] = downsample_factor(pair.source_size, pair.size)
     meta['value_full_size'] = list(pair.source_size)
     (out_dir / 'metadata.json').write_text(
         json.dumps(meta, indent=2, ensure_ascii=False), encoding='utf-8')
@@ -1689,6 +1750,11 @@ def export_all(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
     `ipm_state` 若给出，会写进 matrix 的暂存区，随事务一起提交；这样就不必
     事先单独保存状态文件，也就不会出现"新状态 + 旧矩阵"的中间态。
     """
+    # 网格合法性先在这里校验一次。prepare_map_pair 里那道才是权威（流水线的唯一收口），
+    # 但它发生在矩阵已经写进暂存区之后，日志上会先冒出一句"六矩阵已保存"再报错，
+    # 读起来像是写坏了一半。提前拦一次纯粹为了这句话不误导人。
+    downsample_factor(size, TABLE_SIZE)
+
     table_stage = DIR_TABLE.with_name(DIR_TABLE.name + '.staging')
     matrix_stage = DIR_MATRIX.with_name(DIR_MATRIX.name + '.staging')
     for stage, target in ((table_stage, DIR_TABLE), (matrix_stage, DIR_MATRIX)):
@@ -1895,7 +1961,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help='txt（默认，逗号分隔文本，与历史产物一致）/ '
                             'bin（int16 定点裸二进制）/ c（自包含 C 头文件）')
     tbl_g.add_argument('--table-size', nargs=2, type=int, metavar=('W', 'H'),
-                       help='把表重采样到该网格，例如 320 240；不给则与图像同尺寸')
+                       help='把表重采样到该网格；只允许整数倍**等比**缩小，'
+                            '例如 1280x720 源图可用 640 360 / 320 180 / 256 144 / 160 90；'
+                            '320 240 会被拒绝（x 4 倍、y 3 倍，破坏公制纵横比）。不给则与图像同尺寸')
     tbl_g.add_argument('--table-fixed-point', type=int, metavar='N',
                        help='bin/c 的定点小数位数，默认 4（即 1/16 px）')
 
@@ -2571,8 +2639,8 @@ def load_or_run_calibration(force: bool = False
         else:
             print('未找到 calib.json，开始从标定照片重新标定。')
         spec = BOARD          # 显式捕获：provenance 跟着本次实际用的板走
-        K, D, img_size, _fit = calibrate_camera(board=spec)
-        save_calibration(K, D, img_size, board=spec)
+        K, D, img_size, fit = calibrate_camera(board=spec)
+        save_calibration(K, D, img_size, board=spec, fit_result=fit)
     Knew = resolve_new_camera_matrix(K, D, img_size)
     assert_invertible('K', K)
     assert_invertible('Knew', Knew)

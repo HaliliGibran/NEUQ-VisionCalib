@@ -31,6 +31,8 @@ TABLE_FIXED_POINT"的策略编排，所以留。
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import math
+
 import cv2
 import numpy as np
 
@@ -39,6 +41,58 @@ from .geometry import (
     apply_homography,
     homography_denominator,
 )
+
+
+def downsample_factor(source_size: Tuple[int, int],
+                      table_size: Optional[Tuple[int, int]]) -> int:
+    """校验查找表网格是源尺寸的整数倍等比缩小，返回倍率 n；不合法则抛 ValueError。
+
+    为什么必须**等比**：BirdView 的公制尺度是各向同性的（scale px/cm 对 x 与 y 同一个
+    值）。1280x720 降成 320x240 时 x 缩 4 倍、y 缩 3 倍，于是小图里
+    x 是 scale/4、y 是 scale/3 —— 一个物理上严格 45x45 cm 的正方形会变成
+    53.8 x 71.7 px 的竖长矩形，宽高比 0.75。C 端若直接拿这张图找线、算角度、
+    曲率、横向误差，赛道会被横向压缩 25%，全部失真。而 batch_test() 输出的正是
+    这张真实的小图，所以风险不是理论上的。
+
+    等比之后 C 端的坐标换算也从两个 step 简化成一个 n：
+        full_x = (small_x + 0.5) * n - 0.5
+        full_y = (small_y + 0.5) * n - 0.5
+
+    table_size 为 None（不降采样）时返回 1。
+    """
+    sw, sh = int(source_size[0]), int(source_size[1])
+    if sw <= 0 or sh <= 0:
+        raise ValueError(f'源图尺寸必须为正，收到 {source_size}。')
+    if table_size is None:
+        return 1
+    tw, th = int(table_size[0]), int(table_size[1])
+    if tw <= 0 or th <= 0:
+        raise ValueError(f'查找表网格必须为正，收到 {table_size}。')
+    if tw > sw or th > sh:
+        raise ValueError(f'查找表网格不能大于源图尺寸：源图 {sw}x{sh}，收到 {tw}x{th}。')
+
+    if sw % tw == 0 and sh % th == 0 and sw // tw == sh // th:
+        return sw // tw
+
+    allowed = ', '.join(f'{sw // n}x{sh // n}' for n in table_grid_factors(sw, sh)
+                        if n > 1)
+    raise ValueError(
+        '查找表只能按整数倍等比例降采样。\n'
+        f'当前源图 {sw}x{sh}，{tw}x{th} 分别对应 {sw / tw:g}x 与 {sh / th:g}x，'
+        '会破坏 BirdView 公制纵横比。\n'
+        + (f'例如可使用 {allowed}。' if allowed else '当前源图尺寸没有可用的等比倍率。'))
+
+
+def table_grid_factors(width: int, height: int, min_width: int = 80,
+                       min_height: int = 45) -> list:
+    """能同时整除宽高、且结果网格不至于小到没用的所有倍率（升序，含 1）。
+
+    界面直接拿它生成"降采样倍率"下拉项，所以允许倍率只有这一处定义——让用户自己填
+    宽高就一定会有人填出 320x240 那种 4x/3x 的组合。
+    """
+    limit = math.gcd(int(width), int(height))
+    return [n for n in range(1, limit + 1)
+            if limit % n == 0 and width // n >= min_width and height // n >= min_height]
 
 
 def resample_map_pair(map_x: np.ndarray, map_y: np.ndarray,

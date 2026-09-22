@@ -122,11 +122,16 @@
         <label>定点位 <input id="in-table-fp" type="number" min="0" max="15" value="4"></label>
       </div>
       <div class="pair">
-        <label>降采样宽 <input id="in-table-w" type="number" min="8" placeholder="留空=原尺寸"></label>
-        <label>降采样高 <input id="in-table-h" type="number" min="8" placeholder="留空=原尺寸"></label>
+        <label>降采样倍率
+          <select id="in-table-factor"></select>
+        </label>
       </div>
+      <p class="hint">只允许<b>整数倍等比</b>降采样。<code>320×240</code> 这类组合是非法的：
+        它让 x 缩 4 倍、y 缩 3 倍，16:9 的 BirdView 被压成 4:3，物理上 45×45 cm 的正方形
+        会变成宽高比 0.75 的竖长矩形，C 端拿它算角度、曲率、横向误差全部失真。</p>
       <p class="hint">全尺寸文本表在 720p 下约 56 MB，单片机放不下。
-        <code>bin</code> + <code>320×240</code> 约 1.2 MB，是能上车的量级。</p>
+        <code>bin</code> + <code>4×（320×180）</code> 约 0.9 MB，是能上车的量级。
+        等比之后 C 端只需一个倍率 n：<code>full = (small + 0.5) × n − 0.5</code>。</p>
       <button id="btn-commit" class="primary">导出矩阵与查找表</button>
       <button id="btn-batch" class="ghost">只重跑批量测试</button>
     </article>

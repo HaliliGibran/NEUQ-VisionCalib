@@ -868,15 +868,41 @@ function currentThreshold() {
   return (isFinite(v) && v > 0) ? v : null;
 }
 
-/** 打表选项。宽高都填了才降采样，否则保持原尺寸。 */
+/** 打表选项。降采样只给倍率，宽高由服务端按标定分辨率算。 */
 function tableOptions() {
-  const w = parseInt($('in-table-w').value, 10);
-  const h = parseInt($('in-table-h').value, 10);
+  const n = parseInt($('in-table-factor').value, 10);
   return {
     table_format: $('in-table-format').value,
     table_fixed_point: parseInt($('in-table-fp').value, 10),
-    table_size: (w > 0 && h > 0) ? [w, h] : null,
+    table_factor: (n > 1) ? n : 1,
   };
+}
+
+/** 用服务端给的清单填「降采样倍率」下拉框。前端不做任何除法。 */
+function fillTableFactors(options) {
+  const sel = $('in-table-factor');
+  if (!sel) return;
+  if (!options || !options.length) {
+    // 可用倍率只能由标定分辨率决定，还没标定就老实说，不要凭空列一批选项
+    if (!sel.options.length) {
+      sel.innerHTML = '<option value="1">标定后可选</option>';
+    }
+    return;
+  }
+  const keep = sel.value;
+  sel.innerHTML = '';
+  options.forEach((o) => {
+    const opt = document.createElement('option');
+    opt.value = String(o.factor);
+    opt.textContent = (o.factor === 1)
+      ? `原始 ${o.width}×${o.height}`
+      : `1/${o.factor}：${o.width}×${o.height}`;
+    sel.appendChild(opt);
+  });
+  // 默认选 4×：1280×720 下就是 320×180，四组表约 0.9 MB，是当前推荐的上车规格
+  const want = options.some((o) => String(o.factor) === keep) ? keep
+    : (options.some((o) => o.factor === 4) ? '4' : String(options[0].factor));
+  sel.value = want;
 }
 
 function schedulePreview(immediate) {
@@ -1514,8 +1540,9 @@ function bindActions() {
     }
     try {
       const opts = tableOptions();
+      const grid = $('in-table-factor').selectedOptions[0];
       log(`导出中：表格式 ${opts.table_format}`
-        + (opts.table_size ? `，网格 ${opts.table_size[0]}x${opts.table_size[1]}` : '，原尺寸')
+        + `，${grid ? grid.textContent : `${opts.table_factor}×`}`
         + (opts.table_format === 'txt' ? '' : `，Q${opts.table_fixed_point}`));
       const data = await api('/api/commit', { ...previewParams(), ...opts });
       state.committedQuad = state.quad.map((p) => p.slice());
@@ -1647,6 +1674,7 @@ function bindActions() {
       $('in-target-w').value = st.target_init.width_cm;
       $('in-target-f').value = st.target_init.forward_cm;
     }
+    fillTableFactors(st.table_grid_options);
 
     // 上次用的原图若还在候选里就优先选它，否则退回第一张
     const pick = (savedName && st.ipm_candidates.includes(savedName))

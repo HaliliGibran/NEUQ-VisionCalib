@@ -3,14 +3,15 @@
 交付给嵌入式 C 端的是一堆映射表。表一旦内部不一致（方向搞反、无效点没标、精度不够），
 在车上是极难排查的。这个脚本把每条约定都独立验一遍：
 
-  1. H 把源四点映射成矩形，且尺寸/邻边垂直/旋转角/锚点四项不变量成立
-  2. undistort/reverse 表 remap 的结果 == cv2.undistort
-  3. undistort_ipm/reverse 表 remap 的结果 == cv2.warpPerspective(去畸变图, H)
-  4. undistort_ipm 的 forward 与 reverse 互为逆映射
-  5. 无效哨兵只出现在合法区域之外，且有效区连通
-  6. 落盘的 forward 与 reverse **各自**等于流水线应当生成的那张表
+  1. H 把源四点映射成矩形，且尺寸/邻边垂直/旋转角/参考原点四项不变量成立
+  2. 表网格是源图的整数倍**等比**缩小（非等比会破坏 BirdView 的公制纵横比）
+  3. undistort/reverse 表 remap 的结果 == cv2.undistort
+  4. undistort_ipm/reverse 表 remap 的结果 == cv2.warpPerspective(去畸变图, H)
+  5. undistort_ipm 的 forward 与 reverse 互为逆映射
+  6. 无效哨兵只出现在合法区域之外，且有效区连通
+  7. 落盘的 forward 与 reverse **各自**等于流水线应当生成的那张表
 
-第 6 条才是主判据。理由见 check_forward_reverse 的 docstring：一对经过栅格化、
+第 7 条才是主判据。理由见 check_forward_reverse 的 docstring：一对经过栅格化、
 INTER_AREA 重采样与定点量化的离散表，本来就不保证严格互逆，把"互逆"当成必须成立的
 数学不变量会得到一个随 scale 漂移的假失败。职责因此分成三段：
 
@@ -252,6 +253,29 @@ def compare_to_pipeline(root: Path, direction: str,
     return report(name, ok,
                   f'最大差 {max_err:.4f} px（容差 {tol:.4f}），'
                   f'有效点 {int(good.sum())}，无效判定不一致 {mismatch} 个')
+
+
+def check_grid_isotropy() -> bool:
+    """检查 7: 表网格必须是源图的**整数倍等比**缩小。
+
+    这一条是交付级的公制几何门槛，不是格式挑剔。1280x720 降成 320x240 时 x 缩 4 倍、
+    y 缩 3 倍，小图里的公制尺度就变成 x=scale/4、y=scale/3——一个物理上 45x45 cm 的
+    正方形会成为 53.8 x 71.7 px、宽高比 0.75 的竖长矩形。C 端若直接拿这张图找线、
+    算角度、曲率、横向误差，赛道被横向压缩 25%，全部失真。而 batch_test() 输出的
+    正是这张真实的小图，所以风险不是理论上的。
+
+    等比之后 C 端只需要一个倍率 n：full = (small + 0.5) * n - 0.5。
+    """
+    sw, sh = IMAGE_SIZE
+    tw, th = (TABLE_SHAPE if TABLE_SHAPE else IMAGE_SIZE)
+    try:
+        n = core.downsample_factor(IMAGE_SIZE, (tw, th))
+    except ValueError as exc:
+        return report('表网格为整数倍等比', False, str(exc).replace('\n', ' '))
+    return report('表网格为整数倍等比',
+                  True,
+                  f'源图 {sw}x{sh} -> 网格 {tw}x{th}，倍率 {n}x（x/y 同一倍率）；'
+                  f'C 端换算 full = (small + 0.5) * {n} - 0.5')
 
 
 def check_export_fidelity(root: Path, calib: dict, matrices: dict) -> bool:
@@ -653,6 +677,7 @@ def main() -> int:
 
     results = [
         check_homography(matrices),
+        check_grid_isotropy(),
         check_undistort_tables(root, calib),
         check_composite_tables(root, calib, matrices),
         check_forward_reverse(root),

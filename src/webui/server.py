@@ -225,6 +225,30 @@ def _state_pair(key_a: str, key_b: str,
     return a, b
 
 
+def table_grid_options() -> list:
+    """查找表可选的降采样倍率清单，供界面渲染下拉项。
+
+    尺寸基准取标定分辨率：本轮进程里的 `STATE['img_size']` 优先，否则读 `calib.json`。
+    两者都拿不到就返回空列表——可用倍率**只能**由源图尺寸决定，凭空猜一个 1280x720
+    会让界面列出一批对当前工程并不成立的选项。标定完成后状态会刷新，届时自然有值。
+
+    只给"倍率 + 结果网格"两项，页面不做任何除法：1280x720 下用户能看到的就是
+    1x/2x/4x/5x/8x/10x/16x，压根没有 320x240 这个选项。
+    """
+    size = STATE['img_size']
+    if not size:
+        try:
+            loaded = core.load_calibration()
+            size = loaded[2] if loaded else None
+        except (SystemExit, OSError, ValueError, KeyError, TypeError, IndexError):
+            size = None
+    if not size:
+        return []
+    w, h = int(size[0]), int(size[1])
+    return [{'factor': n, 'width': w // n, 'height': h // n}
+            for n in core.table_grid_factors(w, h)]
+
+
 def initial_phys_size() -> tuple[float, float]:
     """网页上「物理尺寸」两个输入框的初值：已保存的 ipm_state 优先于默认值。
 
@@ -335,6 +359,9 @@ def api_status() -> dict:
         'phys_init': {'w': phys_w, 'h': phys_h},
         # 目标地面窗口初值，同一套优先级。这是**构图目标**，不是有效性边界。
         'target_init': {'width_cm': target_w, 'forward_cm': target_f},
+        # 查找表允许的降采样倍率。由服务端按标定分辨率算好，页面只负责渲染下拉项——
+        # 前端自己拼宽高就会出现 320x240 那种非等比组合，而那会破坏公制纵横比。
+        'table_grid_options': table_grid_options(),
 
         'ipm_candidates': [p.name for p in core.list_images(core.DIR_IPM_IN)],
         'ipm_source': safe_rel(STATE['src_path']) if STATE['src_path'] else None,
@@ -822,7 +849,7 @@ def api_calibrate(body: dict) -> dict:
         if body.get('force') or not core.CALIB_JSON.is_file():
             spec = core.BOARD     # 显式捕获：provenance 跟着本次实际用的板走
             K, D, img_size, fit = core.calibrate_camera(board=spec)
-            core.save_calibration(K, D, img_size, board=spec)
+            core.save_calibration(K, D, img_size, board=spec, fit_result=fit)
         else:
             print(f'复用已有标定文件 {core.CALIB_JSON.name}'
                   '（勾选"强制重新标定"可从头再算一遍）。')
@@ -1020,17 +1047,24 @@ def apply_table_options(body: dict) -> None:
     if fmt in ('txt', 'bin', 'c'):
         core.TABLE_FORMAT = fmt
 
-    size = body.get('table_size')
-    if size:
-        try:
-            w, h = int(size[0]), int(size[1])
-        except (TypeError, ValueError, IndexError):
-            raise ValueError('降采样尺寸格式不对，应为 [宽, 高]。') from None
-        if w <= 0 or h <= 0:
-            raise ValueError('降采样尺寸必须为正整数。')
-        core.TABLE_SIZE = (w, h)
-    else:
+    # 网页只给"降采样倍率"，不给宽高。让用户自己填两个数，就一定会出现 320x240
+    # 这种 x 缩 4 倍、y 缩 3 倍的组合——那会把 16:9 的 BirdView 非等比压成 4:3，
+    # 一个物理上 45x45 cm 的正方形在小图里变成宽高比 0.75 的竖长矩形，C 端拿它算
+    # 角度、曲率、横向误差全部失真。倍率这种表示法连表达非法组合的能力都没有。
+    factor = body.get('table_factor')
+    if factor in (None, '', 1, '1'):
         core.TABLE_SIZE = None
+    else:
+        try:
+            n = int(factor)
+        except (TypeError, ValueError):
+            raise ValueError('降采样倍率必须是整数。') from None
+        w, h = STATE['img_size']
+        if n not in core.table_grid_factors(w, h):
+            allowed = '、'.join(f'{n2}x（{w // n2}x{h // n2}）'
+                               for n2 in core.table_grid_factors(w, h))
+            raise ValueError(f'{n}x 不是 {w}x{h} 的可用等比倍率。可选：{allowed}。')
+        core.TABLE_SIZE = (w // n, h // n)
 
     fp = body.get('table_fixed_point')
     if fp not in (None, ''):
