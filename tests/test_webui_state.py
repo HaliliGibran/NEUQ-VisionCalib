@@ -808,9 +808,33 @@ def main() -> int:
     check(total == 1,
           '整个 app.js 只有这一处调用点，不存在"初始化一套、刷新另一套"',
           f'实际 {total} 处')
-    check('fillTableFactors' in app_js.split(anchor)[0]
-          or 'function fillTableFactors' in app_js,
-          'fillTableFactors 有定义（函数声明提升，定义在后面调用也成立）')
+
+    # 反向状态同样要同步：已标定 → 清空之后 options 变空，旧倍率必须消失。
+    # 这里曾经有个 `if (!sel.options.length)` 守卫，于是"未标定→标定"修好了，
+    # "已标定→清空"却残留着「1/4：320×180」，看着像还能选，实际已无标定基础。
+    fn_anchor = 'function fillTableFactors(options) {'
+    fstart = app_js.find(fn_anchor)
+    check(fstart >= 0, 'app.js 里找得到 fillTableFactors 定义')
+    depth, fend = 0, len(app_js)
+    for i in range(fstart + len(fn_anchor) - 1, len(app_js)):
+        if app_js[i] == '{':
+            depth += 1
+        elif app_js[i] == '}':
+            depth -= 1
+            if depth == 0:
+                fend = i
+                break
+    fn_body = app_js[fstart:fend]
+    # 只看代码，不看注释：注释里写着"这里曾经有个 sel.options.length 守卫"是好事，
+    # 不该让它把检查判失败。这一段里没有 // 出现在字符串里，按行截断就够了。
+    fn_code = '\n'.join(line.split('//')[0] for line in fn_body.splitlines())
+    check('sel.options.length' not in fn_code,
+          '空清单分支里没有 sel.options.length 守卫——清空必须无条件生效',
+          '有这个守卫就只能单向同步')
+    check('标定后可选' in fn_body and 'sel.disabled = true' in fn_body
+          and 'sel.disabled = false' in fn_body,
+          '空清单回到「标定后可选」并置灰，有值时恢复可用',
+          '置灰比"能展开但其实不能用"更说得清')
 
     print()
     if FAILED:

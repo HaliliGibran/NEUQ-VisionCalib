@@ -888,12 +888,15 @@ function fillTableFactors(options) {
   const sel = $('in-table-factor');
   if (!sel) return;
   if (!options || !options.length) {
-    // 可用倍率只能由标定分辨率决定，还没标定就老实说，不要凭空列一批选项
-    if (!sel.options.length) {
-      sel.innerHTML = '<option value="1">标定后可选</option>';
-    }
+    // 空清单要**无条件**清掉旧选项。这里曾加过 `if (!sel.options.length)` 的守卫，
+    // 结果只修好了"未标定 → 标定"，"已标定 → 清空"反过来会残留：calib.json 已经
+    // 没了、options 变空，而下拉框里还挂着「1/4：320×180」，看着像还能选，
+    // 实际上工程已经没有标定基础。状态同步必须双向。
+    sel.innerHTML = '<option value="1">标定后可选</option>';
+    sel.disabled = true;
     return;
   }
+  sel.disabled = false;
   const keep = sel.value;
   sel.innerHTML = '';
   options.forEach((o) => {
