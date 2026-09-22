@@ -28,7 +28,7 @@ import zipfile
 from contextlib import redirect_stdout, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 FROZEN = getattr(sys, 'frozen', False)
 
@@ -653,29 +653,67 @@ def api_backup_list() -> dict:
     return {'items': items, 'count': len(items)}
 
 
-def api_preview_gallery() -> dict:
-    """列出去畸变成果图，并配对回对应的标定原图。
+def image_url(path: Path) -> str:
+    """拼出 /api/image 的取图地址。
 
-    calib_preview/ 里的文件名规则是 {原图名}_undist.jpg（见 export_undistort_previews），
-    据此反查 calib_input/ 里的原图，前端就能做"原图 vs 去畸变"并排对照——
-    这正是这个目录存在的意义：验收畸变矫正到底做没做对。
+    路径统一用正斜杠再整体转义：serve_image 拿到后是 core.SCRIPT_DIR / rel，
+    两种分隔符在 Windows 上都能拼对，但只有正斜杠在 URL 里读得懂。
+    调用方可以再追加 &max=<像素> 限制最大边（缩略图与大图共用同一条地址）。
     """
-    items = []
-    for p in core.list_images(core.DIR_CALIB_PREVIEW):
-        stem = p.stem[:-len('_undist')] if p.stem.endswith('_undist') else p.stem
-        # 原图扩展名可能与预览图不同，按 stem 在标定目录里找同名的任意图片
-        source = next((q for q in core.list_images(core.DIR_CALIB_IN)
-                       if q.stem == stem), None)
-        items.append({
-            # 前端拿这个相对路径去请求 /image，必须相对工程根（core.SCRIPT_DIR），
-            # 不能只拼目录名——数据目录已经收拢到 data/ 下了。
-            'preview': safe_rel(p),
-            'source': (safe_rel(source) if source is not None else None),
-            'stem': stem,
-        })
-    items.sort(key=lambda it: it['stem'])
-    return {'items': items, 'count': len(items),
-            'paired': sum(1 for it in items if it['source'])}
+    return '/api/image?rel=' + quote(safe_rel(path).replace('\\', '/'))
+
+
+def pair_preview_images() -> list[dict]:
+    """把 calib_input/ 的原图与 calib_preview/ 的去畸变图配成一组一组。
+
+    配对只认磁盘上真实存在的文件：以原图为准建槽位，再拿预览图去填。
+    命名规则（{原图名}_undist.jpg，见 export_undistort_previews）只作为"这张
+    预览图属于谁"的线索，认不出来的、或者对应槽位已经被占了的，一律单独成组、
+    原图侧留空——绝不允许一张预览图挤掉别人的位置，那会让界面把 A 的原图和
+    B 的去畸变图摆在一起，而这正是"并排对照"最不能出的错。
+    """
+    suffix = '_undist'
+    slots: dict[str, dict] = {}
+    for p in core.list_images(core.DIR_CALIB_IN):
+        slots[p.stem] = {'name': p.stem, 'raw': p, 'undistorted': None}
+
+    previews = core.list_images(core.DIR_CALIB_PREVIEW)
+    # 带 _undist 后缀的先认领：calib_preview/ 里万一混进一份与原图同名的拷贝，
+    # 不能让它抢在真正的去畸变图前面占掉槽位。
+    for q in sorted(previews, key=lambda q: (not q.stem.endswith(suffix), q.stem)):
+        stem = q.stem[:-len(suffix)] if q.stem.endswith(suffix) else q.stem
+        slot = slots.get(stem)
+        if slot is not None and slot['undistorted'] is None:
+            slot['undistorted'] = q
+            continue
+        # 配不上任何原图（原图被删了/改名了），或那张原图已经有去畸变图了：
+        # 用文件名另开一组，键名带扩展名以免和原图槽位撞车。名字仍给去掉
+        # _undist 的那个照片名——这一组的原图侧是空的，不存在配错的风险。
+        slots[q.name] = {'name': stem, 'raw': None, 'undistorted': q}
+
+    return [slots[key] for key in sorted(slots, key=lambda k: (slots[k]['name'], k))]
+
+
+def api_preview_gallery() -> dict:
+    """列出"原图 vs 去畸变"对照组，配对关系由服务端给定。
+
+    前端不再自己拼 calib_preview/xxx_undist.jpg 去猜谁配谁：名字规则一旦不成立
+    （改过名、扩展名不同、少了一张），前端猜出来的地址要么 404 要么张冠李戴。
+    这里直接给出两侧的取图地址，缺哪侧就是 null，让界面显示空态。
+    """
+    items = [{
+        'name': slot['name'],
+        'raw_url': image_url(slot['raw']) if slot['raw'] is not None else None,
+        'undistorted_url': (image_url(slot['undistorted'])
+                            if slot['undistorted'] is not None else None),
+    } for slot in pair_preview_images()]
+    return {
+        'items': items,
+        'count': len(items),
+        'paired': sum(1 for it in items if it['raw_url'] and it['undistorted_url']),
+        'missing_raw': sum(1 for it in items if not it['raw_url']),
+        'missing_undistorted': sum(1 for it in items if not it['undistorted_url']),
+    }
 
 
 def api_calibrate(body: dict) -> dict:

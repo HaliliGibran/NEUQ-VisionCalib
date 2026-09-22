@@ -1011,12 +1011,14 @@ async function openGallery() {
     gallery.items.forEach((it, i) => {
       const el = document.createElement('div');
       el.className = 'shot';
-      el.title = it.stem;
+      el.title = it.name;
       const img = document.createElement('img');
       img.loading = 'lazy';
-      img.src = '/api/image?rel=' + encodeURIComponent(it.preview) + '&max=360';
+      // 缩略图优先用去畸变图；只剩原图时也得让这一组可点开，
+      // 但要在标签上说清楚，别让人把原图当成去畸变成果验收了。
+      img.src = thumbUrl(it.undistorted_url || it.raw_url, 360);
       const span = document.createElement('span');
-      span.textContent = it.stem;
+      span.textContent = it.undistorted_url ? it.name : it.name + '（缺去畸变）';
       el.append(img, span);
       el.onclick = () => showGalleryItem(i);
       grid.appendChild(el);
@@ -1026,8 +1028,14 @@ async function openGallery() {
   $('gallery-count').textContent = String(gallery.items.length);
   $('gallery-viewer').hidden = true;
   $('gallery').hidden = false;
-  log(`打开成果图画廊：${gallery.items.length} 张去畸变图，`
-    + `其中 ${data.paired} 张能配到原图。`);
+  log(`打开成果图画廊：${gallery.items.length} 组对照，`
+    + `其中 ${data.paired} 组两侧齐全`
+    + `（缺原图 ${data.missing_raw}，缺去畸变 ${data.missing_undistorted}）。`);
+}
+
+/** 给服务端下发的取图地址补上最大边限制。 */
+function thumbUrl(url, maxEdge) {
+  return url + '&max=' + maxEdge;
 }
 
 function closeGallery() {
@@ -1041,17 +1049,10 @@ function showGalleryItem(i) {
   gallery.index = i;
   const it = gallery.items[i];
 
-  $('viewer-preview').src =
-    '/api/image?rel=' + encodeURIComponent(it.preview) + '&max=1600';
-  if (it.source) {
-    $('viewer-source').src =
-      '/api/image?rel=' + encodeURIComponent(it.source) + '&max=1600';
-  } else {
-    $('viewer-source').removeAttribute('src');
-  }
-  $('viewer-name').textContent = `${i + 1} / ${gallery.items.length}  ·  ${it.stem}`;
+  setPane('viewer-source', it.raw_url);
+  setPane('viewer-preview', it.undistorted_url);
+  $('viewer-name').textContent = `${it.name}  ·  ${i + 1} / ${gallery.items.length}`;
   $('gallery-viewer').hidden = false;
-  applyCompare();
 
   document.querySelectorAll('#gallery-grid .shot').forEach((el, k) => {
     el.classList.toggle('active', k === i);
@@ -1060,13 +1061,23 @@ function showGalleryItem(i) {
   if (active) active.scrollIntoView({ block: 'nearest' });
 }
 
-/** 按勾选状态决定是否并排显示原图；没有配到原图时强制隐藏该栏。 */
-function applyCompare() {
-  const want = $('gallery-compare').checked;
-  const it = gallery.items[gallery.index];
-  const hasSource = !!(it && it.source);
-  $('pane-source').hidden = !(want && hasSource);
-  $('gallery-compare').disabled = !hasSource;
+/** 装一侧的图；地址为空就清掉 src 并露出空态占位。
+
+    清 src 这一步是硬要求：留着上一张的 src 的话，缺失的那一侧会继续显示
+    上一组的图，看上去就是"A 的原图配 B 的去畸变图"——比什么都不显示更糟。
+ */
+function setPane(imgId, url) {
+  const img = $(imgId);
+  const miss = $(imgId + '-missing');
+  if (url) {
+    img.src = thumbUrl(url, 1600);
+    img.hidden = false;
+    miss.hidden = true;
+  } else {
+    img.removeAttribute('src');
+    img.hidden = true;
+    miss.hidden = false;
+  }
 }
 
 function galleryStep(delta) {
@@ -1079,7 +1090,6 @@ function galleryStep(delta) {
 function bindGallery() {
   $('btn-gallery').onclick = () => withBusy($('btn-gallery'), openGallery);
   $('gallery-close').onclick = closeGallery;
-  $('gallery-compare').onchange = applyCompare;
   $('viewer-prev').onclick = () => galleryStep(-1);
   $('viewer-next').onclick = () => galleryStep(1);
   // 点遮罩空白处关闭（点面板内部不关）

@@ -13,6 +13,8 @@
       pending / .old 是"不可判定"的一档，后者连 api_source 都要被拒
   B. 备份 manifest 带 project_config 快照，且清空后素材库依据作废
   C. 备份目录跟着 --root 现取（不能停在 import 时抄下来的旧根）
+  D. /api/preview_gallery 的配对由服务端按真实文件给出，缺哪一侧就是 null，
+     且绝不把别的照片的图串到空出来的那一侧
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import unquote
 
 import numpy as np
 
@@ -47,6 +50,24 @@ def floors(folder: Path, n: int) -> Path:
         core.safe_imwrite(folder / f'floor_{i}.jpg',
                           np.full((80, 80, 3), 128, np.uint8))
     return folder
+
+
+def rel_of(url: str | None) -> str | None:
+    """从 /api/image?rel=... 里取回相对路径，用来核对两侧指的是哪张文件。"""
+    if not url:
+        return None
+    return unquote(url.split('rel=', 1)[1])
+
+
+def calib_pairs(stems: list[str]) -> None:
+    """在当前工程根下造出成对的标定原图与去畸变图。"""
+    core.DIR_CALIB_IN.mkdir(parents=True, exist_ok=True)
+    core.DIR_CALIB_PREVIEW.mkdir(parents=True, exist_ok=True)
+    for i, stem in enumerate(stems):
+        core.safe_imwrite(core.DIR_CALIB_IN / f'{stem}.jpg',
+                          np.full((16, 16, 3), 20 + 10 * i, np.uint8))
+        core.safe_imwrite(core.DIR_CALIB_PREVIEW / f'{stem}_undist.jpg',
+                          np.full((16, 16, 3), 21 + 10 * i, np.uint8))
 
 
 def main() -> int:
@@ -191,6 +212,54 @@ def main() -> int:
               'dir_backup() 与 core 当前根一致', str(server.dir_backup()))
         check(other in server.dir_backup().parents,
               '换根之后备份落在新根下', str(server.dir_backup()))
+
+        # ---- D. 成果图画廊：配对是服务端按真实文件算的，缺一侧只能是空态
+        # 前端原来自己拼 calib_preview/<名字>_undist.jpg 去猜谁配谁，一旦某一侧
+        # 少了文件，"并排对照"就可能把 A 的原图和 B 的去畸变图摆在一起——
+        # 那比不显示更糟：验收的人会据此判断畸变矫正做对了。
+        print('\n[D] /api/preview_gallery 配对与缺失空态')
+        core.configure_paths(root=tmp / 'gallery_root')
+        stems = ['shot_a', 'shot_b', 'shot_c']
+        calib_pairs(stems)
+
+        g = server.api_preview_gallery()
+        check(g['count'] == 3 and g['paired'] == 3
+              and g['missing_raw'] == 0 and g['missing_undistorted'] == 0,
+              '三组齐全时 count/paired 都是 3',
+              f"count={g['count']} paired={g['paired']}")
+        check([it['name'] for it in g['items']] == stems,
+              '每组有一个名字，顺序按名字排',
+              str([it['name'] for it in g['items']]))
+        check(all(rel_of(it['raw_url']) == f"calib_input/{it['name']}.jpg"
+                  and rel_of(it['undistorted_url'])
+                  == f"calib_preview/{it['name']}_undist.jpg"
+                  for it in g['items']),
+              '两个地址指向同一张照片的两个版本（服务端给的配对）',
+              f"{rel_of(g['items'][0]['raw_url'])} | "
+              f"{rel_of(g['items'][0]['undistorted_url'])}")
+
+        # 去畸变图被改名：那一组的 undistorted_url 必须是 null，raw_url 照旧
+        gone = core.DIR_CALIB_PREVIEW / 'shot_b_undist.jpg'
+        gone.rename(gone.parent / (gone.name + '.bak'))
+        g2 = server.api_preview_gallery()
+        b = next(it for it in g2['items'] if it['name'] == 'shot_b')
+        check(g2['count'] == 3 and g2['missing_undistorted'] == 1
+              and b['undistorted_url'] is None
+              and rel_of(b['raw_url']) == 'calib_input/shot_b.jpg',
+              '缺去畸变图时该组只报空态，原图仍是自己的那张', str(b))
+        check(all(rel_of(it['undistorted_url']) == f"calib_preview/{it['name']}_undist.jpg"
+                  for it in g2['items'] if it['name'] != 'shot_b'),
+              '缺的那一侧没有串到别的照片上（其余两组配对不变）',
+              str([rel_of(it['undistorted_url']) for it in g2['items']]))
+        gone.parent.joinpath(gone.name + '.bak').rename(gone)
+
+        # 反过来：原图被删，去畸变图还在，那一组的 raw_url 为 null
+        (core.DIR_CALIB_IN / 'shot_c.jpg').unlink()
+        g3 = server.api_preview_gallery()
+        c = next(it for it in g3['items'] if it['name'] == 'shot_c')
+        check(g3['count'] == 3 and g3['missing_raw'] == 1 and c['raw_url'] is None
+              and rel_of(c['undistorted_url']) == 'calib_preview/shot_c_undist.jpg',
+              '缺原图时该组仍在列，只是原图侧为空', str(c))
     finally:
         core.configure_paths(root=old_root)
         core.configure_board(old_board)

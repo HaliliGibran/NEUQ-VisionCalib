@@ -367,12 +367,21 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   flex: 1 1 0; min-width: 0; margin: 0;
   display: flex; flex-direction: column; gap: 4px;
 }
-.viewer-pane[hidden] { display: none; }
 .viewer-pane img {
   flex: 1 1 auto; min-height: 0; width: 100%;
   object-fit: contain; background: #202020;
   border-radius: 8px;
 }
+/* 某一侧的文件不存在时顶上来的占位：撑满这一栏，保持左右对齐，
+   这样另一侧不会被拉宽，也不会让人以为两张图是一对。 */
+.pane-missing {
+  flex: 1 1 auto; min-height: 0; margin: 0;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px dashed var(--border-2); border-radius: 8px;
+  background: var(--panel);
+  color: var(--faint); font-size: 12px;
+}
+.pane-missing[hidden] { display: none; }
 .viewer-pane figcaption {
   flex: 0 0 auto; text-align: center;
   font-size: 11px; color: var(--muted);
@@ -387,9 +396,11 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 }
 .viewer-bar .mono { font-size: 12px; color: var(--muted); }
 
+/* 窄窗口：两栏并排会挤成两条细缝，改成上下堆叠，并把对照区让得更高一些 */
 @media (max-width: 900px) {
   .viewer-stage { flex-direction: column; }
-  .gallery-viewer { height: 64%; }
+  .viewer-pane img, .pane-missing { min-height: 120px; }
+  .gallery-viewer { height: 72%; }
 }
 
 /* 标定板规格的三个数字并排 */

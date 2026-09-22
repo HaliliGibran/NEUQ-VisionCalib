@@ -203,7 +203,6 @@
     <header class="gallery-head">
       <h2>标定去畸变成果 · <span id="gallery-count">0</span> 张</h2>
       <div class="gallery-tools">
-        <label class="row"><input id="gallery-compare" type="checkbox" checked> 并排显示原图</label>
         <button id="gallery-close" class="ghost sm" type="button">关闭（Esc）</button>
       </div>
     </header>
@@ -211,12 +210,14 @@
       <div id="gallery-grid" class="gallery-grid"></div>
       <div id="gallery-viewer" class="gallery-viewer" hidden>
         <div class="viewer-stage">
-          <figure class="viewer-pane" id="pane-source">
+          <figure class="viewer-pane">
             <img id="viewer-source" alt="原图">
+            <p id="viewer-source-missing" class="pane-missing" hidden>原图缺失</p>
             <figcaption>原图（带畸变）</figcaption>
           </figure>
           <figure class="viewer-pane">
             <img id="viewer-preview" alt="去畸变后">
+            <p id="viewer-preview-missing" class="pane-missing" hidden>去畸变图缺失</p>
             <figcaption>去畸变后</figcaption>
           </figure>
         </div>
