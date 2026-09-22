@@ -1,12 +1,8 @@
-"""图像读写的底层工具：绕开 OpenCV 在非 ASCII 路径上的坑。
+"""图像读写的无状态工具：让中文路径与失败处理在全工程保持一致。
 
-从 neuq_vision_calib.py 原样搬来，函数体逐字未改。这一层没有任何项目级状态依赖，
-连 neuq_core.config 都不需要，所以可以独立 import、独立测试。
-
-刻意**没有**搬进来的（虽然以后可能也归到这一层）：
-  normalize_camera_image  牵扯分辨率约定与流水线语义，不是纯 IO。
-  resolve_user_path       依赖 DIR_IPM_IN 等目录全局。
-  file_sha256             等后面统一归置，这一刀不扩大范围。
+OpenCV 的图像编解码没有问题，容易出错的是把 Windows 路径直接交给 ``imread`` /
+``imwrite``。这里改由 Python 负责 Unicode 路径和文件字节，OpenCV 只负责编解码；
+上层因此不用在每个读写点重复兼容逻辑。
 """
 
 from pathlib import Path

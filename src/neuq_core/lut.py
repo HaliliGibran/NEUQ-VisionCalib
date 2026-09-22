@@ -1,31 +1,12 @@
-"""查找表的数学核：网格生成、无效点标定、重采样与复合反向映射。
+"""查找表（LUT）的数学核：坐标网格、重采样与去畸变 + IPM 复合映射。
 
-从 neuq_vision_calib.py 原样搬来，函数体、docstring 与注释逐字未改。依赖方向单向：
-本模块只用 cv2/numpy 与 neuq_core.geometry，不导入 neuq_core.config，更不导入
-facade，因此可以独立 import、独立测试。
+如果只记一句话：**reverse 表是“输出图这个像素，要去源图哪里取颜色”**。图像渲染
+通常采用这种 destination → source 的 gather 方式，因为逐个源像素向外撒（forward
+scatter）会产生空洞与重叠。表值可以是小数，真正取色时由双线性插值组合四个邻居。
 
-分界线是"要不要自己去读运行时开关"：resample_map_pair 属于"给我目标 size 我就做"
-的数学操作，所以搬；prepare_map_pair 属于"自己去读 TABLE_SIZE / TABLE_FORMAT /
-TABLE_FIXED_POINT"的策略编排，所以留。
-
-刻意**没有**搬进来的：
-  quantize_table / dequantize_table / prepare_map_pair
-  write_table_txt / write_table_bin / write_table_c / format_int16_array
-  clear_stale_tables / serialize_map_pair
-  load_table / _load_c_header / load_map_pair
-  table_convention_text / report_table_size
-  export_undistort_tables / export_composite_tables / load_exported_reverse_pair
-  BIN_SENTINEL / TABLE_FORMAT / TABLE_FIXED_POINT / TABLE_SIZE
-                        这批直接读 TABLE_FORMAT / TABLE_FIXED_POINT / TABLE_SIZE，
-                        而这三个是 CLI 在 apply_options() 里用 global 重新赋值的
-                        运行时状态。硬搬就得再加一个 bind_table_options() 的镜像。
-                        尤其 dequantize_table(..., fixed_point=None) 里
-                        `fp = TABLE_FIXED_POINT if fixed_point is None else ...`
-                        这个设计本身就是为了让运行时修改生效，搬进没有 runtime
-                        context 的模块会直接破坏该契约。
-  valid_fov_polygon / MAX_RANGE_CM / MAX_LATERAL_CM
-                        同为运行时状态，权威留在 facade（见 geometry 的说明）。
-  IpmCalibrator         交互标定类，依赖 cv2 窗口与大量运行时开关，不属于这一层。
+本模块只做给定数组与尺寸即可完成的计算，不读取导出格式、定点位数等运行时策略。
+序列化与 Q 格式量化留在应用编排层。完整解释见 ``docs/KNOWLEDGE_GUIDE.md``
+第 13～17 节。
 """
 
 import math
@@ -56,6 +37,11 @@ def downsample_factor(source_size: Tuple[int, int],
     等比之后 C 端的坐标换算也从两个 step 简化成一个 n：
         full_x = (small_x + 0.5) * n - 0.5
         full_y = (small_y + 0.5) * n - 0.5
+
+    ``+0.5`` / ``-0.5`` 来自像素中心：缩小图第 0 格的中心，不对应原图坐标 0，
+    而对应它覆盖的 n 个原像素的中心。还要特别区分“表的索引网格”和“表里的值”：
+    网格可以从 1280×720 缩成 320×180，表值依然是原始全分辨率图上的采样坐标，
+    不能再除以 4。
 
     table_size 为 None（不降采样）时返回 1。
     """
@@ -96,7 +82,11 @@ def table_grid_factors(width: int, height: int, min_width: int = 80,
 
 def resample_map_pair(map_x: np.ndarray, map_y: np.ndarray,
                       size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
-    """把一组映射表重采样到目标网格。
+    """把一组映射表重采样到目标索引网格，表值仍在原来的源图坐标系中。
+
+    ``cv2.resize`` 按像素中心关系为新网格估计映射值：缩小时用面积平均，放大时用
+    双线性插值（bilinear interpolation）。这只是在更稀或更密的位置保存同一连续
+    映射，不会把 value space 随网格一起缩放。
 
     只在所有贡献像素都有效时才输出有效值：地平线两侧的坐标相差极大，跨越边界插值
     会算出根本不存在的采样点，宁可把有效边界收缩一格。
@@ -127,8 +117,9 @@ class MapPair:
     之后序列化与批量测试消费的是同一个对象——而不是"写文件走一条链、
     验证走另一条链"，那正是导出的表与验过的表其实是两份数据的老毛病。
 
-    `x`/`y` 里放的是 C 端重建出来的坐标（bin/c 已按 Q 定点还原），
-    所以拿它跑批量测试等价于拿真实交付物跑。
+    ``x``/``y`` 里放的是 C 端重建出来的**源图全分辨率坐标**（bin/c 已按 Q 定点
+    还原），所以拿它跑批量测试等价于拿真实交付物跑。``size`` 是 LUT 索引网格，
+    ``source_size`` 是 value 所指向的原图；两者在降采样后不是同一个概念。
     """
 
     x: np.ndarray                      # (H, W) 输出像素 -> 源图采样坐标 X
@@ -179,7 +170,7 @@ def table_spaces(tag: str) -> dict:
 
 
 def pixel_grid(size: Tuple[int, int]) -> np.ndarray:
-    """返回 (H*W, 2) 的像素坐标点集，按行优先展开。"""
+    """返回图像中每个像素中心的 ``(x, y)`` 坐标，形状 ``(H*W, 2)``、按行展开。"""
     w, h = size
     xs, ys = np.meshgrid(np.arange(w, dtype=np.float64),
                          np.arange(h, dtype=np.float64))
@@ -206,14 +197,25 @@ def mask_out_of_range(pts: np.ndarray, size: Tuple[int, int],
 
 def undistorted_grid(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                      size: Tuple[int, int]) -> np.ndarray:
-    """每个原始畸变像素对应的去畸变坐标，(H*W, 2)。"""
+    """计算 ``原始畸变像素 → Knew 去畸变像素`` 的 forward 点映射。
+
+    索引点来自 ``size=(W,H)`` 的原始图，返回 ``(H*W, 2)``、单位 px。
+    ``cv2.undistortPoints`` 的方向是“给畸变点，求理想点”，适合构建 forward 表；
+    它不能直接回答 reverse 渲染所需的“给理想输出点，去原图哪里取色”。
+    """
     grid = pixel_grid(size).reshape(-1, 1, 2)
     return cv2.undistortPoints(grid, K, D, P=Knew).reshape(-1, 2)
 
 
 def distort_points(pts_undist: np.ndarray, K: np.ndarray, D: np.ndarray,
                    Knew: np.ndarray) -> np.ndarray:
-    """去畸变像素 -> 原始畸变像素。畸变正向模型是闭式的，无需迭代。"""
+    """计算 ``Knew 去畸变像素 → 原始畸变像素``，输入输出单位都是 px。
+
+    去畸变不是一张全局 3×3 矩阵：径向位移含 ``r²/r⁴/r⁶``，会随点离主点的距离
+    非线性变化。这里先用 ``inv(Knew)`` 把像素还原成归一化相机坐标，再让
+    ``cv2.projectPoints`` 按 ``K`` 与 ``D`` 施加真实镜头的正向畸变。正向公式是闭式的，
+    比把 ``undistortPoints`` 反过来猜更直接、也更符合它的 API 语义。
+    """
     norm = apply_homography(np.linalg.inv(Knew), pts_undist)
     obj = np.column_stack((norm, np.ones(norm.shape[0])))
     zeros = np.zeros(3, dtype=np.float64)
@@ -225,7 +227,12 @@ def build_composite_reverse_map(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                                 H: np.ndarray, H0: np.ndarray, sign: float,
                                 size: Tuple[int, int]
                                 ) -> Tuple[np.ndarray, np.ndarray]:
-    """BirdView 每个输出像素 -> 原始畸变图采样坐标，无效点标 -1。
+    """构建 ``BirdView 输出像素 → 原始畸变图采样坐标`` 的复合 reverse LUT。
+
+    对输出画布的每个像素，先经 ``inv(H)`` 回到 Knew 去畸变图，再用
+    :func:`distort_points` 回到原始相机图。于是嵌入式端一次 remap 就同时完成“镜头
+    去畸变 + 地面逆透视”，不必保存中间图，也不必逐像素重算多项式与 3×3 投影。
+    返回的 x/y 数组以 BirdView 像素为索引，值是原图全分辨率 px；无效点标 -1。
 
     两道判据都不能省：
     1. 中间的去畸变坐标必须落在地平线的地面侧。地平线另一侧（相机后方）的输出像素

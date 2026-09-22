@@ -1,17 +1,12 @@
-"""一组目录的换装事务：rename / backup / rollback / finalize。
+"""用可回滚的目录换装，让一组相关文件要么一起更新，要么一起保持旧版。
 
-从 neuq_vision_calib.py 的 `_commit_dirs` 下沉而来，并拆成两阶段：install 之后
-**不立刻删 .old**，由调用方确认"该换装依赖的元数据也已落盘"再 finalize。这样
-"目录已换新、配置还是旧的"这段窗口里仍然可以整体回滚。
+可以把它理解成换桌布：先在旁边把新桌布完整铺好（``.staging``），再把旧桌布挪到
+安全位置（``.old``），确认新桌布和配套物品都就位后，才撤掉旧桌布。不能一开始就
+扔掉旧版，因为目录更新与 ``project.json`` 等元数据写入不是同一个原子文件操作。
 
-两个消费者：
-  素材覆盖导入   calib_input / ipm_input 一起换，且 keep_staging=True
-                （暂存区里可能是 --move 搬进来的唯一原件，失败时绝不能删）
-  矩阵与表导出   matrix / lookup_table 一起换，一次性 commit_dirs 即可
-
-依赖方向只出不进：只用标准库，不导入 neuq_core.config，更不导入 facade，
-所以可以独立 import、独立测试。BACKUP_SUFFIX 定义在这里而不是 config：
-它是"换装怎么做"的一部分，config 的残留检查从这里拿同一个常量。
+``install`` 负责换上新目录但保留旧目录，``rollback`` 负责复原，``finalize`` 才表示
+不可逆地删除备份。素材覆盖导入还会保留失败的暂存区：在 ``--move`` 模式下，其中
+可能是用户照片的唯一副本。宁可留下需要人工判断的残留，也不冒险替用户猜哪份能删。
 """
 
 import shutil
@@ -26,7 +21,8 @@ BACKUP_SUFFIX = '.old'
 class DirectorySwapTransaction:
     """把一批暂存目录整体换成正式目录，可回滚。
 
-    install() 先统一"挪走旧的"，再统一"放上新的"。这样一旦中途出错，两个目录
+    ``pairs`` 中每项都是 ``(stage, target)``。install() 先统一“挪走旧的”，再统一
+    “放上新的”。这样一旦中途出错，两个目录
     都还躺在 .old 里，可以一起复原——不会留下"一个已是新版、另一个还是旧版"的
     中间态。两轮 rename 的顺序是外部契约（回归测试按第 N 次 rename 注入故障），
     不要调整。
@@ -54,7 +50,7 @@ class DirectorySwapTransaction:
         self.stranded: List[Path] = []
 
     def install(self) -> None:
-        """全部 target -> .old，再全部 stage -> target；**不删 .old**。
+        """全部 ``target → .old``，再全部 ``stage → target``；**不删 .old**。
 
         失败时不自动回滚：调用方可能还要在 rollback 之外做别的收尾（比如把
         project.json 恢复成事务开始前的样子），由它决定调用顺序。
@@ -77,12 +73,12 @@ class DirectorySwapTransaction:
             self.installed.append((target, stage))
 
     def finalize(self) -> None:
-        """事务真的成功了：删掉 .old。这一步之后不再可能回滚。"""
+        """确认目录及其关联元数据都已提交后删除 ``.old``；此后不能再回滚。"""
         for _target, backup, _stage in self.moved:
             shutil.rmtree(backup, ignore_errors=True)
 
     def rollback(self) -> None:
-        """回到 install 之前的状态；install 成功之后同样可以调用（.old 还在）。
+        """回到 install 之前的状态；install 成功之后同样可以调用（``.old`` 还在）。
 
         结束后 self.stranded 列出"搬不回暂存区、只能原样保留"的正式目录：空表示
         回滚干净、磁盘确实回到了改动前；非空表示磁盘是新旧混合，调用方必须据此
@@ -130,7 +126,7 @@ def commit_dirs(pairs: Sequence[Tuple[Path, Path]],
                 keep_staging: bool = False) -> None:
     """一次性换装：install 失败则 rollback 并抛出，成功则立刻 finalize。
 
-    给"换装本身就是整个事务"的调用方用（矩阵与查找表导出）。需要在换装与元数据
+    给“换装本身就是整个事务”的调用方用（矩阵与查找表导出）。需要在换装与元数据
     落盘之间留一个可回滚窗口的，直接用 DirectorySwapTransaction。
     """
     tx = DirectorySwapTransaction(pairs, what=what, keep_staging=keep_staging)

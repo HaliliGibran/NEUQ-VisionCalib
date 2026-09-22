@@ -1,17 +1,15 @@
-"""底层几何 primitives：单应求解、齐次变换、四边形与多边形判据。
+"""逆透视所需的几何积木：单应、齐次变换、地平线与多边形裁剪。
 
-从 neuq_vision_calib.py 原样搬来，常量、函数体、docstring 与注释逐字未改。依赖方向
-单向且最浅：只用 numpy，不导入 cv2，不依赖 neuq_core.config，更不导入 facade，
-因此可以独立 import、独立测试。
+本模块只回答数学问题，不读取工程配置，也不打开 OpenCV 窗口。最重要的坐标约定是：
 
-刻意**没有**搬进来的：
-  valid_fov_polygon     直接读 DEN_EPS / MAX_RANGE_CM / MAX_LATERAL_CM，后两个是 CLI 在
-                        apply_options() 里用 global 重新赋值的运行时状态。搬它就得为这些
-                        值做一份跨模块镜像，那是新增状态复制，不是这一刀的范围。它留在
-                        facade，继续调用这里搬出来的 clip_polygon_halfplane / apply_homography。
-  MAX_RANGE_CM / MAX_LATERAL_CM
-                        运行时状态，权威留在 facade。
-  IpmCalibrator         交互标定类，依赖 cv2 窗口与大量运行时开关，不属于这一层。
+* 图像点是 ``(x, y)`` 像素，x 向右、y 向下；
+* :func:`physical_rect` 生成的地面点以标定矩形中心为原点，单位是 cm；
+* 最终 BirdView 仍是 x 向右、y 向下，公制点经比例尺变成像素点；
+* 3×3 矩阵接收 ``[x, y, 1]`` 形式的齐次坐标（homogeneous coordinates）。
+
+这里的函数刻意保持无状态，方便单独验证公式。需要读取运行时范围的
+``valid_fov_polygon``，以及负责交互的 ``IpmCalibrator``，留在应用编排层。
+完整直觉与推导见 ``docs/KNOWLEDGE_GUIDE.md`` 的第 2、7～11 节。
 """
 
 from typing import List, Optional, Tuple
@@ -25,7 +23,15 @@ FIT_TOLERANCE_PX = 1e-6     # 自动布局自检的越界容差（像素），�
 
 
 def normalize_points_for_dlt(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Hartley 归一化：平移到重心、缩放到平均距离 sqrt(2)，返回归一化点与变换矩阵。"""
+    """为直接线性变换（DLT）整理二维点，返回归一化点与 3×3 变换 ``T``。
+
+    ``pts`` 是任意二维坐标系里的 ``(N, 2)`` 点。先补成 ``[x, y, 1]``，就能把
+    “减去重心”和“统一缩放”合在矩阵 ``T`` 中；输出前两列则回到普通二维坐标。
+
+    归一化不改变点之间的投影关系，只把数值搬到原点附近、把平均距离调到
+    ``sqrt(2)``。否则像素坐标里的上千和齐次常数 1 同时进入 DLT 方程，奇异值分解
+    容易被量级差放大舍入误差。所有点几乎重合时没有可用的几何尺度，因此明确报退化。
+    """
     points = np.asarray(pts, dtype=np.float64)
     center = points.mean(axis=0)
     centered = points - center
@@ -45,7 +51,16 @@ def normalize_points_for_dlt(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def compute_homography(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
-    """四点单应，归一化 DLT，float64 全程。
+    """由四对平面点求单应（Homography）``dst ~ H @ src``。
+
+    输入、输出都是按 ``TL, TR, BL, BR`` 对应的 ``(4, 2)`` 点；两边可以采用不同
+    单位。本项目通常是“去畸变图像素 → 标定矩形 cm”。符号 ``~`` 表示齐次比例
+    等价：``[x, y, w]`` 与 ``[kx, ky, kw]`` 表示同一个二维点，最后都除以第三项。
+
+    H 有 9 个数，但整体乘任意非零倍数都不改变结果，所以只有 8 个自由度；每对点
+    提供 x/y 两条约束，四对点刚好给出 8 条。DLT 把这些约束写成 ``A h = 0``，
+    SVD 取最接近零空间的向量，再撤销两边的 Hartley 归一化。四点共线、重合或极度
+    挤在一起时约束会退化；上游还会用面积与凸性判据把这类交互位形挡住。
 
     这里刻意不用 OpenCV 的现成接口：cv2.getPerspectiveTransform 只接受 CV_32F 输入
     （传 float64 直接抛 checkVector 断言），cv2.findHomography 虽接受 float64 但内部
@@ -74,7 +89,12 @@ def compute_homography(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
 
 
 def physical_rect(phys_w: float, phys_h: float) -> np.ndarray:
-    """标定矩形的物理角点，顺序 TL,TR,BL,BR，中心为原点，y 向下即朝向车辆。"""
+    """返回标定矩形坐标系中的四个物理角点，单位 cm。
+
+    顺序是 ``TL, TR, BL, BR``，原点在矩形中心，x 向右、y 向下（朝向车辆）。
+    这是用四点建立 ``H0`` 的 *marker frame*，不是最终逆透视参考坐标系；后者的
+    原点由 :func:`ground_reference_origin` 另行定义。两个“原点”不能混用。
+    """
     hw, hh = phys_w / 2.0, phys_h / 2.0
     return np.array([
         [-hw, -hh],
@@ -85,24 +105,28 @@ def physical_rect(phys_w: float, phys_h: float) -> np.ndarray:
 
 
 def rotation_matrix(deg: float) -> np.ndarray:
-    """cm 坐标系内绕原点旋转的齐次矩阵（y 向下，故正角为顺时针）。"""
+    """返回地面 cm 坐标绕原点旋转的齐次矩阵；y 向下，所以正角为顺时针。"""
     t = np.deg2rad(deg)
     c, s = np.cos(t), np.sin(t)
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
 
 
 def scale_matrix(k: float) -> np.ndarray:
-    """cm -> 像素的等比缩放齐次矩阵，k 的单位是 px/cm。"""
+    """返回“地面 cm → BirdView 像素”的等比缩放矩阵，``k`` 的单位是 px/cm。"""
     return np.array([[k, 0.0, 0.0], [0.0, k, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
 
 
 def translation_matrix(tx: float, ty: float) -> np.ndarray:
-    """平移齐次矩阵。"""
+    """返回二维平移的齐次矩阵；3×3 形式让平移也能参加矩阵连乘。"""
     return np.array([[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]], dtype=np.float64)
 
 
 def apply_homography(H: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """对 (N,2) 点集应用单应，返回 (N,2)。
+    """把 ``(N, 2)`` 点补成 ``[x, y, 1]`` 后应用单应，再返回普通二维点。
+
+    若 ``H @ [x, y, 1]`` 得到 ``[u, v, w]``，真正坐标是 ``[u/w, v/w]``。
+    与普通仿射变换相比，这个随位置变化的分母正是透视效果的来源；``w`` 接近 0
+    时点趋向投影意义上的无穷远，也就是地平线附近。
 
     刻意不用 cv2.perspectiveTransform：后者在齐次分量接近 0 时把结果置 0，
     而本项目依赖 isfinite 判据剔除映射到无穷远的点，需要 inf 如实传播。
@@ -116,7 +140,10 @@ def apply_homography(H: np.ndarray, pts: np.ndarray) -> np.ndarray:
 
 
 def homography_denominator(H: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """单应的齐次分母 H[2,0]*x + H[2,1]*y + H[2,2]，符号区分地平线两侧。
+    """返回单应的齐次分母 ``H[2] · [x, y, 1]``。
+
+    分母为 0 的直线会被映到无穷远，即图像中的地平线；正负号区分它的两侧。
+    只看绝对值会把天空侧也当成合法地面，因此调用方还要配合 :func:`horizon_sign`。
 
     非有限的输入点先归零：它们已被调用方的 isfinite 判据剔除，这里只是避免
     inf 参与乘法产生溢出告警。
@@ -163,7 +190,7 @@ def horizon_sign(H0: np.ndarray, ground_pts: np.ndarray) -> float:
 
 
 def line_intersection(a1, a2, b1, b2) -> Optional[np.ndarray]:
-    """两直线交点，平行或退化时返回 None。"""
+    """求 ``a1-a2`` 与 ``b1-b2`` 两条无限直线的像素交点；平行或退化时返回 None。"""
     x1, y1 = a1
     x2, y2 = a2
     x3, y3 = b1
@@ -177,7 +204,7 @@ def line_intersection(a1, a2, b1, b2) -> Optional[np.ndarray]:
 
 
 def order_corners_tl_tr_bl_br(pts: np.ndarray) -> np.ndarray:
-    """按 y 再按 x 把四点排成 TL,TR,BL,BR。"""
+    """按图像坐标把四点排成 ``TL, TR, BL, BR``，供像素点与物理角点一一对应。"""
     a = np.asarray(pts, dtype=np.float64)
     idxs = np.argsort(a[:, 1])
     top = a[idxs[:2]]
@@ -188,7 +215,7 @@ def order_corners_tl_tr_bl_br(pts: np.ndarray) -> np.ndarray:
 
 
 def quad_area(pts: np.ndarray) -> float:
-    """TL,TR,BL,BR 四点围成的四边形面积（shoelace 绝对值）。"""
+    """返回 ``TL,TR,BL,BR`` 四点围成的面积（px²），用鞋带公式计算。"""
     p = np.asarray(pts, dtype=np.float64)[[0, 1, 3, 2]]
     x, y = p[:, 0], p[:, 1]
     return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
@@ -207,7 +234,11 @@ def is_convex_quad(pts: np.ndarray) -> bool:
 
 
 def clip_polygon_halfplane(poly: np.ndarray, a: float, b: float, c: float) -> np.ndarray:
-    """保留满足 a*x + b*y + c >= 0 的部分（Sutherland-Hodgman 单边裁剪）。
+    """用半平面 ``a*x + b*y + c >= 0`` 裁剪二维多边形。
+
+    沿多边形边界逐段走：两端同在保留侧就留下终点，一内一外就补上与边界线的交点。
+    这正是 Sutherland–Hodgman 裁剪的一步；连续对地平线、横向/纵向范围执行，就能
+    得到既在相机有效地面侧、又没有延伸到数值无穷远的有效区域。
 
     poly 必须是 (N, 2)；返回值始终是新建的 float64 (M, 2) 数组。
     """
@@ -235,9 +266,11 @@ def clip_polygon_halfplane(poly: np.ndarray, a: float, b: float, c: float) -> np
 
 def max_scale_for_fov(poly_cm: np.ndarray, anchor_px: Tuple[float, float],
                       out_size: Tuple[int, int]) -> float:
-    """不裁切有效视野时允许的最大 scale（px/cm）。
+    """给定锚点后，求不裁切 ``poly_cm`` 的最大比例尺（px/cm）。
 
-    约束是 anchor + k*q 落在输出图内，k 线性出现，故有闭式解。
+    每个地面点 ``q`` 的输出位置都是 ``anchor + k*q``。``k`` 在上下左右四条边界
+    约束里都只以一次项出现，因此无需试探或迭代：分别算出允许的上限，取最小值
+    就是闭式解。输入多边形与锚点分别使用 cm 和 px，返回值负责把两者连接起来。
     """
     if poly_cm.shape[0] < 3:
         return 0.0
@@ -324,9 +357,8 @@ def target_window_cm(width_cm: float, forward_cm: float) -> np.ndarray:
         x in [-width/2, +width/2]
         y in [-forward, 0]
 
-    y 向下即朝向车辆，故 y=0 这条边（近边）正是参考原点所在的那条。因此不需要任何
-    形状参数——A2 那版还要传"旋转后的标定矩形"进来取近边，那是因为当时把 marker
-    frame 的矩形近边当成了业务基准，属于坐标语义没分清。
+    y 向下即朝向车辆，故 y=0 这条边（近边）正是参考原点所在的那条。标定矩形只负责
+    建立公制映射，不负责决定最终构图；这里因此只接收真正的业务目标宽度与前向深度。
 
     这是**构图目标**，与 valid_fov_polygon 给出的**有效性边界**是两件不同的事。
     MAX_RANGE_CM / MAX_LATERAL_CM 存在的理由只是"地平线附近映射到无穷远，必须截
@@ -360,10 +392,9 @@ def fit_bottom_aligned(
     "不裁切的 scale 上限"；这里 anchor_y 也是自由量，求的是"近边贴住输出图底边、
     同时把给定多边形放到最大且一点不裁切"的那一组 (anchor_y, scale)。
 
-    对 poly_cm 是什么刻意不作假设——它只是"这一块 cm 区域要完整装进画布"。调用方
-    传目标地面窗口（target_window_cm）就是构图；传 valid_fov_polygon 就是"完整容纳
-    有效视野"。函数名因此不再带 fov：把调用方的意图写进被调用方的名字，正是上一版
-    默认"完整容纳 valid FOV"这个错误目标能一直藏着不被发现的原因。
+    对 poly_cm 是什么刻意不作假设——它只是“这一块 cm 区域要完整装进画布”。调用方
+    传目标地面窗口（target_window_cm）就是为构图服务；传 valid_fov_polygon 则表示
+    想完整容纳数学上的有效视野。函数名不带 fov，正是为了不混淆这两种目标。
 
     物理 y 向下即朝向车辆，所以多边形的 qy_max 是最近处、qy_min 是最远处。把近边
     钉在 B = H-1-margin 上（这才是"贴底"），scale 就只受三个上界约束：纵向总高

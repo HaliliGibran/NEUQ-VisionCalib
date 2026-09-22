@@ -1,19 +1,13 @@
-"""相机标定的低耦合内核：棋盘检出与 calibrateCamera 的直接封装。
+"""相机标定的数学内核：检测棋盘角点，并把多张观测交给 OpenCV 拟合。
 
-从 neuq_vision_calib.py 原样搬来，函数体逐字未改（唯一例外见下）。依赖方向单向：
-本模块只依赖 neuq_core.config，不导入 facade，也不碰任何目录/运行时开关。
+一张棋盘照片提供两组彼此对应的点：棋盘平面上已知的 ``object points``（mm）和
+照片中检测到的 ``image points``（px）。多张不同距离、倾角和画面位置的照片共同
+约束相机内参 ``K``、五个畸变参数 ``D=[k1,k2,p1,p2,k3]``，以及每张照片各自的
+姿态 ``rvec/tvec``。只拍一张正对镜头的棋盘，许多参数会彼此“冒充”，数值看似能拟合，
+换到画面边缘却不可信。
 
-刻意**没有**搬进来的：
-  fit_camera            读 facade 的 MAX_REPROJ_ERR。为它再做一份阈值镜像，或者把
-                        阈值改成参数，都属于状态模型/API 改动，不是这一刀的范围。
-  calibrate_camera      本质是"算法 + 目录读取 + 状态检查 + 日志 + preview 输出"，
-                        不是纯算法函数。
-  capture_calibration_images / export_undistort_previews /
-  save_calibration / load_calibration / calib_board_meta
-                        都直接依赖目录全局与 safe_imread/safe_imwrite。
-
-唯一的非逐字改动：detect_* 里默认规格的取法由裸全局 `BOARD` 改为 `config.BOARD`
-（同一份值，由 facade 的 configure_board() 同步过来），因为本模块不再有那个裸全局。
+本模块只保留不依赖目录与界面的计算。素材读取、异常帧剔除和结果提交由
+``neuq_vision_calib.py`` 编排。背景知识见 ``docs/KNOWLEDGE_GUIDE.md`` 第 3～6 节。
 """
 
 from typing import Optional, Tuple
@@ -31,7 +25,9 @@ def detect_chessboard(gray: np.ndarray, fast: bool = False,
                       ) -> Tuple[bool, Optional[np.ndarray]]:
     """检出棋盘内角点，全部检出才算成功。
 
-    OpenCV 的棋盘检测是全有全无的：拓扑推断要求整块棋盘完整可见，检不到就返回 False，
+    ``board.corners`` 指相邻方格交界处的**内角点数**：例如 12×9 个方格只有
+    11×8 个内角点。OpenCV 的棋盘检测是全有全无的：拓扑推断要求整块棋盘完整可见，
+    检不到就返回 False，
     不存在"只返回一部分角点"的中间态。所以这里的策略是尽量提高检出率：
     先用 SB（sector-based）算法，它对低分辨率、运动模糊、光照不均和大透视畸变明显更鲁棒，
     且自带亚像素精度；失败再退回经典算法配 cornerSubPix。
@@ -89,7 +85,13 @@ def detect_chessboard_partial(gray: np.ndarray,
 
 
 def _calibrate_once(obj_points, img_points, img_size):
-    """跑一次 calibrateCamera，返回 (rms, K, D, rvecs, tvecs, std_int, per_view)。
+    """用当前全部观测跑一次标定，返回 ``(rms, K, D, rvecs, tvecs, ...)``。
+
+    ``obj_points`` 是每张图对应的棋盘平面点（mm），``img_points`` 是同序角点（px），
+    ``img_size`` 是图像 ``(W, H)``。``K`` 把归一化相机坐标变成像素坐标；``D`` 中
+    ``k1/k2/k3`` 描述随半径变化的径向畸变，``p1/p2`` 描述镜头装配偏心造成的切向
+    畸变。每张图的 ``rvec/tvec`` 则回答“这块棋盘相对相机在哪里”，它们不是一套
+    可以跨照片共用的相机内参。
 
     优先用 calibrateCameraExtended 以拿到每张图的 RMS 与内参标准差；旧版 OpenCV
     没有这个接口时退回 calibrateCamera，此时这两个量以空数组代替。
@@ -111,10 +113,15 @@ def _calibrate_once(obj_points, img_points, img_size):
 
 def report_reprojection_error(obj_points, img_points, rvecs, tvecs,
                               K: np.ndarray, D: np.ndarray) -> float:
-    """返回平均欧氏重投影误差（px）。
+    """返回所有角点的平均欧氏重投影误差（px）。
 
-    OpenCV 的 calibrateCamera 返回的是 RMS，比平均欧氏距离偏大；这里单独算一份
-    平均值，口径与 MATLAB cameraCalibrator 的 Overall Mean Error 一致，便于对比。
+    做法是把已知棋盘点按拟合出的 ``K/D/rvec/tvec`` 重新投回照片，再量预测点与实测
+    角点的距离。它回答“一个角点平均偏了多少像素”。OpenCV 返回的 RMS 先平方误差、
+    求平均再开方，对少数大误差更敏感；两个数口径不同，不能互相替代。
+
+    RMS 或均值很小也不代表画面边缘一定可信：如果角点都集中在中央，边缘畸变参数
+    仍缺少数据约束。这里单独计算均值，是为了与 MATLAB cameraCalibrator 的
+    Overall Mean Error 采用同一口径，便于对比。
     """
     total_err = 0.0
     total_pts = 0
