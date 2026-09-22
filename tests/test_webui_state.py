@@ -19,9 +19,13 @@
      回包里的"推荐值"——重置按钮靠它做成间接层，前端不抄常量
   F. 自动布局（近场贴底 + 最大不裁切）在 preview 与 commit 两侧同源：看到的 BirdView
      与导出的 H 必须是同一组 (anchor_y, scale)
+  G. 导出成功之后的自动逆透视测试集（test_input/_auto_ipm）与成果画廊：
+     选中的标点图不进测试集、用户自己的文件字节不动、准备过程中途失败不留半套、
+     配对来自 batch_test 的实际返回、批测失败不影响已导出的矩阵与查找表
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sys
@@ -72,6 +76,34 @@ def calib_pairs(stems: list[str]) -> None:
                           np.full((16, 16, 3), 20 + 10 * i, np.uint8))
         core.safe_imwrite(core.DIR_CALIB_PREVIEW / f'{stem}_undist.jpg',
                           np.full((16, 16, 3), 21 + 10 * i, np.uint8))
+
+
+def ipm_candidates(stems: list[str], size=(80, 80)) -> None:
+    """在 ipm_input/ 造若干张地面候选图。"""
+    core.DIR_IPM_IN.mkdir(parents=True, exist_ok=True)
+    for i, stem in enumerate(stems):
+        core.safe_imwrite(core.DIR_IPM_IN / f'{stem}.jpg',
+                          np.full((size[1], size[0], 3), 40 + 5 * i, np.uint8))
+
+
+def identity_pair(size=(80, 80)):
+    """一份恒等映射的 MapPair：batch_test 只用到 x/y/size/source_size。"""
+    w, h = size
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float64),
+                         np.arange(h, dtype=np.float64))
+    return core.MapPair(x=xs, y=ys, source_size=(w, h))
+
+
+def sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def names_in(folder: Path) -> list[str]:
+    return [p.name for p in core.list_images(folder)]
+
+
+def rel_str(path: Path) -> str:
+    return server.safe_rel(path).replace('\\', '/')
 
 
 def main() -> int:
@@ -340,7 +372,8 @@ def main() -> int:
                                 img_size=(320, 240), src_path=None)
             core.export_all = fake_export_all
             core.build_ipm_state = lambda *a, **kw: {}
-            core.batch_test = lambda pair: None
+            # 签名跟着 batch_test 的新形状走（可指定目录、返回实际生成的配对）
+            core.batch_test = lambda pair, input_dir=None, output_dir=None: []
             core.safe_imwrite = lambda *a, **kw: None
 
             pv = server.api_preview(dict(auto))
@@ -413,6 +446,203 @@ def main() -> int:
                   and abs(fb2['recommended']['scale'] - fb['recommended']['scale']) < 1e-12,
                   'fallback 幂等：再求一次得到同一组 (anchor_y, scale)',
                   f"{fb['recommended']['scale']:.9f} -> {fb2['recommended']['scale']:.9f}")
+        finally:
+            for name, fn in originals.items():
+                setattr(core, name, fn)
+            server.STATE.update(**old_state)
+
+        # ---- G. 导出成功之后：自动逆透视测试集 + 成果画廊
+        # 这一刀的风险全在"数据所有权"上：_auto_ipm/ 是工具的缓存可以整体刷新，
+        # test_input/ 根目录是用户的东西，一个字节都不能碰。再加上"配对必须来自
+        # batch 的实际返回"——按目录 stem 反猜是标定画廊已经踩过的坑。
+        print('\n[G] 自动测试集 _auto_ipm 与逆透视成果画廊')
+        core.configure_paths(root=tmp / 'auto_ipm_root')
+        old_state = {k: server.STATE[k] for k in
+                     ('K', 'D', 'Knew', 'img_size', 'src_path', 'src_undist',
+                      'ipm_results')}
+        originals = {name: getattr(core, name) for name in
+                     ('export_all', 'build_ipm_state', 'batch_test',
+                      'load_exported_reverse_pair')}
+        real_batch = core.batch_test
+        try:
+            ipm_candidates([f'cand_{i}' for i in range(8)])
+            picked = core.DIR_IPM_IN / 'cand_3.jpg'
+
+            # 用户自己放在 test_input/ 根目录的东西：图片、说明文件，还有上次的结果
+            core.DIR_TEST_IN.mkdir(parents=True, exist_ok=True)
+            core.DIR_TEST_OUT.mkdir(parents=True, exist_ok=True)
+            user_img = core.DIR_TEST_IN / 'user_own.jpg'
+            core.safe_imwrite(user_img, np.full((80, 80, 3), 7, np.uint8))
+            user_txt = core.DIR_TEST_IN / 'readme.txt'
+            user_txt.write_text('我自己的测试集说明', encoding='utf-8')
+            user_out = core.DIR_TEST_OUT / 'old_result.jpg'
+            core.safe_imwrite(user_out, np.full((8, 8, 3), 9, np.uint8))
+            before = {p: sha(p) for p in (user_img, user_txt, user_out)}
+
+            # 导出那一步写的 BirdView 结果图（画廊第一项的右侧就是它）
+            core.safe_imwrite(core.IPM_RESULT, np.full((40, 40, 3), 200, np.uint8))
+            server.STATE.update(src_path=picked, ipm_results=[])
+
+            auto_in, stage, auto_out = server.auto_test_dirs()
+            res = server.run_auto_batch(identity_pair())
+            check(len(names_in(auto_in)) == 7,
+                  'ipm_input 有 8 张、选 1 张 → _auto_ipm 正好 7 张',
+                  f'{len(names_in(auto_in))} 张: {names_in(auto_in)}')
+            check('cand_3.jpg' not in names_in(auto_in),
+                  '被选中的标点图绝不进入自动测试集', str(names_in(auto_in)))
+            check(all(sha(p) == h for p, h in before.items()),
+                  'test_input / test_output 根目录里用户自己的文件字节级不变',
+                  ', '.join(p.name for p in before))
+            check(not stage.exists(), '换装成功后暂存区不留残留', str(stage.name))
+            check(res == {'ok': True, 'generated': 7, 'error': None},
+                  'run_auto_batch 报告 7 张成果', str(res))
+            check(len(names_in(auto_out)) == 7,
+                  '自动结果实际落在 test_output/_auto_ipm',
+                  f'{rel_str(auto_out)}: {len(names_in(auto_out))} 张')
+
+            g = server.api_ipm_result_gallery()
+            first = g['items'][0]
+            check(g['count'] == 8 and first['role'] == 'calibration'
+                  and first['name'] == 'cand_3.jpg',
+                  '画廊第一项是参与四点标定的那张基准图',
+                  f"{first['name']} / {first['role']}")
+            check(rel_of(first['raw_url']) == 'ipm_input/cand_3.jpg'
+                  and rel_of(first['birdview_url'])
+                  == 'ipm_output/UnDistortionInverseImage.jpg',
+                  '基准图那一组是「原图 ↔ 当前最终 BirdView（IPM_RESULT）」',
+                  f"{rel_of(first['raw_url'])} | {rel_of(first['birdview_url'])}")
+            rest = g['items'][1:]
+            check(all(it['role'] == 'test' for it in rest)
+                  and 'cand_3.jpg' not in [it['name'] for it in rest],
+                  '其后各项都是没参与标点的测试图',
+                  str([it['name'] for it in rest]))
+            check(all(rel_of(it['raw_url']) == f"test_input/_auto_ipm/{it['name']}"
+                      and rel_of(it['birdview_url'])
+                      == f"test_output/_auto_ipm/{Path(it['name']).stem}_birdview.jpg"
+                      for it in rest),
+                  'Gallery 的 raw ↔ birdview 配对来自实际 batch 返回记录',
+                  f"{rel_of(rest[0]['raw_url'])} | {rel_of(rest[0]['birdview_url'])}")
+
+            # 第二次换标点图：原来那张要进来、新选的那张要出去
+            server.STATE.update(src_path=core.DIR_IPM_IN / 'cand_5.jpg')
+            server.run_auto_batch(identity_pair())
+            names2 = names_in(auto_in)
+            check('cand_3.jpg' in names2 and 'cand_5.jpg' not in names2
+                  and len(names2) == 7,
+                  '第二次换标点图 → 自动测试集正确刷新', str(names2))
+
+            # 准备阶段中途失败：旧的自动测试集必须完好，绝不留半套
+            before_names = names_in(auto_in)
+            real_copy2 = shutil.copy2
+            calls = {'n': 0}
+
+            def flaky_copy2(src, dst, *a, **kw):
+                calls['n'] += 1
+                if calls['n'] == 4:
+                    raise OSError('磁盘已满（故障注入）')
+                return real_copy2(src, dst, *a, **kw)
+
+            shutil.copy2 = flaky_copy2
+            try:
+                server.run_auto_batch(identity_pair())
+                check(False, '复制第 4 张失败时整条准备流程中止')
+            except OSError as exc:
+                check('故障注入' in str(exc), '复制第 4 张失败时整条准备流程中止',
+                      str(exc))
+            finally:
+                shutil.copy2 = real_copy2
+            check(names_in(auto_in) == before_names,
+                  '自动输入准备中途失败 → 旧自动集不变、无半套', str(names_in(auto_in)))
+            check(not stage.exists(), '失败后暂存区被清掉', str(stage.name))
+
+            # 坏图与宽高比不符的图：被 batch 跳过之后画廊不能虚构出成果
+            (core.DIR_IPM_IN / 'broken.jpg').write_bytes(b'not an image at all')
+            core.safe_imwrite(core.DIR_IPM_IN / 'wide.jpg',
+                              np.full((40, 200, 3), 60, np.uint8))
+            server.STATE.update(src_path=picked)
+            res = server.run_auto_batch(identity_pair())
+            check(len(names_in(auto_in)) == 9 and res['generated'] == 7,
+                  '坏图/比例不符的图进了输入，但没有生成结果',
+                  f"输入 {len(names_in(auto_in))} 张 → 成果 {res['generated']} 张")
+            g = server.api_ipm_result_gallery()
+            shown = [it['name'] for it in g['items']]
+            check('broken.jpg' not in shown and 'wide.jpg' not in shown
+                  and g['count'] == 8,
+                  '坏图/比例不符被跳过后 gallery 不虚构结果', str(shown))
+            (core.DIR_IPM_IN / 'broken.jpg').unlink()
+            (core.DIR_IPM_IN / 'wide.jpg').unlink()
+
+            # batch_test 的默认参数一个字没变：不给目录就读写 test_input/test_output 根
+            done = core.batch_test(identity_pair())
+            check([(rel_str(a), rel_str(b)) for a, b in done]
+                  == [('test_input/user_own.jpg', 'test_output/user_own_birdview.jpg')],
+                  'batch_test 不带 input_dir/output_dir 时仍是 test_input/ 根目录语义',
+                  str([(rel_str(a), rel_str(b)) for a, b in done]))
+
+            # ---- api_commit：batch 必须用 export_all 返回的那个 pair
+            sentinel = identity_pair()
+            seen: dict = {}
+
+            def fake_export_all(K, D, Knew, H, H0, sign, extra, size, ipm_state=None):
+                """只落两个产物标记：导出事务本身另有专门的测试文件。"""
+                core.DIR_MATRIX.mkdir(parents=True, exist_ok=True)
+                (core.DIR_MATRIX / 'matrices.json').write_text('{}', encoding='utf-8')
+                lut = core.DIR_TABLE / 'undistort_ipm' / 'reverse'
+                lut.mkdir(parents=True, exist_ok=True)
+                (lut / 'MapW.txt').write_text('0', encoding='utf-8')
+                return sentinel
+
+            def spy_batch(pair, input_dir=None, output_dir=None):
+                seen.update(pair=pair, input_dir=input_dir, output_dir=output_dir)
+                return real_batch(pair, input_dir=input_dir, output_dir=output_dir)
+
+            core.export_all = fake_export_all
+            core.build_ipm_state = lambda *a, **kw: {}
+            core.batch_test = spy_batch
+            server.STATE.update(src_undist=np.full((240, 320, 3), 128, np.uint8),
+                                K=np.eye(3), D=np.zeros((4, 1)), Knew=np.eye(3),
+                                img_size=(320, 240), src_path=picked, ipm_results=[])
+            body = {'quad': [[90, 80], [230, 80], [30, 200], [290, 200]],
+                    'phys_w': 45.0, 'phys_h': 45.0, 'anchor_x': 0.5,
+                    'anchor_y': 0.3, 'heading': 0.0, 'scale': 3.0,
+                    'table_format': 'txt'}
+            out = server.api_commit(dict(body))
+            check(seen.get('pair') is sentinel,
+                  'batch 用的是 export_all 返回的同一个最终 MapPair（不是重新算的）',
+                  f"同一对象: {seen.get('pair') is sentinel}")
+            check(seen.get('input_dir') == auto_in
+                  and seen.get('output_dir') == auto_out,
+                  '自动批测读写的是 _auto_ipm 子目录，不碰根目录',
+                  f"{rel_str(seen['input_dir'])} → {rel_str(seen['output_dir'])}")
+            check(out['export_ok'] is True and out['batch']['ok'] is True
+                  and out['batch']['generated'] == 7,
+                  'api_commit 分别报告 export_ok 与 batch', str(out['batch']))
+
+            # ---- batch 炸了：矩阵与查找表照样在盘上，接口要说清楚是两件事
+            def boom_batch(pair, input_dir=None, output_dir=None):
+                raise RuntimeError('批量测试炸了（故障注入）')
+
+            core.batch_test = boom_batch
+            out = server.api_commit(dict(body))
+            check(out['export_ok'] is True and out['batch']['ok'] is False
+                  and '故障注入' in (out['batch']['error'] or ''),
+                  'batch 失败时接口明确报告 export_ok=true + batch.ok=false',
+                  str(out['batch']))
+            check((core.DIR_MATRIX / 'matrices.json').is_file()
+                  and (core.DIR_TABLE / 'undistort_ipm' / 'reverse' / 'MapW.txt').is_file(),
+                  'batch 失败后 matrices/LUT 仍然存在（批测不属于导出事务）')
+            check('矩阵与查找表已导出成功' in out['log'],
+                  '日志里也把两件事分开说，而不是一句"导出失败"',
+                  out['log'].strip().splitlines()[-1][:40])
+
+            # ---- 单独点「只重跑批量测试」：仍是 test_input 根目录语义
+            core.batch_test = spy_batch
+            core.load_exported_reverse_pair = lambda size: sentinel
+            seen.clear()
+            server.api_batch()
+            check(seen.get('input_dir') is None and seen.get('output_dir') is None,
+                  'api_batch 不传目录 → 保持原来 test_input 根目录的语义',
+                  f"input_dir={seen.get('input_dir')}")
         finally:
             for name, fn in originals.items():
                 setattr(core, name, fn)

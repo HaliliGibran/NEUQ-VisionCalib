@@ -19,6 +19,7 @@ import base64
 import io
 import json
 import re
+import shutil
 import sys
 import threading
 import time
@@ -82,6 +83,10 @@ STATE: dict = {
     'src_path': None,   # 当前逆透视标定原图
     'src_raw': None,    # 原始畸变图
     'src_undist': None, # 去畸变图，四点拖拽在它上面进行
+    # 上一次导出后自动批测的成果记录：[{name, role, raw, birdview}]，由 batch_test
+    # 的**实际返回**填充（见 record_ipm_results）。逆透视成果画廊只读它，不去扫目录
+    # 按 stem 反查配对——那正是标定画廊踩过的坑。
+    'ipm_results': [],
 }
 
 # 当前 HTTP 服务实例，供"退出"接口调用 shutdown()（见 api_shutdown）
@@ -311,6 +316,9 @@ def api_status() -> dict:
         'last_table': last_table,
         'photo_counts': api_import_status(),
         'preview_count': len(core.list_images(core.DIR_CALIB_PREVIEW)),
+        # 第 3 步「查看逆透视成果」按钮的启用条件与张数。只认本轮进程里真实生成过的
+        # 配对记录：没有记录时按钮保持 disabled，绝不让界面凭目录里的文件猜成果。
+        'ipm_result_count': len(STATE['ipm_results']),
     }
 
 
@@ -570,7 +578,7 @@ def _clear_project_folders() -> tuple:
 
     # 内存里的标定与逆透视状态一并作废，否则界面还显示着已经被清掉的标定
     STATE.update(K=None, D=None, Knew=None, img_size=None,
-                 src_path=None, src_raw=None, src_undist=None)
+                 src_path=None, src_raw=None, src_undist=None, ipm_results=[])
     # 素材库空了，"这套素材按哪块棋盘分拣"这个事实也就不存在了。
     # 不清的话，下一次增量导入会拿一条对不上号的旧依据去判 stale。
     core.clear_material_board()
@@ -742,6 +750,27 @@ def api_preview_gallery() -> dict:
         'missing_raw': sum(1 for it in items if not it['raw_url']),
         'missing_undistorted': sum(1 for it in items if not it['undistorted_url']),
     }
+
+
+def api_ipm_result_gallery() -> dict:
+    """列出逆透视成果对照组（原图 ↔ BirdView），配对关系由服务端给定。
+
+    数据源是 STATE['ipm_results'] —— 上一次导出成功后自动批测**实际生成**的那批
+    配对，不是去扫 test_output/_auto_ipm/ 再按文件名反查。差别在于：被跳过的图
+    （读不出来、宽高比不同）在这里根本不会出现，而按目录反查一定会把"少了一张
+    结果"猜成别人的结果，或者让整组凭空消失（见 pair_preview_images 的注释）。
+
+    第一项是真正参与四点标定的那张基准图（role=calibration，右侧就是本次导出的
+    IPM_RESULT）；其后是没参与标点的测试图（role=test）。
+    """
+    items = [{
+        'name': rec['name'],
+        'role': rec['role'],
+        'raw_url': image_url(rec['raw']) if rec['raw'] is not None else None,
+        'birdview_url': (image_url(rec['birdview'])
+                         if rec['birdview'] is not None else None),
+    } for rec in STATE['ipm_results']]
+    return {'items': items, 'count': len(items)}
 
 
 def api_calibrate(body: dict) -> dict:
@@ -975,8 +1004,89 @@ def apply_table_options(body: dict) -> None:
         core.TABLE_FIXED_POINT = fp
 
 
+# 自动测试集的专属子目录名。它是程序生成、可整体刷新的缓存，所以必须待在自己的
+# 子目录里：test_input/ 与 test_output/ 的根目录属于用户，本工具在那里不删不改不读。
+AUTO_TEST_SUBDIR = '_auto_ipm'
+
+
+def auto_test_dirs() -> tuple[Path, Path, Path]:
+    """自动测试集的三个目录：(输入, 输入暂存区, 输出)。现取，跟着工程根走。"""
+    return (core.DIR_TEST_IN / AUTO_TEST_SUBDIR,
+            core.DIR_TEST_IN / (AUTO_TEST_SUBDIR + '.staging'),
+            core.DIR_TEST_OUT / AUTO_TEST_SUBDIR)
+
+
+def prepare_auto_test_input(exclude: Path | None) -> list[str]:
+    """把 ipm_input/ 里除标点原图之外的候选刷进 test_input/_auto_ipm/。
+
+    选中做四点标定的那张不复制：它是"已经拿来拟合"的图，用它验证等于自证。
+
+    "先准备完整，再整体替换"：全部复制进 _auto_ipm.staging/ 成功之后才换装。
+    复制到一半磁盘满的话暂存区被整个丢掉，旧的 _auto_ipm/ 一个字节都没动过——
+    绝不会留下半套正式的自动测试集。换装直接复用导出那条路上的 core.commit_dirs
+    （keep_staging=False：暂存区里都是拷贝，没有 --move 原件的顾虑）。
+    """
+    target, stage, _out = auto_test_dirs()
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True, exist_ok=True)
+    skip = exclude.resolve() if exclude is not None else None
+
+    names: list[str] = []
+    try:
+        for p in core.list_images(core.DIR_IPM_IN):
+            if skip is not None and p.resolve() == skip:
+                continue
+            shutil.copy2(p, stage / p.name)
+            names.append(p.name)
+    except BaseException:
+        # 没能全部复制成功：暂存区作废，正式目录还没被碰过
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+    core.commit_dirs(((stage, target),), what='自动逆透视测试集')
+    return names
+
+
+def record_ipm_results(done) -> list[dict]:
+    """把 batch_test 的实际返回整理成画廊记录，并存进 STATE。
+
+    第一项固定是参与四点标定的那张基准图：它的 BirdView 不在 test_output/ 里，
+    而是随本次导出一起提交的 IPM_RESULT。其余各项严格来自 done 里的配对，
+    被跳过的图不会出现——画廊因此不可能虚构出一个"成果"。
+    """
+    records: list[dict] = []
+    src = STATE['src_path']
+    if src is not None and Path(src).is_file() and core.IPM_RESULT.is_file():
+        records.append({'name': Path(src).name, 'role': 'calibration',
+                        'raw': Path(src), 'birdview': core.IPM_RESULT})
+    for raw, birdview in done or []:
+        records.append({'name': Path(raw).name, 'role': 'test',
+                        'raw': Path(raw), 'birdview': Path(birdview)})
+    STATE['ipm_results'] = records
+    return records
+
+
+def run_auto_batch(pair) -> dict:
+    """刷新自动测试集并用刚导出的那份表跑一遍，返回 {ok, generated, error}。
+
+    只能在导出事务提交成功之后调用（见 api_commit 里的顺序）：在那之前动测试集，
+    导出一旦失败就会留下一套"对不上任何已交付表"的结果。
+    """
+    input_dir, _stage, output_dir = auto_test_dirs()
+    copied = prepare_auto_test_input(STATE['src_path'])
+    print(f'自动测试集已刷新（{len(copied)} 张，不含标点原图）: {safe_rel(input_dir)}')
+    done = core.batch_test(pair, input_dir=input_dir, output_dir=output_dir)
+    record_ipm_results(done)
+    return {'ok': True, 'generated': len(done or []), 'error': None}
+
+
 def api_commit(body: dict) -> dict:
-    """落盘：保存逆透视状态、导出六矩阵与两套查找表、跑批量测试。"""
+    """落盘：保存逆透视状态、导出六矩阵与两套查找表，再跑自动批量测试。
+
+    回包里 export_ok 与 batch 是两件事，必须分开看。自动批测是**交付之后**的验证，
+    不属于导出事务：它失败了矩阵与查找表照样已经提交成功（绝不回滚），所以它的
+    异常不能冒出去——否则前端只会看到一句"导出失败"，而表其实已经在盘上了。
+    """
     p = _preview_inputs(body)
     apply_table_options(body)
     cal = make_calibrator(p['quad'], p['phys_w'], p['phys_h'],
@@ -993,6 +1103,7 @@ def api_commit(body: dict) -> dict:
     core.assert_invertible('H', H)
 
     buf = io.StringIO()
+    batch = {'ok': False, 'generated': 0, 'error': None}
     with redirect_stdout(buf):
         over_crop = cal.is_over_crop()
         if over_crop:
@@ -1023,8 +1134,14 @@ def api_commit(body: dict) -> dict:
         # 导出已成功，这时才写结果图（与矩阵、查找表同属一批产物）
         core.safe_imwrite(core.IPM_RESULT, cal.birdview)
         print('去畸变逆透视结果图已保存:', core.IPM_RESULT)
-        core.batch_test(pair)
-        print('\n全部完成。')
+        # 到这里矩阵、查找表、结果图都已落盘。下面是交付后的验证：失败不回滚任何产物，
+        # 也不许把异常放出去，只把结论写进 batch 让调用方分两行显示。
+        try:
+            batch = run_auto_batch(pair)
+            print('\n全部完成。')
+        except (Exception, SystemExit) as exc:
+            batch = {'ok': False, 'generated': 0, 'error': str(exc)}
+            print(f'\n矩阵与查找表已导出成功，但自动批量测试失败: {exc}')
     log = buf.getvalue()
 
     files = []
@@ -1032,11 +1149,15 @@ def api_commit(body: dict) -> dict:
         pth = core.SCRIPT_DIR / rel
         if pth.is_file():
             files.append({'name': rel, 'size': pth.stat().st_size})
-    return {'log': log, 'files': files}
+    return {'log': log, 'files': files, 'export_ok': True, 'batch': batch}
 
 
 def api_batch() -> dict:
     """只重跑批量测试。
+
+    语义与命令行 `--stage test` 一致：跑的是 **test_input/ 根目录**里用户自己放的
+    那批图，写到 test_output/ 根目录。导出时的自动测试集在 _auto_ipm/ 子目录里，
+    两条路互不干扰（list_images 不递归子目录）。
 
     优先消费已经导出的那套表——这才是"交付给 C 端的表能不能用"的直接验证；
     表不在时才退回按 ipm_state.json 重算。
@@ -1108,6 +1229,9 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == '/api/preview_gallery':
                 with LOCK:
                     return self.send_json(api_preview_gallery())
+            if parsed.path == '/api/ipm_result_gallery':
+                with LOCK:
+                    return self.send_json(api_ipm_result_gallery())
             if parsed.path == '/api/backup_list':
                 with LOCK:
                     return self.send_json(api_backup_list())

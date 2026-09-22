@@ -1672,23 +1672,36 @@ def normalize_camera_image(img: np.ndarray, want_size: Tuple[int, int],
     return cv2.resize(img, want_size, interpolation=cv2.INTER_AREA)
 
 
-def batch_test(pair: MapPair) -> None:
-    """用一份"最终交付"的映射表批量处理 test_input/ 的图片，结果写入 test_output/。
+def batch_test(pair: MapPair, input_dir: Optional[Path] = None,
+               output_dir: Optional[Path] = None) -> List[Tuple[Path, Path]]:
+    """用一份"最终交付"的映射表批量处理一批图片，结果写入输出目录。
 
     关键点是入参 MapPair：它已经过重采样与量化，与落盘的字节同源。走表而不是
     重算，测试才真正验证了导出的那份表；无效点按 C 端语义显式置黑。
+
+    input_dir / output_dir 默认是 DIR_TEST_IN / DIR_TEST_OUT（CLI 与「只重跑批量
+    测试」的既有语义，即工程根下那两个目录本身）。给出别的目录是为了让调用方能
+    跑一套自己管理的测试集（Web 的 test_input/_auto_ipm），判定逻辑完全相同。
+    默认值必须在函数体里现取：这两个全局会被 configure_paths() 重绑定，写进
+    签名默认值就会永远停在模块导入那一刻的路径。
+
+    返回**实际成功生成**的 (输入路径, 输出路径) 配对。读不出来、宽高比不符被
+    跳过的图不在其中——调用方据此配对展示成果，不必再靠文件名反猜谁对应谁。
     """
-    files = list_images(DIR_TEST_IN)
+    in_dir = DIR_TEST_IN if input_dir is None else Path(input_dir)
+    out_dir = DIR_TEST_OUT if output_dir is None else Path(output_dir)
+    files = list_images(in_dir)
     if not files:
-        print(f'{DIR_TEST_IN} 中没有测试图，跳过批量测试。')
-        return
-    DIR_TEST_OUT.mkdir(parents=True, exist_ok=True)
+        print(f'{in_dir} 中没有测试图，跳过批量测试。')
+        return []
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     mx32 = pair.x.astype(np.float32)
     my32 = pair.y.astype(np.float32)
     invalid = pair.invalid
     ow, oh = pair.size
 
+    done: List[Tuple[Path, Path]] = []
     for path in files:
         img = safe_imread(path)
         if img is None:
@@ -1700,8 +1713,11 @@ def batch_test(pair: MapPair) -> None:
             continue
         out = cv2.remap(img, mx32, my32, cv2.INTER_LINEAR, borderValue=(0, 0, 0))
         out[invalid] = 0
-        safe_imwrite(DIR_TEST_OUT / f'{path.stem}_birdview.jpg', out)
-    print(f'批量测试完成（网格 {ow}x{oh}，来源是导出后的表）: {DIR_TEST_OUT}')
+        dst = out_dir / f'{path.stem}_birdview.jpg'
+        safe_imwrite(dst, out)
+        done.append((path, dst))
+    print(f'批量测试完成（网格 {ow}x{oh}，来源是导出后的表）: {out_dir}')
+    return done
 
 
 # ---------------------------------------------------------------- 8. 命令行与素材管理

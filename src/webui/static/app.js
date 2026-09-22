@@ -320,6 +320,7 @@ async function refreshStatus() {
   if (badge) {
     badge.textContent = st.preview_count ? `（${st.preview_count} 张）` : '（暂无）';
   }
+  setIpmGalleryButton(st.ipm_result_count || 0);
 
   renderCandidates(st.ipm_candidates, st.ipm_source);
 
@@ -1104,9 +1105,53 @@ function bindControls() {
 
 // ---------------------------------------------------------------- 成果图画廊
 
+// 一个弹窗服务两类成果对照（标定去畸变 / 逆透视 BirdView）：交互完全一样（网格、
+// 左右并排、翻页、快捷键、缺失空态），所以复用同一套代码；但数据源与文案各自独立
+// —— 两个接口绝不合并，标题也不共用，否则验收的人分不清看的是哪一步的成果。
 const gallery = { items: [], index: -1 };
 
-/** 打开去畸变成果图画廊。 */
+/** 把一组对照渲染进弹窗。
+    items: [{ name, label, leftUrl, rightUrl, thumbNote }]，配对由服务端给定。 */
+function renderGallery({ title, items, emptyText, leftCaption, rightCaption, rightMissing }) {
+  gallery.items = items;
+  gallery.index = -1;
+
+  const grid = $('gallery-grid');
+  grid.innerHTML = '';
+  if (!items.length) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = emptyText;
+    grid.appendChild(p);
+  } else {
+    items.forEach((it, i) => {
+      const el = document.createElement('div');
+      el.className = 'shot';
+      el.title = it.name;
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      // 缩略图优先用结果图；只剩原图时也得让这一组可点开，
+      // 但要在标签上说清楚，别让人把原图当成成果验收了。
+      const thumb = it.rightUrl || it.leftUrl;
+      if (thumb) img.src = thumbUrl(thumb, 360);
+      const span = document.createElement('span');
+      span.textContent = it.thumbNote ? `${it.name}（${it.thumbNote}）` : it.name;
+      el.append(img, span);
+      el.onclick = () => showGalleryItem(i);
+      grid.appendChild(el);
+    });
+  }
+
+  $('gallery-title').textContent = title;
+  $('gallery-count').textContent = String(items.length);
+  $('viewer-source-caption').textContent = leftCaption;
+  $('viewer-preview-caption').textContent = rightCaption;
+  $('viewer-preview-missing').textContent = rightMissing;
+  $('gallery-viewer').hidden = true;
+  $('gallery').hidden = false;
+}
+
+/** 打开标定去畸变成果画廊。 */
 async function openGallery() {
   let data;
   try {
@@ -1115,40 +1160,68 @@ async function openGallery() {
     log('读取成果图失败: ' + e.message, 'err');
     return;
   }
-  gallery.items = data.items || [];
-  gallery.index = -1;
-
-  const grid = $('gallery-grid');
-  grid.innerHTML = '';
-  if (!gallery.items.length) {
-    const p = document.createElement('p');
-    p.className = 'empty';
-    p.textContent = 'calib_preview/ 还是空的。跑一次「运行标定」就会在这里生成每张标定图的去畸变结果。';
-    grid.appendChild(p);
-  } else {
-    gallery.items.forEach((it, i) => {
-      const el = document.createElement('div');
-      el.className = 'shot';
-      el.title = it.name;
-      const img = document.createElement('img');
-      img.loading = 'lazy';
-      // 缩略图优先用去畸变图；只剩原图时也得让这一组可点开，
-      // 但要在标签上说清楚，别让人把原图当成去畸变成果验收了。
-      img.src = thumbUrl(it.undistorted_url || it.raw_url, 360);
-      const span = document.createElement('span');
-      span.textContent = it.undistorted_url ? it.name : it.name + '（缺去畸变）';
-      el.append(img, span);
-      el.onclick = () => showGalleryItem(i);
-      grid.appendChild(el);
-    });
-  }
-
-  $('gallery-count').textContent = String(gallery.items.length);
-  $('gallery-viewer').hidden = true;
-  $('gallery').hidden = false;
-  log(`打开成果图画廊：${gallery.items.length} 组对照，`
+  const items = (data.items || []).map((it) => ({
+    name: it.name,
+    label: null,
+    leftUrl: it.raw_url,
+    rightUrl: it.undistorted_url,
+    thumbNote: it.undistorted_url ? null : '缺去畸变',
+  }));
+  renderGallery({
+    title: '标定去畸变成果',
+    items,
+    emptyText: 'calib_preview/ 还是空的。跑一次「运行标定」就会在这里生成每张标定图的去畸变结果。',
+    leftCaption: '原图（带畸变）',
+    rightCaption: '去畸变后',
+    rightMissing: '去畸变图缺失',
+  });
+  log(`打开成果图画廊：${items.length} 组对照，`
     + `其中 ${data.paired} 组两侧齐全`
     + `（缺原图 ${data.missing_raw}，缺去畸变 ${data.missing_undistorted}）。`);
+}
+
+// 成果记录里的角色 → 界面上的说法。第一项是真正参与四点标定的那张基准图，
+// 其余是没参与标点的测试图；这两者的说服力完全不同，必须在界面上分清。
+const IPM_ROLE_LABEL = { calibration: '标定基准图', test: '测试图' };
+
+/** 打开逆透视成果画廊（原图 ↔ BirdView）。 */
+async function openIpmGallery() {
+  let data;
+  try {
+    data = await api('/api/ipm_result_gallery');
+  } catch (e) {
+    log('读取逆透视成果失败: ' + e.message, 'err');
+    return;
+  }
+  const raw = data.items || [];
+  const items = raw.map((it) => ({
+    name: it.name,
+    label: IPM_ROLE_LABEL[it.role] || it.role,
+    leftUrl: it.raw_url,
+    rightUrl: it.birdview_url,
+    thumbNote: IPM_ROLE_LABEL[it.role] || it.role,
+  }));
+  renderGallery({
+    title: '逆透视成果（原图 ↔ BirdView）',
+    items,
+    emptyText: '暂无成果，先完成导出。',
+    leftCaption: '原图（带畸变）',
+    rightCaption: 'BirdView（逆透视）',
+    rightMissing: 'BirdView 缺失',
+  });
+  const cal = raw.filter((it) => it.role === 'calibration').length;
+  const test = raw.filter((it) => it.role === 'test').length;
+  log(`打开逆透视成果画廊：标定基准图 ${cal} 张 + 测试图 ${test} 张`
+    + '（配对来自导出后那次批量测试的实际结果，被跳过的图不会出现在这里）。');
+}
+
+/** 按「本次是否真的生成过成果」设置第 3 步那个按钮的可点状态与张数。 */
+function setIpmGalleryButton(count) {
+  const btn = $('btn-ipm-gallery');
+  const badge = $('ipm-gallery-badge');
+  if (!btn || !badge) return;
+  btn.disabled = !count;
+  badge.textContent = count ? `（${count} 张）` : '（暂无成果，先完成导出）';
 }
 
 /** 给服务端下发的取图地址补上最大边限制。 */
@@ -1167,9 +1240,12 @@ function showGalleryItem(i) {
   gallery.index = i;
   const it = gallery.items[i];
 
-  setPane('viewer-source', it.raw_url);
-  setPane('viewer-preview', it.undistorted_url);
-  $('viewer-name').textContent = `${it.name}  ·  ${i + 1} / ${gallery.items.length}`;
+  setPane('viewer-source', it.leftUrl);
+  setPane('viewer-preview', it.rightUrl);
+  const parts = [it.name];
+  if (it.label) parts.push(it.label);
+  parts.push(`${i + 1} / ${gallery.items.length}`);
+  $('viewer-name').textContent = parts.join('  ·  ');
   $('gallery-viewer').hidden = false;
 
   document.querySelectorAll('#gallery-grid .shot').forEach((el, k) => {
@@ -1207,6 +1283,7 @@ function galleryStep(delta) {
 /** 绑定画廊的按钮与快捷键。 */
 function bindGallery() {
   $('btn-gallery').onclick = () => withBusy($('btn-gallery'), openGallery);
+  $('btn-ipm-gallery').onclick = () => withBusy($('btn-ipm-gallery'), openIpmGallery);
   $('gallery-close').onclick = closeGallery;
   $('viewer-prev').onclick = () => galleryStep(-1);
   $('viewer-next').onclick = () => galleryStep(1);
@@ -1429,7 +1506,19 @@ function bindActions() {
       const data = await api('/api/commit', { ...previewParams(), ...opts });
       state.committedQuad = state.quad.map((p) => p.slice());
       log(data.log);
+      // 导出与自动批测是两件事，必须分两行说。合成一句"导出失败"会让人以为
+      // 矩阵/查找表没落盘，而它们其实已经提交成功了。
+      if (data.export_ok) {
+        log('✓ 矩阵与查找表导出成功', 'ok');
+      }
       log('导出完成，产物: ' + data.files.map((f) => f.name).join(', '), 'ok');
+      const batch = data.batch || {};
+      if (batch.ok) {
+        log(`✓ 自动批量测试完成：生成 ${batch.generated} 张成果`, 'ok');
+      } else {
+        log('⚠ 自动批量测试失败：' + (batch.error || '未知原因')
+          + '（矩阵与查找表不受影响，已在盘上）', 'err');
+      }
       await refreshStatus();
     } catch (e) { log('导出失败: ' + e.message, 'err'); }
   });
