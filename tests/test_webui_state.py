@@ -483,7 +483,7 @@ def main() -> int:
             core.safe_imwrite(core.IPM_RESULT, np.full((40, 40, 3), 200, np.uint8))
             server.STATE.update(src_path=picked, ipm_results=[])
 
-            auto_in, stage, auto_out = server.auto_test_dirs()
+            auto_in, stage, auto_out, out_stage = server.auto_test_dirs()
             res = server.run_auto_batch(identity_pair())
             check(len(names_in(auto_in)) == 7,
                   'ipm_input 有 8 张、选 1 张 → _auto_ipm 正好 7 张',
@@ -610,9 +610,11 @@ def main() -> int:
             check(seen.get('pair') is sentinel,
                   'batch 用的是 export_all 返回的同一个最终 MapPair（不是重新算的）',
                   f"同一对象: {seen.get('pair') is sentinel}")
+            # P1.1 之后 batch_test 写的是输出暂存区，全部完成才换装成 _auto_ipm；
+            # 输入侧仍是 _auto_ipm。两侧都不碰 test_input / test_output 根目录。
             check(seen.get('input_dir') == auto_in
-                  and seen.get('output_dir') == auto_out,
-                  '自动批测读写的是 _auto_ipm 子目录，不碰根目录',
+                  and seen.get('output_dir') == out_stage,
+                  '自动批测读 _auto_ipm、写输出暂存区，都不碰根目录',
                   f"{rel_str(seen['input_dir'])} → {rel_str(seen['output_dir'])}")
             check(out['export_ok'] is True and out['batch']['ok'] is True
                   and out['batch']['generated'] == 7,
@@ -643,6 +645,73 @@ def main() -> int:
             check(seen.get('input_dir') is None and seen.get('output_dir') is None,
                   'api_batch 不传目录 → 保持原来 test_input 根目录的语义',
                   f"input_dir={seen.get('input_dir')}")
+
+            # ---- P1.1：成果必须对应刚刚那一份 LUT，异常路径也不许例外
+            # 先跑一轮正常的，让磁盘与 STATE 都留下"上一轮"的成果
+            server.STATE.update(src_path=picked, ipm_results=[])
+            prev = server.run_auto_batch(identity_pair())
+            prev_out = names_in(auto_out)
+            check(prev['generated'] == 7 and len(prev_out) == 7,
+                  '上一轮：7 张成果落盘并进了画廊记录', f"{prev['generated']} / {prev_out}")
+
+            # 本轮 batch 故障：画廊必须回到 0，绝不能继续展示上一轮的配对
+            boom = core.batch_test
+
+            def batch_boom(*_a, **_k):
+                raise OSError('本轮批测炸了（故障注入）')
+
+            core.batch_test = batch_boom
+            try:
+                res_fail = server.api_commit(dict(body))
+            finally:
+                core.batch_test = boom
+            check(res_fail['export_ok'] is True and res_fail['batch']['ok'] is False,
+                  '本轮 batch 故障：仍然 export_ok=true', str(res_fail['batch']))
+            check(server.api_ipm_result_gallery()['count'] == 0,
+                  '本轮 batch 故障 → 画廊 count=0，不展示上一轮的旧配对',
+                  str(server.api_ipm_result_gallery()['count']))
+            check(len(server.STATE['ipm_results']) == 0,
+                  '成果记录在本轮开始批测前就已作废')
+
+            # 上轮 7 张、本轮只有 6 张成功 → 正式 output 恰好 6 张，无孤儿旧文件
+            server.STATE.update(src_path=picked, ipm_results=[])
+            server.run_auto_batch(identity_pair())
+            check(len(names_in(auto_out)) == 7, '重新跑通后又回到 7 张')
+            # 从**候选来源**删掉一张。删 _auto_ipm 里的那份没用：run_auto_batch 每轮都会
+            # 从 ipm_input/ 重新刷新输入集，删了会被原样补回来。
+            (core.DIR_IPM_IN / 'cand_0.jpg').unlink()
+            res6 = server.run_auto_batch(identity_pair())
+            final = names_in(auto_out)
+            check(res6['generated'] == 6 and len(final) == 6
+                  and 'cand_0_birdview.jpg' not in final,
+                  '上轮 7 张、本轮 6 张成功 → 正式 output 正好 6 张，没有孤儿旧文件',
+                  f'{len(final)} 张: {final}')
+
+            # 写到第 N 张故障 → 旧正式 output 完整保留，输出暂存区清理干净
+            before_out = names_in(auto_out)
+            real_write = core.safe_imwrite
+            calls = [0]
+
+            def flaky_write(path, img, *a, **k):
+                if '_birdview' in Path(path).name:
+                    calls[0] += 1
+                    if calls[0] == 3:
+                        raise OSError('写第 3 张成果时磁盘满（故障注入）')
+                return real_write(path, img, *a, **k)
+
+            core.safe_imwrite = flaky_write
+            try:
+                server.run_auto_batch(identity_pair())
+                check(False, 'batch 写盘故障应当抛出来')
+            except OSError as exc:
+                check('磁盘满' in str(exc), 'batch 写到第 3 张时故障抛出', str(exc))
+            finally:
+                core.safe_imwrite = real_write
+            check(names_in(auto_out) == before_out,
+                  'batch 中途故障 → 旧正式 output 完整保留（换装前一个字节都没动）',
+                  f'{before_out} -> {names_in(auto_out)}')
+            check(not out_stage.exists() or not any(out_stage.iterdir()),
+                  '故障后输出暂存区已清理', out_stage.name)
         finally:
             for name, fn in originals.items():
                 setattr(core, name, fn)

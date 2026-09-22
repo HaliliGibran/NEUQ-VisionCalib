@@ -1009,11 +1009,12 @@ def apply_table_options(body: dict) -> None:
 AUTO_TEST_SUBDIR = '_auto_ipm'
 
 
-def auto_test_dirs() -> tuple[Path, Path, Path]:
-    """自动测试集的三个目录：(输入, 输入暂存区, 输出)。现取，跟着工程根走。"""
+def auto_test_dirs() -> tuple[Path, Path, Path, Path]:
+    """自动测试集的四个目录：(输入, 输入暂存区, 输出, 输出暂存区)。现取，跟着工程根走。"""
     return (core.DIR_TEST_IN / AUTO_TEST_SUBDIR,
             core.DIR_TEST_IN / (AUTO_TEST_SUBDIR + '.staging'),
-            core.DIR_TEST_OUT / AUTO_TEST_SUBDIR)
+            core.DIR_TEST_OUT / AUTO_TEST_SUBDIR,
+            core.DIR_TEST_OUT / (AUTO_TEST_SUBDIR + '.staging'))
 
 
 def prepare_auto_test_input(exclude: Path | None) -> list[str]:
@@ -1026,7 +1027,7 @@ def prepare_auto_test_input(exclude: Path | None) -> list[str]:
     绝不会留下半套正式的自动测试集。换装直接复用导出那条路上的 core.commit_dirs
     （keep_staging=False：暂存区里都是拷贝，没有 --move 原件的顾虑）。
     """
-    target, stage, _out = auto_test_dirs()
+    target, stage, _out, _out_stage = auto_test_dirs()
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True, exist_ok=True)
     skip = exclude.resolve() if exclude is not None else None
@@ -1071,13 +1072,33 @@ def run_auto_batch(pair) -> dict:
 
     只能在导出事务提交成功之后调用（见 api_commit 里的顺序）：在那之前动测试集，
     导出一旦失败就会留下一套"对不上任何已交付表"的结果。
+
+    输出侧和输入侧一样走"先写暂存区、全部完成再整体换装"，而不是往正式目录里
+    增量写。否则上一轮成功 7 张、这一轮某张因比例不符被跳过时，那张旧的
+    _birdview.jpg 会孤零零留在正式目录里——画廊看 done 不会展示它，但目录计数和
+    用户手动翻文件时会看到一个对不上本轮 LUT 的旧结果。换装之后正式目录里就是
+    本轮实际成果的精确集合。
+
+    batch_test 返回的输出路径指向暂存区，换装后要改写成正式目录下的路径，
+    再交给 record_ipm_results——否则画廊指向的是已经不存在的 .staging。
     """
-    input_dir, _stage, output_dir = auto_test_dirs()
+    input_dir, _stage, output_dir, out_stage = auto_test_dirs()
     copied = prepare_auto_test_input(STATE['src_path'])
     print(f'自动测试集已刷新（{len(copied)} 张，不含标点原图）: {safe_rel(input_dir)}')
-    done = core.batch_test(pair, input_dir=input_dir, output_dir=output_dir)
+
+    shutil.rmtree(out_stage, ignore_errors=True)
+    out_stage.mkdir(parents=True, exist_ok=True)
+    try:
+        done = core.batch_test(pair, input_dir=input_dir, output_dir=out_stage)
+    except BaseException:
+        # 本轮没跑完：暂存区作废，正式目录里上一轮的成果一个字节都没动过
+        shutil.rmtree(out_stage, ignore_errors=True)
+        raise
+    core.commit_dirs(((out_stage, output_dir),), what='自动逆透视成果')
+
+    done = [(raw, output_dir / Path(bv).name) for raw, bv in done or []]
     record_ipm_results(done)
-    return {'ok': True, 'generated': len(done or []), 'error': None}
+    return {'ok': True, 'generated': len(done), 'error': None}
 
 
 def api_commit(body: dict) -> dict:
@@ -1136,6 +1157,11 @@ def api_commit(body: dict) -> dict:
         print('去畸变逆透视结果图已保存:', core.IPM_RESULT)
         # 到这里矩阵、查找表、结果图都已落盘。下面是交付后的验证：失败不回滚任何产物，
         # 也不许把异常放出去，只把结论写进 batch 让调用方分两行显示。
+        #
+        # 先作废上一轮的成果记录，再开始本轮批测。顺序很重要：不清空的话本轮批测一旦
+        # 失败，画廊会继续展示上一轮的配对——而那些 BirdView 是用**上一份** LUT 算的，
+        # 与刚刚导出的这一份已经对不上了。宁可按钮回到 disabled，也不能展示错的成果。
+        STATE['ipm_results'] = []
         try:
             batch = run_auto_batch(pair)
             print('\n全部完成。')
