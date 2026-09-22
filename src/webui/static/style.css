@@ -182,11 +182,19 @@ button.danger-outline:hover {
 }
 .mode-toggle button + button { border-left: 1px solid var(--border-2); }
 
-/* 放大镜：叠在源画布之上、不接收鼠标事件 */
+/* 放大窗：固定钉在源画布右上角、不接收鼠标事件。
+   尺寸要和 app.js 里的 LOUPE_SIZE 一致。
+   .canvas-wrap canvas 那条规则会把它撑成 100%，也会让 [hidden] 失效，
+   所以这里用 ID 选择器把宽高和隐藏都压回来。 */
 #c-loupe {
-  position: absolute; inset: 0;
+  position: absolute; top: 10px; right: 10px;
+  width: 160px; height: 160px;
+  border: 1px solid rgba(255, 255, 255, .7);
+  border-radius: 6px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .45);
   pointer-events: none;
 }
+#c-loupe[hidden] { display: none; }
 
 label {
   display: block; font-size: 12px; color: var(--muted); margin-bottom: 8px;

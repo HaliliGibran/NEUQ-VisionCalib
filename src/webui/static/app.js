@@ -23,10 +23,10 @@ const LABELS = ['TL', 'TR', 'BL', 'BR'];
 const LINE_NAMES = ['TOP', 'BOTTOM', 'LEFT', 'RIGHT'];
 const HANDLE_HIT_PX = 14;
 
-// 放大镜默认 5x，半径 60 px。放大镜画在光标旁边而不是压在上面，
-// 贴边时会自动翻到另一侧并夹进画布。
+// 放大镜固定 5x。放大窗钉在源图区域右上角，中心锁定"当前选中的点"，
+// 不跟随鼠标——微调点位时视线不必在光标与放大镜之间来回跳。
 const LOUPE_SCALE = 5;
-const LOUPE_RADIUS = 60;
+const LOUPE_SIZE = 160;   // 放大窗边长，与 style.css 里 #c-loupe 的尺寸一致
 
 /** 把一行直线 a1->a2 和 b1->b2 求交点；接近平行时返回 null。 */
 function intersectLines(a1, a2, b1, b2) {
@@ -421,6 +421,9 @@ function zoomTo(scale, cx, cy) {
 }
 
 function drawSource() {
+  // 放大窗是"当前选中点"的派生视图，和主画布同一次刷新：
+  // 选中点变了、点位被拖了、图换了都会走到这里，放大窗不会漏更新。
+  updateLoupe();
   const cv = $('c-source');
   const { w, h } = canvasMetrics();
   const dpr = window.devicePixelRatio || 1;
@@ -586,7 +589,6 @@ function clampPointToImage(p) {
 
 function bindCanvas() {
   const cv = $('c-source');
-  const wrap = $('canvas-wrap');
 
   cv.addEventListener('mousedown', (e) => {
     if (!state.img) return;
@@ -627,7 +629,6 @@ function bindCanvas() {
         drawSource();
       }
     }
-    updateLoupe(e.clientX, e.clientY);
   });
 
   window.addEventListener('mouseup', () => {
@@ -635,11 +636,8 @@ function bindCanvas() {
       schedulePreview(true);
     }
     state.drag = null;
-    clearLoupe();   // 放大镜只在拖动期间出现
+    // 这里**不能**清放大窗：松手后点还是选中的，放大窗必须继续锁在它上面。
   });
-
-  // 鼠标离开画布就清掉放大镜
-  wrap.addEventListener('mouseleave', clearLoupe);
 
   cv.addEventListener('wheel', (e) => {
     if (!state.img) return;
@@ -686,67 +684,67 @@ function bindCanvas() {
   new ResizeObserver(() => { drawSource(); }).observe($('canvas-wrap'));
 }
 
-/** 放大镜：拖动时在鼠标**旁边**画一个圆形放大区，5x 默认。
+/** 当前锁定点的原图坐标；未选中 / 数据缺失都返回 null。
 
-    位置放在光标旁边而不是压在上面，否则正好挡住你要对的那个点。
-    采样中心仍然是光标位置，只是把圆挪开，并用一根细引线指明它对应哪里。
-    只在拖动期间显示——平时鼠标扫过画布不该有东西跟着晃。
+    唯一来源是 state.selected：corner 模式是角点下标（-1 = 未选中），
+    line 模式是 `l{i}e{ei}` 字符串。没有第二份"放大镜自己的目标"状态。
  */
-function updateLoupe(clientX, clientY) {
-  const loupe = $('c-loupe');
-  // 不拖动就不显示
-  if (!state.img || !state.drag) { clearLoupe(); return; }
+function selectedImagePoint() {
+  const sel = state.selected;
+  if (state.editMode === 'corner') {
+    if (typeof sel !== 'number' || sel < 0 || !state.quad) return null;
+    return state.quad[sel] || null;
+  }
+  if (typeof sel !== 'string' || !state.linePoints) return null;
+  const m = /^l(\d+)e(\d+)$/.exec(sel);
+  if (!m) return null;
+  const ln = state.linePoints[Number(m[1])];
+  return ln ? (ln[Number(m[2])] || null) : null;
+}
 
-  const rect = $('canvas-wrap').getBoundingClientRect();
-  const mx = clientX - rect.left;
-  const my = clientY - rect.top;
+/** 放大窗：固定钉在源图区域右上角的 160×160 小窗，5x，中心锁定当前选中的点。
+
+    位置不随鼠标动，只有内容会变：换选中点 → 换中心；拖选中点 → 实时重采样。
+    未选中任何点时整个窗隐藏。窗内叠加主画布同一套几何绘制，中心画十字准星。
+ */
+function updateLoupe() {
+  const loupe = $('c-loupe');
+  if (!loupe) return;
+  const target = state.img ? selectedImagePoint() : null;
+  if (!target) { clearLoupe(); return; }
 
   const dpr = window.devicePixelRatio || 1;
-  if (loupe.width !== Math.round(rect.width * dpr)
-      || loupe.height !== Math.round(rect.height * dpr)) {
-    loupe.width = Math.round(rect.width * dpr);
-    loupe.height = Math.round(rect.height * dpr);
+  const px = Math.round(LOUPE_SIZE * dpr);
+  if (loupe.width !== px || loupe.height !== px) {
+    loupe.width = px;
+    loupe.height = px;
   }
+  loupe.hidden = false;
+
   const ctx = loupe.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, rect.width, rect.height);
+  ctx.clearRect(0, 0, LOUPE_SIZE, LOUPE_SIZE);
+  ctx.fillStyle = '#202020';
+  ctx.fillRect(0, 0, LOUPE_SIZE, LOUPE_SIZE);
 
-  const [ix, iy] = toImage(clientX, clientY);
-  if (ix < 0 || iy < 0 || ix >= state.img.width || iy >= state.img.height) return;
+  const [ix, iy] = target;
+  const c = LOUPE_SIZE / 2;
+  const halfSrc = c / LOUPE_SCALE;
 
-  // 圆的落点：优先右上，贴边就翻到反侧，最后再夹到画布内
-  const gap = 22;
-  let cx = mx + LOUPE_RADIUS + gap;
-  let cy = my - LOUPE_RADIUS - gap;
-  if (cx + LOUPE_RADIUS > rect.width) cx = mx - LOUPE_RADIUS - gap;
-  if (cy - LOUPE_RADIUS < 0) cy = my + LOUPE_RADIUS + gap;
-  cx = Math.min(Math.max(cx, LOUPE_RADIUS), Math.max(LOUPE_RADIUS, rect.width - LOUPE_RADIUS));
-  cy = Math.min(Math.max(cy, LOUPE_RADIUS), Math.max(LOUPE_RADIUS, rect.height - LOUPE_RADIUS));
-
-  // 引线：从光标指向圆心，让人一眼看出放大镜对应画面哪个位置
-  ctx.strokeStyle = 'rgba(255,255,255,.45)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(mx, my);
-  ctx.lineTo(cx, cy);
-  ctx.stroke();
-
-  // 图片局部：以光标处的原图坐标为中心，半径 halfSrc 缩放成 LOUPE_RADIUS
-  const halfSrc = LOUPE_RADIUS / LOUPE_SCALE;
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(cx, cy, LOUPE_RADIUS, 0, Math.PI * 2);
-  ctx.clip();
+  // 源矩形可能越出图像边界；drawImage 会按同比例裁剪目标矩形，
+  // 所以锁定点始终落在窗心，靠边时只是有一侧留空。
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(state.img, ix - halfSrc, iy - halfSrc, 2 * halfSrc, 2 * halfSrc,
-    cx - LOUPE_RADIUS, cy - LOUPE_RADIUS, 2 * LOUPE_RADIUS, 2 * LOUPE_RADIUS);
+    0, 0, LOUPE_SIZE, LOUPE_SIZE);
 
-  // 圆内叠加几何。复用主画布那两个绘制函数，toScreen 换成放大镜的几何：
-  // 原图 (ix,iy) 落在圆心 (cx,cy)，其余点按 LOUPE_SCALE 放大。
+  // 窗内几何：复用主画布的绘制函数，把 toScreen 换成"锁定点落在窗心、其余按 5x 放大"。
+  // 半透明画，否则窗心那个实心手柄正好盖住你要对的像素。
   const toScreenZ = (p) => [
-    (p[0] - ix) * LOUPE_SCALE + cx,
-    (p[1] - iy) * LOUPE_SCALE + cy,
+    (p[0] - ix) * LOUPE_SCALE + c,
+    (p[1] - iy) * LOUPE_SCALE + c,
   ];
+  ctx.save();
+  ctx.globalAlpha = 0.55;
   if (state.editMode === 'corner' && state.quad) {
     drawCornerMode(ctx, state.quad.map(toScreenZ));
   } else if (state.editMode === 'line' && state.linePoints) {
@@ -756,31 +754,24 @@ function updateLoupe(clientX, clientY) {
   }
   ctx.restore();
 
-  // 外圈与十字准星（在 clip 之外画，保证描边完整）
-  ctx.strokeStyle = '#fff';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(cx, cy, LOUPE_RADIUS, 0, Math.PI * 2);
-  ctx.stroke();
-
-  ctx.strokeStyle = 'rgba(255,80,80,0.9)';
+  // 十字准星：中间留空，别把要对的那个像素盖住
+  ctx.strokeStyle = 'rgba(255,80,80,0.95)';
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.moveTo(cx - 9, cy); ctx.lineTo(cx + 9, cy);
-  ctx.moveTo(cx, cy - 9); ctx.lineTo(cx, cy + 9);
-  ctx.stroke();
-
-  // 光标处的定位点，标明采样中心
-  ctx.strokeStyle = 'rgba(255,80,80,0.9)';
-  ctx.beginPath();
-  ctx.arc(mx, my, 3, 0, Math.PI * 2);
+  ctx.moveTo(c - 22, c); ctx.lineTo(c - 5, c);
+  ctx.moveTo(c + 5, c); ctx.lineTo(c + 22, c);
+  ctx.moveTo(c, c - 22); ctx.lineTo(c, c - 5);
+  ctx.moveTo(c, c + 5); ctx.lineTo(c, c + 22);
   ctx.stroke();
 }
 
+/** 隐藏并清空放大窗。唯一调用点在 updateLoupe 的"未选中"分支。 */
 function clearLoupe() {
   const loupe = $('c-loupe');
   if (!loupe) return;
+  loupe.hidden = true;
   const ctx = loupe.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, loupe.width, loupe.height);
 }
 
