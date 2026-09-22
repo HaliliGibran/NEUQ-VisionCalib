@@ -8,6 +8,16 @@
   3. undistort_ipm/reverse 表 remap 的结果 == cv2.warpPerspective(去畸变图, H)
   4. undistort_ipm 的 forward 与 reverse 互为逆映射
   5. 无效哨兵只出现在合法区域之外，且有效区连通
+  6. 落盘的 forward 与 reverse **各自**等于流水线应当生成的那张表
+
+第 6 条才是主判据。理由见 check_forward_reverse 的 docstring：一对经过栅格化、
+INTER_AREA 重采样与定点量化的离散表，本来就不保证严格互逆，把"互逆"当成必须成立的
+数学不变量会得到一个随 scale 漂移的假失败。职责因此分成三段：
+
+  数学生成逻辑对不对                → 第 6 条（流水线 oracle）
+  写盘 / 重采样 / 量化对不对        → 第 6 条（同一条，逐点比对）
+  两张离散表能不能完美互逆          → 第 4 条，全分辨率下是 hard gate，
+                                     降采样后只作诊断
 
 落盘格式自动识别：逗号分隔文本（MapW.txt）、int16 定点二进制（MapW.bin）、
 C 头文件（Map.h）。读取统一走主脚本的 core.load_map_pair，这样"脚本怎么读表"
@@ -35,8 +45,15 @@ if str(_ROOT / 'src') not in sys.path:
 
 import neuq_vision_calib as core  # noqa: E402
 
-TOL_INV_PX = 3.0      # forward/reverse 互逆的容差（表按 %.2f 量化，留足余量）
 VISIBLE_FRAC = 0.005  # 允许的"肉眼可见差异"像素占比（灰度差 > 8）
+
+# 全分辨率下 forward(reverse(p)) 的判据。刻意用分位数而不是最大值：
+# 逆透视在远场是强非线性的，双线性插一格的残差在那里天然可以到几个像素，
+# 用 max 当判据等于让极少数近地平线的点决定结论。这两个数是标定出来的——
+# 一对正确的表实测 p50≈0.14 / p95≈0.71（留 2~3 倍余量），而"最近邻取整"那个
+# 老实现 p50≈4.57，会在这里差一个数量级地失败。
+ROUNDTRIP_P50_PX = 0.5
+ROUNDTRIP_P95_PX = 2.0
 
 BIN_SENTINEL = core.BIN_SENTINEL
 
@@ -49,6 +66,7 @@ IMAGE_SIZE: tuple[int, int] = (0, 0)         # 源图尺寸，来自 calib.json
 KNEW: np.ndarray | None = None               # 去畸变输出矩阵，来自 matrices.json
 IS_TEXT_TABLE = True                         # 表格式是否为 %.2f 文本，影响量化容差
 SKIPPED = 0                                  # 因降采样而跳过的检查条数
+DIAGNOSED = 0                                # 只报告、不判定通过/失败的条数
 
 
 def undistort_reference(src: np.ndarray, K: np.ndarray, D: np.ndarray) -> np.ndarray:
@@ -115,16 +133,133 @@ def report(name: str, ok: bool, detail: str) -> bool:
     return ok
 
 
+def diagnose(name: str, detail: str) -> bool:
+    """打印一条只报告、不判定的观测。
+
+    与 skip() 的区别：skip 是"这条没法验"，diagnose 是"这条验了，但它不该当
+    hard gate"。降采样表的互逆性就属于后者——两张离散表分别经过栅格化、
+    INTER_AREA 重采样与定点量化，互逆只是近似成立，没有可靠的固定阈值。
+    """
+    global DIAGNOSED
+    DIAGNOSED += 1
+    print(f'  [诊断] {name}: {detail}')
+    return True
+
+
+def grid_from_full(v: np.ndarray, step: float) -> np.ndarray:
+    """全分辨率坐标 -> 降采样网格坐标（像素中心对齐，与 cv2.resize 同一约定）。
+
+    不能写成 v / step。cv2.resize 的语义是像素**中心**对应，正变换是
+    full = (small + 0.5) * step - 0.5，所以反变换必须带上这半个像素：
+    small = (full + 0.5) / step - 0.5。320x240 下这个偏差是 x 方向约 1.5、
+    y 方向约 1.0 个全分辨率像素，足以混进"互逆误差"里假装成表的问题。
+    """
+    return (v + 0.5) / step - 0.5
+
+
+def full_from_grid(i: np.ndarray, step: float) -> np.ndarray:
+    """降采样网格索引 -> 它代表的全分辨率坐标。grid_from_full 的逆。"""
+    return (i + 0.5) * step - 0.5
+
+
+def bilinear_at(a: np.ndarray, b: np.ndarray, gx: np.ndarray, gy: np.ndarray):
+    """在 (a, b) 两张同形表上做双线性采样，返回 (va, vb, 可用掩码)。
+
+    四邻域必须**全部**有效才给值：无效点是哨兵 -1，插进来会得到一个既不是
+    坐标也不是哨兵的中间数。这与 core.resample_map_pair 的判据一致——
+    宁可把有效边界收缩一格，也不输出不存在的采样点。
+    """
+    th, tw = a.shape
+    inside = (gx >= 0) & (gx <= tw - 1) & (gy >= 0) & (gy <= th - 1)
+    x0 = np.clip(np.floor(np.where(inside, gx, 0)), 0, tw - 2).astype(np.int64)
+    y0 = np.clip(np.floor(np.where(inside, gy, 0)), 0, th - 2).astype(np.int64)
+    wx = np.clip(gx - x0, 0.0, 1.0)
+    wy = np.clip(gy - y0, 0.0, 1.0)
+
+    def valid(j, i):
+        return (a[j, i] >= 0) & (b[j, i] >= 0)
+
+    usable = (inside & valid(y0, x0) & valid(y0, x0 + 1)
+              & valid(y0 + 1, x0) & valid(y0 + 1, x0 + 1))
+
+    def lerp(m):
+        top = (1 - wx) * m[y0, x0] + wx * m[y0, x0 + 1]
+        bot = (1 - wx) * m[y0 + 1, x0] + wx * m[y0 + 1, x0 + 1]
+        return (1 - wy) * top + wy * bot
+
+    return lerp(a), lerp(b), usable
+
+
 def full_resolution() -> bool:
     """表是否与源图同尺寸。不同尺寸时逐像素比对无意义。"""
     return TABLE_SHAPE is None or TABLE_SHAPE == IMAGE_SIZE
 
 
+def pipeline_composite_maps(calib: dict, matrices: dict) -> dict:
+    """按流水线重算 undistort_ipm 的正反两张表（重采样、量化之前）。
+
+    这是整个脚本的 oracle：复刻 core.export_composite_tables 里那几行数学，
+    逐点比对落盘结果。**正反都要算** —— 以前只重算 reverse，forward 的数学
+    错了（方向反了、无效判据不一致）在这里是看不出来的，而 forward 恰恰是
+    "互逆"那一条唯一能间接碰到的地方，那条又天然带着插值误差。
+    """
+    K = np.asarray(calib['camera_matrix'], dtype=np.float64).reshape(3, 3)
+    D = np.asarray(calib['dist_coeffs'], dtype=np.float64).ravel()
+    Knew = np.asarray(matrices['Knew'], dtype=np.float64).reshape(3, 3)
+    H = np.asarray(matrices['H'], dtype=np.float64).reshape(3, 3)
+    H0 = np.asarray(matrices['H0'], dtype=np.float64).reshape(3, 3)
+    sign = float(matrices['horizon_sign'])
+    w, h = IMAGE_SIZE
+
+    rev = core.build_composite_reverse_map(K, D, Knew, H, H0, sign, IMAGE_SIZE)
+
+    und = core.undistorted_grid(K, D, Knew, IMAGE_SIZE)
+    valid = np.isfinite(und).all(axis=1)
+    valid &= sign * core.homography_denominator(H0, und) >= core.DEN_EPS
+    fwd = core.mask_out_of_range(core.apply_homography(H, und), IMAGE_SIZE, valid)
+    return {
+        'reverse': rev,
+        'forward': (fwd[:, 0].reshape(h, w), fwd[:, 1].reshape(h, w)),
+    }
+
+
+def compare_to_pipeline(root: Path, direction: str,
+                        expect: tuple) -> bool:
+    """把一个方向的落盘表与流水线重算结果逐点比对。"""
+    fx, fy = expect
+    if IMAGE_SIZE != TABLE_SHAPE:
+        fx, fy = core.resample_map_pair(fx, fy, TABLE_SHAPE)
+    ax, ay = load_pair(root / 'lookup_table' / 'undistort_ipm' / direction)
+
+    name = f'落盘 {direction} == 流水线重算'
+    if ax.shape != fx.shape:
+        return report(name, False,
+                      f'网格不符: 落盘 {ax.shape[1]}x{ax.shape[0]}，'
+                      f'重算 {fx.shape[1]}x{fx.shape[0]}')
+
+    # NaN 既不满 >=0 也不满 <0，所以"无效"必须显式写成 ~isfinite | <0，
+    # 只用 <0 判断会把重算侧的无效点漏掉一大半。
+    bad_expect = ~np.isfinite(fx) | (fx < 0.0) | ~np.isfinite(fy) | (fy < 0.0)
+    bad_actual = (ax < 0.0) | (ay < 0.0)
+
+    mismatch = int(np.count_nonzero(bad_expect != bad_actual))
+    good = ~bad_expect
+    err = np.hypot(ax[good] - fx[good], ay[good] - fy[good])
+    max_err = float(err.max()) if err.size else 0.0
+    tol = quant_tolerance()
+
+    ok = mismatch == 0 and max_err <= tol
+    return report(name, ok,
+                  f'最大差 {max_err:.4f} px（容差 {tol:.4f}），'
+                  f'有效点 {int(good.sum())}，无效判定不一致 {mismatch} 个')
+
+
 def check_export_fidelity(root: Path, calib: dict, matrices: dict) -> bool:
-    """检查 6: 落盘的表是否忠实等于流水线重算的结果。
+    """检查 6: 落盘的正反两张表是否忠实等于流水线重算的结果。
 
     覆盖重采样与定点量化两步。检查 2/3 验证的是数学（只有全分辨率下才可比），
-    这一项验证的是"算出来的东西有没有原样写进文件"，任何网格、任何格式都成立。
+    这一项验证的是"算出来的东西有没有原样写进文件"，任何网格、任何格式都成立，
+    因此它才是降采样交付物的主判据。
     """
     # core 已在模块顶部导入（那时就把 src/ 挂上了 sys.path），这里只需按用户给的
     # 工程根重绑定路径常量，并把表格格式同步过去，好让 core.load_map_pair 读得对。
@@ -132,40 +267,9 @@ def check_export_fidelity(root: Path, calib: dict, matrices: dict) -> bool:
     core.TABLE_SIZE = TABLE_SHAPE
     core.TABLE_FIXED_POINT = FIXED_POINT
 
-    K = np.asarray(calib['camera_matrix'], dtype=np.float64).reshape(3, 3)
-    D = np.asarray(calib['dist_coeffs'], dtype=np.float64).ravel()
-    Knew = np.asarray(matrices['Knew'], dtype=np.float64).reshape(3, 3)
-    H = np.asarray(matrices['H'], dtype=np.float64).reshape(3, 3)
-    H0 = np.asarray(matrices['H0'], dtype=np.float64).reshape(3, 3)
-    sign = float(matrices['horizon_sign'])
-    size = IMAGE_SIZE
-
-    fx, fy = core.build_composite_reverse_map(K, D, Knew, H, H0, sign, size)
-    if size != TABLE_SHAPE:
-        fx, fy = core.resample_map_pair(fx, fy, TABLE_SHAPE)
-    ax, ay = load_pair(root / 'lookup_table' / 'undistort_ipm' / 'reverse')
-
-    if ax.shape != fx.shape:
-        return report('落盘表 == 流水线重算', False,
-                      f'网格不符: 落盘 {ax.shape[1]}x{ax.shape[0]}，重算 {fx.shape[1]}x{fx.shape[0]}')
-
-    # NaN 既不满 >=0 也不满 <0，所以"无效"必须显式写成 ~isfinite | <0，
-    # 只用 <0 判断会把重算侧的无效点漏掉一大半。
-    bad_ex = ~np.isfinite(fx) | (fx < 0.0)
-    bad_ey = ~np.isfinite(fy) | (fy < 0.0)
-    bad_ax = ax < 0.0
-    bad_ay = ay < 0.0
-
-    mismatch = int(np.count_nonzero((bad_ex | bad_ey) != (bad_ax | bad_ay)))
-    good = ~(bad_ex | bad_ey)
-    err = np.hypot(ax[good] - fx[good], ay[good] - fy[good])
-    max_err = float(err.max()) if err.size else 0.0
-    tol = quant_tolerance()
-
-    ok = mismatch == 0 and max_err <= tol
-    return report('落盘表 == 流水线重算', ok,
-                  f'最大差 {max_err:.4f} px（容差 {tol:.4f}），'
-                  f'有效点 {int(good.sum())}，无效判定不一致 {mismatch} 个')
+    expect = pipeline_composite_maps(calib, matrices)
+    results = [compare_to_pipeline(root, d, expect[d]) for d in ('reverse', 'forward')]
+    return all(results)
 
 
 def quant_tolerance() -> float:
@@ -402,7 +506,25 @@ def check_composite_tables(root: Path, calib: dict, matrices: dict) -> bool:
 
 
 def check_forward_reverse(root: Path) -> bool:
-    """检查 4: 逆透视的 forward 与 reverse 互为逆映射。"""
+    """检查 4: 逆透视的 forward 与 reverse 是否互为逆映射。
+
+    做法：reverse 给出连续的原图坐标 -> 换算成 forward 表的连续网格坐标 ->
+    **双线性**采样 forward -> 应当回到出发的那个输出像素。
+
+    以前这里是 `rint(reverse / step)` 再整数索引 forward，那验的其实是
+    "reverse -> 最近邻源网格 -> forward"。逆透视的 forward 局部放大率中位数
+    实测 24 倍，0.2 个源像素的取整残差会被放大成约 5 个输出像素；实测误差与
+    "取整残差 x 局部雅可比"的相关系数 0.9917，在放大 <1.5 的区域往返误差
+    p99 只有 0.547 px —— 表是互逆的，是判据自己引入了误差。改成双线性后
+    同一对表的中位误差从 4.57 px 降到 0.14 px。
+
+    判定分两档：
+      全分辨率表  -> hard gate（分位判据，见 ROUNDTRIP_* 的注释）
+      降采样表    -> 只报告。两张表分别经过栅格化、INTER_AREA 重采样与定点
+                     量化，这三步都不可逆，"严格互逆"不是必须成立的数学不变量，
+                     硬卡阈值只会得到一个随网格与 scale 漂移的假失败。这一档的
+                     正确性由检查 6（落盘 == 流水线重算，正反两张都比）保证。
+    """
     rev_x, rev_y = load_pair(root / 'lookup_table' / 'undistort_ipm' / 'reverse')
     fwd_x, fwd_y = load_pair(root / 'lookup_table' / 'undistort_ipm' / 'forward')
     th, tw = rev_x.shape
@@ -410,36 +532,37 @@ def check_forward_reverse(root: Path) -> bool:
         return report('forward/reverse 互逆', False,
                       f'尺寸不一致: reverse {rev_x.shape} vs forward {fwd_x.shape}')
 
-    # 降采样后两个表的"索引步长"都变成 step 个原图像素，往返路径必须按这个比例换算：
-    # 输出网格点 (x,y) 对应输出像素 (x*step, y*step)，reverse 给出的却是原图坐标，
-    # 要除以 step 才能拿去索引 forward。漏掉这一步会算出几百像素的假误差。
     step_x = IMAGE_SIZE[0] / tw
     step_y = IMAGE_SIZE[1] / th
 
     ys, xs = np.mgrid[0:th, 0:tw]
-    ys, xs = ys.ravel(), xs.ravel()
-    valid = (rev_x[ys, xs] >= 0) & (rev_y[ys, xs] >= 0)
-    ys, xs = ys[valid], xs[valid]
-    if ys.size == 0:
+    seed = (rev_x >= 0) & (rev_y >= 0)
+    if not seed.any():
         return report('forward/reverse 互逆', False, '反向表没有有效点')
 
-    sx = np.rint(rev_x[ys, xs] / step_x).astype(np.int64).clip(0, tw - 1)
-    sy = np.rint(rev_y[ys, xs] / step_y).astype(np.int64).clip(0, th - 1)
-    back_x, back_y = fwd_x[sy, sx], fwd_y[sy, sx]
+    # 出发点：网格索引代表的那个全分辨率输出像素
+    out_x = full_from_grid(xs[seed].astype(np.float64), step_x)
+    out_y = full_from_grid(ys[seed].astype(np.float64), step_y)
+    # reverse 的取值是全分辨率原图坐标，要先换成 forward 表的网格坐标
+    gx = grid_from_full(rev_x[seed], step_x)
+    gy = grid_from_full(rev_y[seed], step_y)
 
-    hit = (back_x >= 0) & (back_y >= 0)
-    if not hit.any():
+    back_x, back_y, usable = bilinear_at(fwd_x, fwd_y, gx, gy)
+    if not usable.any():
         return report('forward/reverse 互逆', False, 'forward 在这些源点上全是无效值')
-    err = np.hypot(back_x[hit] - xs[hit] * step_x, back_y[hit] - ys[hit] * step_y)
 
-    # 容差随步长放大：forward 只能落在最近的源图网格上，索引取整误差会被
-    # 局部放大率（每个源像素对应多少输出像素）放大。
-    tol = TOL_INV_PX * max(step_x, step_y) + 1.0
-    med = float(np.median(err))
+    err = np.hypot(back_x[usable] - out_x[usable], back_y[usable] - out_y[usable])
+    p50 = float(np.median(err))
     p95 = float(np.percentile(err, 95))
-    return report('forward/reverse 互逆', med <= tol and p95 <= tol * 3,
-                  f'往返误差中位数 {med:.2f} px，95 分位 {p95:.2f} px，'
-                  f'容差 {tol:.1f} px，命中率 {100 * hit.mean():.1f}%')
+    mx = float(err.max())
+    detail = (f'往返误差 p50={p50:.3f} p95={p95:.3f} max={mx:.3f} px，'
+              f'可判定覆盖率 {100 * usable.mean():.1f}%'
+              f'（四邻域全有效才算），网格 {tw}x{th}')
+
+    if not full_resolution():
+        return diagnose('forward/reverse 互逆（降采样，仅诊断）', detail)
+    return report('forward/reverse 互逆', p50 <= ROUNDTRIP_P50_PX and p95 <= ROUNDTRIP_P95_PX,
+                  detail + f'；判据 p50<={ROUNDTRIP_P50_PX} p95<={ROUNDTRIP_P95_PX}')
 
 
 def check_sentinel(root: Path) -> bool:
@@ -479,7 +602,7 @@ def print_table_inventory(root: Path) -> None:
 
 def main() -> int:
     """入口。"""
-    global FIXED_POINT, TABLE_SHAPE, IMAGE_SIZE, SKIPPED, IS_TEXT_TABLE
+    global FIXED_POINT, TABLE_SHAPE, IMAGE_SIZE, SKIPPED, IS_TEXT_TABLE, DIAGNOSED
 
     root = (Path(sys.argv[1]).resolve() if len(sys.argv) > 1
             else Path(__file__).resolve().parent.parent)
@@ -508,6 +631,7 @@ def main() -> int:
     KNEW = (np.asarray(matrices['Knew'], dtype=np.float64).reshape(3, 3)
             if matrices.get('Knew') is not None else None)
     SKIPPED = 0
+    DIAGNOSED = 0
 
     print(f'校验 {root}')
     print(f'表格式 {fmt}' + (f'（Q{FIXED_POINT} 定点）' if fmt != 'txt' else '')
@@ -527,8 +651,13 @@ def main() -> int:
         check_export_fidelity(root, calib, matrices),
     ]
 
-    tail = f'（其中 {SKIPPED} 项因降采样跳过）' if SKIPPED else ''
-    print(f'\n{sum(results)}/{len(results)} 项通过{tail}。')
+    tail = []
+    if SKIPPED:
+        tail.append(f'{SKIPPED} 项因降采样跳过')
+    if DIAGNOSED:
+        tail.append(f'{DIAGNOSED} 项只作诊断不判定')
+    suffix = f'（其中 {"，".join(tail)}）' if tail else ''
+    print(f'\n{sum(results)}/{len(results)} 项通过{suffix}。')
     return 0 if all(results) else 1
 
 
