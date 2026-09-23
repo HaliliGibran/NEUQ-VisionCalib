@@ -49,11 +49,10 @@ def webview2_version() -> str | None:
     hives = {'HKEY_LOCAL_MACHINE': winreg.HKEY_LOCAL_MACHINE,
              'HKEY_CURRENT_USER': winreg.HKEY_CURRENT_USER}
     for path, hive_name in WV2_KEYS:
-        with suppress(OSError):
-            with winreg.OpenKey(hives[hive_name], path) as key:
-                version, _ = winreg.QueryValueEx(key, 'pv')
-                if version:
-                    return str(version)
+        with suppress(OSError), winreg.OpenKey(hives[hive_name], path) as key:
+            version, _ = winreg.QueryValueEx(key, 'pv')
+            if version:
+                return str(version)
     return None
 
 

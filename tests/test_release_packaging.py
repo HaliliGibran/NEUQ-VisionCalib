@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import shutil
 import sys
@@ -21,7 +22,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 
-import build_release as br  # noqa: E402 必须先把 tools/ 挂上 sys.path
+# 必须先把 tools/ 挂上 sys.path，才能导入 build_release。
+br = importlib.import_module('build_release')
 
 FAILED: list[str] = []
 
@@ -167,7 +169,7 @@ def test_wait_for_url(base: Path) -> None:
     class Handler(BaseHTTPRequestHandler):
         """冒充我们的后端：/api/status 返回带 root/dirs 的 JSON。"""
 
-        def do_GET(self) -> None:  # noqa: N802 - 框架要求的名字
+        def do_GET(self) -> None:  # BaseHTTPRequestHandler 要求此方法名
             body = json.dumps({'root': 'x', 'dirs': []}).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
