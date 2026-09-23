@@ -31,6 +31,7 @@ const HANDLE_HIT_PX = 14;
 // 不跟随鼠标——微调点位时视线不必在光标与放大镜之间来回跳。
 const LOUPE_SCALE = 5;
 const LOUPE_SIZE = 160;   // 放大窗边长，与 style.css 里 #c-loupe 的尺寸一致
+let activeCalibrationDiagnostics = null;
 
 /** 把一行直线 a1->a2 和 b1->b2 求交点；接近平行时返回 null。 */
 function intersectLines(a1, a2, b1, b2) {
@@ -116,6 +117,152 @@ function renderCalibrationSummary(fit) {
     + ' 推荐阈值仅是首轮数据的辅助建议，不是标定质量合格标准。';
 }
 
+/** 展示质量诊断摘要、补拍行动项和逐照片技术数据。 */
+function renderCalibrationDiagnostics(diagnostics) {
+  const section = $('calib-diagnostics');
+  const count = $('calib-diagnostic-count');
+  const metrics = $('calib-diagnostic-metrics');
+  const priority = $('calib-diagnostic-priority');
+  const recommendations = $('calib-diagnostic-recommendations');
+  const heatmapPanel = $('calib-heatmap-panel');
+  const detailPanel = $('calib-diagnostic-detail-panel');
+  const heatmapButton = $('btn-coverage-heatmap');
+  const detailButton = $('btn-diagnostic-details');
+
+  activeCalibrationDiagnostics = diagnostics || null;
+  if (!diagnostics) {
+    section.hidden = true;
+    heatmapPanel.hidden = true;
+    detailPanel.hidden = true;
+    heatmapButton.setAttribute('aria-expanded', 'false');
+    detailButton.setAttribute('aria-expanded', 'false');
+    return;
+  }
+
+  section.hidden = false;
+  count.textContent = `本次诊断使用 ${diagnostics.view_count || 0} 张最终参与标定的照片。`;
+  heatmapPanel.hidden = true;
+  detailPanel.hidden = true;
+  heatmapButton.textContent = '查看覆盖热力图';
+  detailButton.textContent = '查看详细诊断';
+  heatmapButton.setAttribute('aria-expanded', 'false');
+  detailButton.setAttribute('aria-expanded', 'false');
+
+  metrics.replaceChildren();
+  (diagnostics.metrics || []).forEach((item) => {
+    const card = document.createElement('div');
+    card.className = `diagnostic-metric level-${item.level || 'unknown'}`;
+    const name = document.createElement('span');
+    name.className = 'diag-name';
+    name.textContent = item.label;
+    const value = document.createElement('span');
+    value.className = 'diag-value';
+    value.textContent = item.value;
+    card.append(name, value);
+    metrics.appendChild(card);
+  });
+
+  if (!diagnostics.priority) {
+    priority.textContent = '当前没有可用的优先建议。';
+  } else if (diagnostics.priority.topic === '采集分布') {
+    priority.textContent = `未发现突出的采集薄弱项。${diagnostics.priority.text}`;
+  } else {
+    priority.textContent = `当前最需要改善：${diagnostics.priority.topic}。${diagnostics.priority.text}`;
+  }
+  recommendations.replaceChildren();
+  (diagnostics.recommendations || []).forEach((text) => {
+    const item = document.createElement('li');
+    item.textContent = text;
+    recommendations.appendChild(item);
+  });
+
+  $('calib-diagnostic-heuristics-note').textContent = diagnostics.heuristics_note || '';
+  const stdBox = $('calib-diagnostic-std');
+  stdBox.replaceChildren();
+  if (diagnostics.std_intrinsics && diagnostics.std_intrinsics.length) {
+    diagnostics.std_intrinsics.forEach((item) => {
+      const line = document.createElement('div');
+      const value = Number.isFinite(item.value_px) ? item.value_px.toFixed(2) : '—';
+      const sigma = Number.isFinite(item.sigma_px) ? item.sigma_px.toFixed(2) : '—';
+      line.textContent = `${item.name} = ${value} ± ${sigma} px`;
+      stdBox.appendChild(line);
+    });
+    const note = document.createElement('div');
+    note.className = 'hint';
+    note.textContent = diagnostics.std_intrinsics_note || '';
+    stdBox.appendChild(note);
+  } else {
+    stdBox.textContent = '当前 OpenCV 未提供可用的内参标准差。';
+  }
+
+  const tableBody = $('calib-diagnostic-views');
+  tableBody.replaceChildren();
+  (diagnostics.views || []).forEach((view) => {
+    const row = document.createElement('tr');
+    const cells = [
+      view.name,
+      `${(view.center_x * 100).toFixed(1)}%, ${(view.center_y * 100).toFixed(1)}%`,
+      `${(view.area_fraction * 100).toFixed(2)}%`,
+      `${Number.isFinite(view.tilt_x_deg) ? view.tilt_x_deg.toFixed(1) : '—'}, `
+        + `${Number.isFinite(view.tilt_y_deg) ? view.tilt_y_deg.toFixed(1) : '—'}°`,
+      Number.isFinite(view.distance_cm) ? `${view.distance_cm.toFixed(1)} cm` : '—',
+      Number.isFinite(view.rms_px) ? `${view.rms_px.toFixed(3)} px` : '—',
+    ];
+    cells.forEach((text) => {
+      const cell = document.createElement('td');
+      cell.textContent = text;
+      row.appendChild(cell);
+    });
+    tableBody.appendChild(row);
+  });
+}
+
+/** 绘制逐照片贡献次数热力图：空白、偶尔出现和反复观测使用不同色阶。 */
+function drawCalibrationHeatmap(diagnostics) {
+  if (!diagnostics || !diagnostics.heatmap) return;
+  const canvas = $('calib-coverage-canvas');
+  const cssW = canvas.clientWidth || 520;
+  const cssH = 220;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = cssW * dpr;
+  canvas.height = cssH * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const { cols, rows, counts } = diagnostics.heatmap;
+  const padL = 36, padR = 8, padT = 24, padB = 24;
+  const gridW = cssW - padL - padR;
+  const gridH = cssH - padT - padB;
+  const cellW = gridW / cols;
+  const cellH = gridH / rows;
+  const colors = ['#f4f1ea', '#dbeafe', '#93c5fd', '#2563eb'];
+
+  ctx.font = '10px -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif';
+  ctx.fillStyle = '#6b6a66';
+  ctx.textAlign = 'center';
+  ctx.fillText('画面上方', padL + gridW / 2, 13);
+  ctx.fillText('画面左侧', padL + 22, cssH - 5);
+  ctx.fillText('画面右侧', cssW - padR - 22, cssH - 5);
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const count = counts[row][col];
+      const colorIndex = count === 0 ? 0 : (count === 1 ? 1 : (count === 2 ? 2 : 3));
+      const x = padL + col * cellW;
+      const y = padT + row * cellH;
+      ctx.fillStyle = colors[colorIndex];
+      ctx.fillRect(x + 1, y + 1, cellW - 2, cellH - 2);
+      ctx.strokeStyle = 'rgba(31,31,30,.18)';
+      ctx.strokeRect(x + 1, y + 1, cellW - 2, cellH - 2);
+      ctx.fillStyle = count >= 3 ? '#fff' : '#45443f';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(count), x + cellW / 2, y + cellH / 2);
+    }
+  }
+  ctx.textBaseline = 'alphabetic';
+}
+
 /** 渲染首轮重投影误差柱状图，并按当前阈值预览超限张数。 */
 function drawErrorChart(fit, threshold) {
   const cv = $('c-reproj');
@@ -142,6 +289,7 @@ function drawErrorChart(fit, threshold) {
       cnt0.className = 'hint mono';
     }
     renderCalibrationSummary(null);
+    renderCalibrationDiagnostics(null);
     return;
   }
 
@@ -1074,6 +1222,25 @@ function bindControls() {
     $('in-reproj').value = String(value);
     drawErrorChart(state.fit, currentThreshold());
   };
+  $('btn-coverage-heatmap').onclick = () => {
+    const panel = $('calib-heatmap-panel');
+    panel.hidden = !panel.hidden;
+    const expanded = !panel.hidden;
+    $('btn-coverage-heatmap').setAttribute('aria-expanded', String(expanded));
+    $('btn-coverage-heatmap').textContent = expanded ? '隐藏覆盖热力图' : '查看覆盖热力图';
+    if (expanded) drawCalibrationHeatmap(activeCalibrationDiagnostics);
+  };
+  $('btn-diagnostic-details').onclick = () => {
+    const panel = $('calib-diagnostic-detail-panel');
+    panel.hidden = !panel.hidden;
+    const expanded = !panel.hidden;
+    $('btn-diagnostic-details').setAttribute('aria-expanded', String(expanded));
+    $('btn-diagnostic-details').textContent = expanded ? '隐藏详细诊断' : '查看详细诊断';
+  };
+  window.addEventListener('resize', () => {
+    const panel = $('calib-heatmap-panel');
+    if (!panel.hidden) drawCalibrationHeatmap(activeCalibrationDiagnostics);
+  });
 
   ['in-ax', 'in-ay', 'in-hd'].forEach((id) => {
     $(id).addEventListener('input', () => {
@@ -1440,6 +1607,7 @@ async function runCalibration({ force = false, threshold } = {}) {
   log(data.log);
   if (data.fit) {
     state.fit = data.fit;
+    renderCalibrationDiagnostics(data.fit.diagnostics);
     drawErrorChart(data.fit, currentThreshold());
   } else {
     state.fit = null;

@@ -69,6 +69,7 @@ from neuq_core.calibration import (  # noqa: F401
     _calibrate_once,
     detect_chessboard,
     detect_chessboard_partial,
+    diagnose_calibration_views,
     recommend_reprojection_threshold,
     report_reprojection_error,
 )
@@ -634,6 +635,9 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
     first_names, first_errors = first_pass if first_pass else ([], np.array([]))
     recommendation = recommend_reprojection_threshold(first_errors)
     mean_err = report_reprojection_error(obj_points, img_points, rvecs, tvecs, K, D)
+    diagnostics = diagnose_calibration_views(
+        img_points, obj_points, rvecs, tvecs, K, std_int, img_size,
+        [path.name for path in used], per_view)
     fit_result = {
         'rms': float(rms),
         'mean_reprojection_error': float(mean_err),
@@ -647,6 +651,7 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
         'recommended_outlier_count': recommendation['outlier_count'],
         'recommendation_sample_count': recommendation['sample_count'],
         'recommendation_status': recommendation['status'],
+        'diagnostics': diagnostics,
         'opencv_version': str(cv2.__version__),
         # 第一轮尚未剔除任何视图时的误差，供阈值预览与推荐值使用。
         'all_names': list(first_names),

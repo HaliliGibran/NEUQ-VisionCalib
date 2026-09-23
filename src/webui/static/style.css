@@ -133,6 +133,48 @@ main {
 .reproj-recommendation .hint { margin: 0; }
 .reproj-recommendation button { flex: 0 0 auto; }
 #calib-final-result { line-height: 1.45; }
+.calib-diagnostics {
+  border-top: 1px solid var(--border); margin: 10px 0; padding-top: 8px;
+}
+.calib-diagnostics h4 { margin: 0 0 7px; font-size: 12px; font-weight: 600; }
+.diagnostic-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+.diagnostic-metric {
+  min-width: 0; padding: 4px 6px; border-radius: 6px;
+  background: var(--panel-2); display: flex; justify-content: space-between; gap: 5px;
+  font-size: 11px;
+}
+.diagnostic-metric .diag-name { color: var(--muted); }
+.diagnostic-metric .diag-value { font-weight: 600; white-space: nowrap; }
+.diagnostic-metric.level-good .diag-value { color: var(--ok); }
+.diagnostic-metric.level-fair .diag-value { color: var(--warn); }
+.diagnostic-metric.level-weak .diag-value { color: var(--danger); }
+.diagnostic-metric.level-unknown .diag-value { color: var(--muted); }
+.diagnostic-priority {
+  margin: 8px 0 5px; padding: 6px 8px; border-radius: 6px;
+  background: var(--warn-bg); color: var(--warn); font-size: 11px;
+}
+.diagnostic-advice { font-size: 11px; }
+.diagnostic-advice ul { margin: 3px 0 7px; padding-left: 20px; }
+.diagnostic-advice li { margin: 2px 0; }
+.diagnostic-caveat { margin-bottom: 6px; }
+.diagnostic-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.diagnostic-detail-panel {
+  margin: 6px 0; padding: 7px; border-radius: 7px; background: var(--panel-2);
+}
+#calib-coverage-canvas { display: block; width: 100%; height: 220px; }
+.heatmap-legend { display: flex; flex-wrap: wrap; gap: 8px; font-size: 10px; color: var(--muted); }
+.heatmap-legend span { display: inline-flex; align-items: center; gap: 3px; }
+.heatmap-swatch { width: 10px; height: 10px; display: inline-block; border-radius: 2px; }
+.heatmap-swatch.none { background: #f4f1ea; border: 1px solid var(--border-2); }
+.heatmap-swatch.once { background: #dbeafe; }
+.heatmap-swatch.twice { background: #93c5fd; }
+.heatmap-swatch.many { background: #2563eb; }
+.diagnostic-std { margin: 4px 0 8px; font-family: var(--mono); font-size: 10px; }
+.diagnostic-std div { padding: 1px 0; }
+.diagnostic-table-wrap { overflow-x: auto; }
+.diagnostic-table { width: 100%; border-collapse: collapse; font-size: 10px; white-space: nowrap; }
+.diagnostic-table th, .diagnostic-table td { padding: 3px 5px; border-bottom: 1px solid var(--border); text-align: right; }
+.diagnostic-table th:first-child, .diagnostic-table td:first-child { text-align: left; }
 
 /* 导入卡片里的文件夹选择 */
 .file-row { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; }

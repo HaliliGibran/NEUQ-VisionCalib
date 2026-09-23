@@ -100,6 +100,43 @@
         <button id="btn-use-recommended" class="ghost sm" type="button" disabled>使用推荐值</button>
       </div>
       <div id="calib-final-result" class="hint"></div>
+      <section id="calib-diagnostics" class="calib-diagnostics" hidden>
+        <h4>标定数据诊断</h4>
+        <p id="calib-diagnostic-count" class="hint"></p>
+        <div id="calib-diagnostic-metrics" class="diagnostic-metrics"></div>
+        <div id="calib-diagnostic-priority" class="diagnostic-priority"></div>
+        <div class="diagnostic-advice">
+          <strong>补拍建议与检查说明</strong>
+          <ul id="calib-diagnostic-recommendations"></ul>
+        </div>
+        <p class="hint diagnostic-caveat">这些是采集质量提示规则，不是标定合格标准；位置重复的照片不会被自动删除。</p>
+        <div class="diagnostic-actions">
+          <button id="btn-coverage-heatmap" class="ghost sm" type="button" aria-expanded="false">查看覆盖热力图</button>
+          <button id="btn-diagnostic-details" class="ghost sm" type="button" aria-expanded="false">查看详细诊断</button>
+        </div>
+        <div id="calib-heatmap-panel" class="diagnostic-detail-panel" hidden>
+          <canvas id="calib-coverage-canvas" width="560" height="252"></canvas>
+          <div class="heatmap-legend">
+            <span><i class="heatmap-swatch none"></i>未覆盖</span>
+            <span><i class="heatmap-swatch once"></i>1 张</span>
+            <span><i class="heatmap-swatch twice"></i>2 张</span>
+            <span><i class="heatmap-swatch many"></i>3 张及以上</span>
+          </div>
+          <p class="hint">每格统计至少有一个角点落入该格的照片数；同一张照片在同一格最多计一次。</p>
+        </div>
+        <div id="calib-diagnostic-detail-panel" class="diagnostic-detail-panel" hidden>
+          <p id="calib-diagnostic-heuristics-note" class="hint"></p>
+          <div id="calib-diagnostic-std" class="diagnostic-std"></div>
+          <div class="diagnostic-table-wrap">
+            <table class="diagnostic-table">
+              <thead>
+                <tr><th>照片</th><th>中心 (x, y)</th><th>投影面积</th><th>倾斜量 (x, y)</th><th>中心距离</th><th>RMS</th></tr>
+              </thead>
+              <tbody id="calib-diagnostic-views"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
       <label>剔除重投影误差超过（px，留空不剔除）
         <input id="in-reproj" type="number" step="any" min="0" placeholder="留空则不筛选">
       </label>
