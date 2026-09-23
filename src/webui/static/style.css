@@ -54,11 +54,11 @@ header {
   border-bottom: 1px solid var(--border); flex: 0 0 auto;
 }
 
-.brand { display: flex; align-items: center; gap: 8px; }
-.brand .dot {
-  width: 9px; height: 9px; border-radius: 50%;
-  background: var(--accent); flex: 0 0 auto;
-}
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.brand-logo { width: 32px; height: 32px; flex: 0 0 auto; object-fit: contain; }
+.brand-copy { display: flex; flex-direction: column; min-width: 0; line-height: 1.2; }
+.brand-copy h1 { font-size: 14px; font-weight: 600; }
+.brand-copy span { color: var(--muted); font-size: 11px; }
 .head-right { display: flex; align-items: center; gap: 8px; }
 
 .chip {
@@ -448,4 +448,9 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   .canvas-wrap { min-height: 420px; }
   .canvas-wrap.small { height: 220px; }
   .logbar { height: 150px; }
+}
+
+@media (max-width: 680px) {
+  header { flex-wrap: wrap; padding: 8px 12px; }
+  .head-right { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
 }

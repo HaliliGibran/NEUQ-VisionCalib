@@ -1451,7 +1451,7 @@ class Handler(BaseHTTPRequestHandler):
         if not path.is_relative_to(STATIC_DIR) or not path.is_file():
             return self.send_json({'error': '静态资源不存在'}, 404)
         ctypes = {'.html': 'text/html; charset=utf-8', '.js': 'application/javascript; charset=utf-8',
-                  '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml'}
+                  '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png'}
         self.send_bytes(path.read_bytes(), ctypes.get(path.suffix, 'application/octet-stream'))
 
     def serve_image(self, query: dict) -> None:
