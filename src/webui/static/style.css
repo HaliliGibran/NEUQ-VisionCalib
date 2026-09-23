@@ -126,6 +126,13 @@ main {
   padding: 6px;
 }
 .chart-wrap canvas { display: block; width: 100%; height: 140px; }
+.reproj-recommendation {
+  display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 8px; margin-bottom: 8px;
+}
+.reproj-recommendation .hint { margin: 0; }
+.reproj-recommendation button { flex: 0 0 auto; }
+#calib-final-result { line-height: 1.45; }
 
 /* 导入卡片里的文件夹选择 */
 .file-row { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; }

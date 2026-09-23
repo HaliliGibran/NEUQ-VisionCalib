@@ -69,6 +69,7 @@ from neuq_core.calibration import (  # noqa: F401
     _calibrate_once,
     detect_chessboard,
     detect_chessboard_partial,
+    recommend_reprojection_threshold,
     report_reprojection_error,
 )
 from neuq_core.config import (  # noqa: F401
@@ -483,9 +484,10 @@ def fit_camera(obj_points, img_points, used, img_size):
     """标定，并在 MAX_REPROJ_ERR 给定时迭代剔除高误差视图。
 
     棋盘照片是手持拍的，个别帧的运动模糊会把整体误差抬高。剔除必须逐轮做：
-    每轮用当前参数算各视图 RMS，丢掉超限的再**完整重标定**。K、D 与每张图的
-    rvec/tvec 是联合优化出来的；删掉观测后仍沿用旧参数，得到的就不是剩余数据的
-    最小二乘解。一次性剔除又会误杀那些仅因初始参数还不准才显得误差大的好帧。
+    每轮完整标定后，只移除当前 RMS 最大且超过阈值的一张，再对剩余视图**完整重标定**。
+    K、D 与每张图的 rvec/tvec 是联合优化出来的；删掉观测后仍沿用旧参数，得到的就
+    不是剩余数据的最小二乘解。逐张重新判断可避免初始参数偏差时一次误删多张好帧。
+    至少保留 3 张视图；如果 3 张时仍有超限视图，就停止并明确报告，而不声称阈值已满足。
 
     先别急着只看 RMS：角点若都集中在画面中央，即使 RMS 很小，边缘畸变仍可能缺少
     约束。这里负责稳健地拟合与记录误差，不替代对角点覆盖范围和去畸变预览的检查。
@@ -497,9 +499,13 @@ def fit_camera(obj_points, img_points, used, img_size):
     前端要做一个"改阈值就能预览会删多少张"的联动，只有 dropped 不够用：被剔的照片
     在最终一轮里根本不存在，拿不到误差。所以额外把第一轮的全体误差带出去，
     任意阈值下都能精确数出超限张数。
+
+    返回值末尾再追加一个量：
+      stop_reason — 达到 3 张下限仍有视图超限时的说明，否则为 None。
     """
     dropped: List[Tuple[str, float]] = []
     first_pass: Optional[Tuple[List[str], np.ndarray]] = None
+    stop_reason = None
     while True:
         rms, K, D, rvecs, tvecs, std_int, per_view = _calibrate_once(
             obj_points, img_points, img_size)
@@ -507,21 +513,27 @@ def fit_camera(obj_points, img_points, used, img_size):
             first_pass = ([p.name for p in used], np.asarray(per_view, dtype=np.float64))
         if MAX_REPROJ_ERR is None or per_view.size == 0:
             break
-        keep = [i for i, e in enumerate(per_view) if e <= MAX_REPROJ_ERR]
-        if len(keep) < 3 or len(keep) == len(obj_points):
+        over_limit = [i for i, e in enumerate(per_view) if e > MAX_REPROJ_ERR]
+        if not over_limit:
             break
-        drop_set = set(range(len(obj_points))) - set(keep)
-        names = [used[i].name for i in sorted(drop_set)]
-        # 记录这一轮被剔的照片及其误差，供前端画图用
-        for i in sorted(drop_set):
-            dropped.append((used[i].name, float(per_view[i])))
-        print(f'  剔除 {len(names)} 张误差超过 {MAX_REPROJ_ERR:.2f} px 的视图后重新标定: '
-              + ', '.join(names[:6]) + (' ...' if len(names) > 6 else ''))
+        if len(obj_points) <= 3:
+            stop_reason = (f'已达到至少 3 张视图的标定下限，仍有 {len(over_limit)} 张最终 RMS '
+                           f'超过阈值 {MAX_REPROJ_ERR:.2f} px；未继续剔除。')
+            print(f'  {stop_reason}')
+            break
+
+        drop_index = max(over_limit, key=lambda i: per_view[i])
+        drop_name = used[drop_index].name
+        drop_error = float(per_view[drop_index])
+        dropped.append((drop_name, drop_error))
+        keep = [i for i in range(len(obj_points)) if i != drop_index]
+        print(f'  剔除当前 RMS 最大的视图 {drop_name}（{drop_error:.4f} px，'
+              f'超过阈值 {MAX_REPROJ_ERR:.2f} px）后重新标定。')
         obj_points = [obj_points[i] for i in keep]
         img_points = [img_points[i] for i in keep]
         used = [used[i] for i in keep]
     return (rms, K, D, rvecs, tvecs, per_view, std_int,
-            obj_points, img_points, used, dropped, first_pass)
+            obj_points, img_points, used, dropped, first_pass, stop_reason)
 
 
 def calibrate_camera(board: Optional[CheckerboardSpec] = None
@@ -616,10 +628,11 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
         raise SystemExit(f'成功检出棋盘的图片只有 {len(obj_points)} 张，不足以标定。')
 
     (rms, K, D, rvecs, tvecs, per_view, std_int,
-     obj_points, img_points, used, dropped, first_pass) = fit_camera(
+     obj_points, img_points, used, dropped, first_pass, stop_reason) = fit_camera(
         obj_points, img_points, used, img_size)
 
     first_names, first_errors = first_pass if first_pass else ([], np.array([]))
+    recommendation = recommend_reprojection_threshold(first_errors)
     mean_err = report_reprojection_error(obj_points, img_points, rvecs, tvecs, K, D)
     fit_result = {
         'rms': float(rms),
@@ -629,8 +642,13 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
         'used_names': [p.name for p in used],
         'dropped': [{'name': n, 'error': float(e)} for n, e in dropped],
         'threshold': float(MAX_REPROJ_ERR) if MAX_REPROJ_ERR is not None else None,
+        'threshold_stop_reason': stop_reason,
+        'recommended_threshold': recommendation['threshold'],
+        'recommended_outlier_count': recommendation['outlier_count'],
+        'recommendation_sample_count': recommendation['sample_count'],
+        'recommendation_status': recommendation['status'],
         'opencv_version': str(cv2.__version__),
-        # 剔除前的全体视图误差，供前端做"改阈值即时预览会删多少张"
+        # 第一轮尚未剔除任何视图时的误差，供阈值预览与推荐值使用。
         'all_names': list(first_names),
         'all_errors': np.asarray(first_errors, dtype=np.float64).tolist(),
     }
@@ -2045,7 +2063,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             '示例:\n'
             '  python neuq_vision_calib.py --list\n'
             '  python neuq_vision_calib.py --import-dir WIN_20260903_17_22_10_Pro\n'
-            '  python neuq_vision_calib.py --stage calib --max-reproj-err 1.5\n'
+            '  python neuq_vision_calib.py --stage calib --max-reproj-err <首轮误差筛选阈值>\n'
             '  python neuq_vision_calib.py --ipm-source ipm_input/floor.jpg --phys-w 60 --phys-h 40\n'
             '  python neuq_vision_calib.py --quad 300,300,980,300,120,700,1160,700 --headless\n'
             '  python neuq_vision_calib.py --stage tables   # 复用上次交互标定的结果\n'
@@ -2085,7 +2103,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     cal_g.add_argument('--undist-alpha', type=float,
                        help='去畸变输出视角 0~1；不给等价 MATLAB 的 OutputView=same（Knew=K）')
     cal_g.add_argument('--max-reproj-err', type=float, metavar='PX',
-                       help='迭代剔除重投影误差超过该值的视图，例如 1.5')
+                       help='逐轮移除当前 RMS 最大且超过该值的视图，并重新标定（至少保留 3 张）')
     cal_g.add_argument('--capture-size', nargs=2, type=int, metavar=('W', 'H'),
                        help='在线拍摄分辨率；不给则用摄像头原生分辨率')
 

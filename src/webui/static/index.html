@@ -95,8 +95,13 @@
       <div class="chart-wrap">
         <canvas id="c-reproj" width="560" height="180"></canvas>
       </div>
+      <div class="reproj-recommendation">
+        <span id="calib-recommendation" class="hint">尚无首轮误差数据。</span>
+        <button id="btn-use-recommended" class="ghost sm" type="button" disabled>使用推荐值</button>
+      </div>
+      <div id="calib-final-result" class="hint"></div>
       <label>剔除重投影误差超过（px，留空不剔除）
-        <input id="in-reproj" type="number" step="0.1" min="0" placeholder="例如 1.5">
+        <input id="in-reproj" type="number" step="any" min="0" placeholder="留空则不筛选">
       </label>
       <label class="row"><input id="in-force" type="checkbox"> 强制重新标定</label>
       <button id="btn-calib" class="primary">运行标定</button>

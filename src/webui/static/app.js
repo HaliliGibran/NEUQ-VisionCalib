@@ -66,12 +66,51 @@ function linesFromQuad(quad) {
   ];
 }
 
-/** 渲染重投影误差柱状图，并按给定阈值实时标注哪些会被剔除。
+/** 把首轮误差推荐值格式化到两位小数；区间太窄时保留更多位数。 */
+function formatRecommendedThreshold(value) {
+  const two = Number(value).toFixed(2);
+  if (Math.abs(Number(two) - value) < 1e-9) return two;
+  return Number(value).toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+}
 
-    fit.all_names / fit.all_errors 是**剔除之前全体视图**的误差，所以换任何阈值都能
-    立刻数出会删多少张，不必等重新标定跑完。老版本 fit 数据没有这两个字段时，
-    退回用 per_view + dropped 拼一份（此时只能反映"上一次实际发生的结果"）。
- */
+/** 展示首轮建议与最近一次完整标定的实际结果。 */
+function renderCalibrationSummary(fit) {
+  const recommendation = $('calib-recommendation');
+  const useButton = $('btn-use-recommended');
+  const result = $('calib-final-result');
+  if (!fit) {
+    recommendation.textContent = '尚无首轮误差数据。';
+    useButton.disabled = true;
+    result.textContent = '';
+    return;
+  }
+
+  const threshold = fit.recommended_threshold;
+  const status = fit.recommendation_status;
+  const total = (fit.all_names && fit.all_names.length)
+    || ((fit.used_names || []).length + (fit.dropped || []).length);
+  if (status === 'recommended' && Number.isFinite(threshold)) {
+    const outliers = fit.recommended_outlier_count || 0;
+    const samples = fit.recommendation_sample_count || total;
+    recommendation.textContent = `推荐阈值：${formatRecommendedThreshold(threshold)} px · 首轮异常 ${outliers} / ${samples} 张`;
+    useButton.disabled = false;
+  } else if (status === 'too_few_samples') {
+    recommendation.textContent = '首轮有效视图不足 5 张，暂不推荐筛选阈值。';
+    useButton.disabled = true;
+  } else {
+    recommendation.textContent = '本批数据未发现明显高误差离群帧';
+    useButton.disabled = true;
+  }
+
+  const used = (fit.used_names || []).length;
+  const dropped = (fit.dropped || []).length;
+  const rms = Number.isFinite(fit.rms) ? `${fit.rms.toFixed(3)} px` : '不可用';
+  result.textContent = `最近一次标定：最终使用 ${used} 张（首轮 ${total} 张）；最终剔除 ${dropped} 张；最终 RMS ${rms}。`
+    + (fit.threshold_stop_reason ? ` ${fit.threshold_stop_reason}` : '')
+    + ' 推荐阈值仅是首轮数据的辅助建议，不是标定质量合格标准。';
+}
+
+/** 渲染首轮重投影误差柱状图，并按当前阈值预览超限张数。 */
 function drawErrorChart(fit, threshold) {
   const cv = $('c-reproj');
   const cssW = cv.clientWidth || 560;
@@ -96,21 +135,33 @@ function drawErrorChart(fit, threshold) {
       cnt0.textContent = '尚无 calib.json —— 先跑一次标定';
       cnt0.className = 'hint mono';
     }
+    renderCalibrationSummary(null);
     return;
   }
 
   let bars = [];
-  if (fit.all_names && fit.all_names.length) {
+  const hasFirstPass = (fit.all_names && fit.all_errors
+    && fit.all_names.length > 0 && fit.all_names.length === fit.all_errors.length);
+  if (hasFirstPass) {
     bars = fit.all_names.map((name, i) => ({ name, error: fit.all_errors[i] }));
   } else {
     bars = (fit.per_view || []).map((e, i) => ({ name: fit.used_names[i], error: e }))
       .concat((fit.dropped || []).map((d) => ({ name: d.name, error: d.error })));
   }
-  if (!bars.length) return;
-  bars.sort((a, b) => a.name.localeCompare(b.name));
+  bars.sort((a, b) => b.error - a.error);
+  renderCalibrationSummary(fit);
+  if (!bars.length) {
+    const cnt = $('calib-count');
+    if (cnt) {
+      cnt.textContent = '当前 OpenCV 未提供逐视图 RMS，无法显示误差图或筛选预览。';
+      cnt.className = 'hint mono';
+    }
+    return;
+  }
 
   const hasThr = typeof threshold === 'number' && isFinite(threshold) && threshold > 0;
-  const cut = hasThr ? bars.filter((b) => b.error > threshold).length : 0;
+  const cut = hasThr && hasFirstPass
+    ? bars.filter((b) => b.error > threshold).length : 0;
 
   // 数量行
   const cnt = $('calib-count');
@@ -118,10 +169,13 @@ function drawErrorChart(fit, threshold) {
     const applied = fit.threshold;
     const pending = hasThr && (applied == null || Math.abs(applied - threshold) > 1e-9);
     cnt.textContent = hasThr
-      ? `将剔除 ${cut} / 共 ${bars.length} 张（阈值 ${threshold}）`
-        + (pending ? ' · 预览，点「运行标定」生效' : '')
-      : `不剔除 · 共 ${bars.length} 张`;
-    if (fit.rms) cnt.textContent += `  ·  上次 RMS ${fit.rms.toFixed(3)} px`;
+      ? (hasFirstPass
+        ? `第一轮有 ${cut} / ${bars.length} 张超过该阈值；迭代重标后最终数量可能变化。`
+        : '缺少第一轮逐视图误差数据，无法预览该阈值。')
+      : (hasFirstPass
+        ? `第一轮共 ${bars.length} 张视图；当前未设置筛选阈值。`
+        : '当前结果没有首轮误差数据，无法预览；尚未设置筛选阈值。');
+    if (hasThr && pending) cnt.textContent += ' · 预览，点「运行标定」生效';
     cnt.className = 'hint mono' + (cut ? ' bad' : '');
   }
 
@@ -1003,11 +1057,17 @@ function drawPreview(dataUrl) {
 function bindControls() {
   ['in-phys-w', 'in-phys-h', 'in-target-w', 'in-target-f'].forEach((id) => $(id).addEventListener('input', () => schedulePreview()));
 
-  // 改剔除阈值立刻重画柱状图与数量，让用户先看到"会删多少张"再决定跑不跑标定
+  // 改筛选阈值只更新首轮预览，不会启动重标定。
   $('in-reproj').addEventListener('input', () => {
     if (!state.fit) return;
     drawErrorChart(state.fit, currentThreshold());
   });
+  $('btn-use-recommended').onclick = () => {
+    const value = state.fit && state.fit.recommended_threshold;
+    if (!Number.isFinite(value)) return;
+    $('in-reproj').value = String(value);
+    drawErrorChart(state.fit, currentThreshold());
+  };
 
   ['in-ax', 'in-ay', 'in-hd'].forEach((id) => {
     $(id).addEventListener('input', () => {
@@ -1361,9 +1421,8 @@ function bindGallery() {
 
 /** 跑一次相机标定并把结果画到卡片上。
 
-    threshold 用 undefined 表示"沿用输入框里的值"，传 '' 或 null 表示强制不剔除。
-    导入素材后会自动调一次（不剔除），目的只是先拿到全体误差分布，
-    让用户能看着柱状图挑阈值，省掉"先盲标一次 → 调阈值 → 再标一次"的第一遍。
+    threshold 用 undefined 表示"沿用输入框里的值"，传 '' 或 null 表示强制不筛选。
+    导入后会自动完成一轮未剔除标定，用首轮完整误差分布供阈值建议与预览使用。
  */
 async function runCalibration({ force = false, threshold } = {}) {
   const payload = {
@@ -1377,6 +1436,8 @@ async function runCalibration({ force = false, threshold } = {}) {
     state.fit = data.fit;
     drawErrorChart(data.fit, currentThreshold());
   } else {
+    state.fit = null;
+    drawErrorChart(null, null);
     $('calib-count').textContent = '（仅复用了已存的 calib.json，未重跑标定）';
     $('calib-count').className = 'hint mono';
   }
@@ -1547,7 +1608,13 @@ function bindActions() {
   $('btn-calib').onclick = () => withBusy($('btn-calib'), async () => {
     try {
       log('开始相机标定…');
-      await runCalibration({ force: $('in-force').checked });
+      const threshold = currentThreshold();
+      const applied = state.fit && state.fit.threshold;
+      const thresholdChanged = state.fit
+        ? (threshold === null ? applied != null
+          : applied == null || Math.abs(Number(applied) - threshold) > 1e-9)
+        : threshold !== null;
+      await runCalibration({ force: $('in-force').checked || thresholdChanged });
       log('标定完成。', 'ok');
     } catch (e) { log('标定失败: ' + e.message, 'err'); }
   });

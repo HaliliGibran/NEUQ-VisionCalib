@@ -10,7 +10,7 @@
 ``neuq_vision_calib.py`` 编排。背景知识见 ``KNOWLEDGE_GUIDE.md`` 第 3～6 节。
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -133,11 +133,64 @@ def report_reprojection_error(obj_points, img_points, rvecs, tvecs,
     return total_err / max(1, total_pts)
 
 
+def recommend_reprojection_threshold(errors: Sequence[float]) -> dict:
+    """根据未经筛除的首轮逐视图 RMS，给出可选的高误差筛选阈值建议。
+
+    使用 median + 3 * (1.4826 * MAD) 识别明显高误差视图，再把建议值放在
+    最大正常值与最小异常值之间。少于 5 个有效视图、MAD 退化或没有异常时不
+    提供数值建议；该结果仅供用户参考，不会自动应用。
+
+    返回 ``threshold``、``outlier_count``、``sample_count`` 和 ``status``，其中
+    status 为 ``recommended``、``too_few_samples``、``mad_degenerate`` 或
+    ``no_outliers``。
+    """
+    values = np.asarray(errors, dtype=np.float64).ravel()
+    values = values[np.isfinite(values)]
+    sample_count = int(values.size)
+    result = {
+        'threshold': None,
+        'outlier_count': 0,
+        'sample_count': sample_count,
+        'status': 'too_few_samples',
+    }
+    if sample_count < 5:
+        return result
+
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    if mad <= np.finfo(np.float64).eps * max(1.0, abs(median)):
+        result['status'] = 'mad_degenerate'
+        return result
+
+    robust_sigma = 1.4826 * mad
+    abnormal = values > median + 3.0 * robust_sigma
+    outlier_count = int(np.count_nonzero(abnormal))
+    if not outlier_count:
+        result['status'] = 'no_outliers'
+        return result
+
+    max_normal = float(np.max(values[~abnormal]))
+    min_abnormal = float(np.min(values[abnormal]))
+    midpoint = (max_normal + min_abnormal) / 2.0
+    threshold = midpoint
+    # 通常精确到 0.01 px；区间很窄时提高精度，确保舍入后仍严格位于两组之间。
+    for decimals in range(2, 10):
+        candidate = round(midpoint, decimals)
+        if max_normal < candidate < min_abnormal:
+            threshold = candidate
+            break
+
+    result.update(threshold=float(threshold), outlier_count=outlier_count,
+                  status='recommended')
+    return result
+
+
 __all__ = [
     'SUBPIX_CRITERIA',
     '_calibrate_once',
     'detect_chessboard',
     'detect_chessboard_partial',
+    'recommend_reprojection_threshold',
     'report_reprojection_error',
 ]
 
