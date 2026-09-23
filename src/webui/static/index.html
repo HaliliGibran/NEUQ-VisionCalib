@@ -96,17 +96,15 @@
         <canvas id="c-reproj" width="560" height="180"></canvas>
       </div>
       <div class="reproj-recommendation">
-        <span id="calib-recommendation" class="hint">尚无首轮误差数据。</span>
-        <button id="btn-use-recommended" class="ghost sm" type="button" disabled>使用推荐值</button>
+        <span id="calib-recommendation" class="hint">尚无首轮统计离群帧检查结果。</span>
       </div>
       <div id="calib-final-result" class="hint"></div>
       <section id="calib-diagnostics" class="calib-diagnostics" hidden>
         <h4>标定数据诊断</h4>
         <p id="calib-diagnostic-count" class="hint"></p>
         <div id="calib-diagnostic-metrics" class="diagnostic-metrics"></div>
-        <div id="calib-diagnostic-priority" class="diagnostic-priority"></div>
         <div class="diagnostic-advice">
-          <strong>补拍建议与检查说明</strong>
+          <strong>逐项补拍建议与检查说明</strong>
           <ul id="calib-diagnostic-recommendations"></ul>
         </div>
         <p class="hint diagnostic-caveat">这些是采集质量提示规则，不是标定合格标准；位置重复的照片不会被自动删除。</p>

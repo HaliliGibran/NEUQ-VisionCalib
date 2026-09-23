@@ -450,9 +450,9 @@ def diagnose_calibration_views(image_points, object_points, rvecs, tvecs,
         {'key': 'scale_diversity', 'label': '尺度变化', 'value': scale_label,
          'level': scale_level,
          'detail': f'棋盘投影面积的等效线性尺寸最大 / 最小约 {scale_ratio:.2f} 倍'},
-        {'key': 'parameter_stability', 'label': '参数稳定性', 'value': stability_label,
+        {'key': 'parameter_stability', 'label': '内参稳定性', 'value': stability_label,
          'level': stability_level,
-         'detail': ('标准差是当前模型和当前数据下的估计不确定性参考，不代表正确性保证；'
+         'detail': ('依据 fx / fy / cx / cy 标准差；不包括畸变参数的不确定性，也不代表正确性保证。'
                     + (f'最大相对不确定性约 {stability_max_ratio * 100:.2f}%。'
                        if stability_max_ratio is not None else '当前 OpenCV 未提供可用标准差。'))},
     ]
@@ -466,13 +466,14 @@ def diagnose_calibration_views(image_points, object_points, rvecs, tvecs,
         corner_list = '、'.join(missing_corners)
         recommendations.append({
             'topic': '边缘覆盖',
-            'text': (f'建议在{corner_list}附近各补拍 {low}～{high} 张，'
-                     '尽量保持完整棋盘可见。'),
+            'text': (f'在{corner_list}附近各补拍 {low}～{high} 张；让棋盘角点延伸到图像边缘/角区，'
+                     '不要只移动棋盘中心，并保持棋盘完整、清晰可见。'),
         })
     elif edge_level == 'weak':
         recommendations.append({
             'topic': '边缘覆盖',
-            'text': '把棋盘移到画面四边和四角附近补拍，保持完整棋盘可见。',
+            'text': '把棋盘移到热力图中观测较少的四边和四角补拍；让角点实际进入边缘区域，'
+                    '不要只移动棋盘中心，并保持棋盘完整、清晰可见。',
         })
     if coverage_level == 'weak':
         recommendations.append({
@@ -483,7 +484,8 @@ def diagnose_calibration_views(image_points, object_points, rvecs, tvecs,
         recommendations.append({
             'topic': '位置重复',
             'text': (f'{repeated_region}重复出现较多（{repeated_count} / {n_views} 张），'
-                     '继续拍相似位置帮助有限；请把棋盘移到其他画面区域。'),
+                     '相似位置新增的几何信息有限；后续把棋盘中心移到热力图中观测较少的区域，'
+                     '并同时改变距离和倾角。已有照片不会仅因位置重复而自动删除。'),
         })
     if pose_level == 'weak':
         recommendations.append({
@@ -497,21 +499,19 @@ def diagnose_calibration_views(image_points, object_points, rvecs, tvecs,
         })
     if stability_level == 'weak':
         recommendations.append({
-            'topic': '参数稳定性',
-            'text': '参数不确定性参考偏高；可先补充不同画面位置、倾角和距离的观测，再比较变化。',
+            'topic': '内参稳定性',
+            'text': '核心内参不确定性参考偏高；可补充不同画面位置、倾角和距离的观测，再比较变化。',
         })
     if not recommendations:
         recommendations.append({
-            'topic': '采集分布',
+            'topic': '检查说明',
             'text': '这些启发式检查未发现突出的采集缺口；仍需结合重投影误差、去畸变预览和实际成像检查。',
         })
 
     return {
         'view_count': int(n_views),
         'metrics': metrics,
-        'priority': {'topic': recommendations[0]['topic'],
-                     'text': recommendations[0]['text']},
-        'recommendations': [item['text'] for item in recommendations],
+        'recommendations': [f"{item['topic']}：{item['text']}" for item in recommendations],
         'heatmap': {
             'cols': int(cols), 'rows': int(rows), 'counts': cell_counts.tolist(),
             'max_count': int(np.max(cell_counts)) if cell_counts.size else 0,
@@ -521,8 +521,11 @@ def diagnose_calibration_views(image_points, object_points, rvecs, tvecs,
         'corners': [{'name': corner_names[i], 'view_count': int(count)}
                     for i, count in enumerate(corner_view_counts)],
         'std_intrinsics': stability_rows if stability_available else [],
-        'std_intrinsics_note': ('仅表示当前模型和当前数据下的估计不确定性参考，不能单独证明标定正确。'),
-        'heuristics_note': ('以下状态和补拍建议是采集质量启发式提示，不是相机标定合格标准；'
+        'std_intrinsics_note': ('仅表示当前模型和当前数据下 fx/fy/cx/cy 的估计不确定性参考；'
+                                '不包含畸变参数不确定性，也不能单独证明标定正确。'),
+        'heuristics_note': ('以下状态和逐项补拍建议是采集质量启发式提示，不是相机标定合格标准。'
+                            '位置重复不等同于坏照片：重复视图可降低该区域的随机观测噪声，'
+                            '但新增几何信息会递减；分布失衡可能削弱参数可辨识性和边缘泛化。'
                             '程序不会自动删除位置重复或低信息量视图。'),
         'views': views,
     }

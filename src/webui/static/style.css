@@ -140,19 +140,16 @@ main {
 .diagnostic-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
 .diagnostic-metric {
   min-width: 0; padding: 4px 6px; border-radius: 6px;
-  background: var(--panel-2); display: flex; justify-content: space-between; gap: 5px;
+  background: var(--panel-2); display: grid; grid-template-columns: 1fr auto; gap: 3px 5px;
   font-size: 11px;
 }
 .diagnostic-metric .diag-name { color: var(--muted); }
 .diagnostic-metric .diag-value { font-weight: 600; white-space: nowrap; }
+.diagnostic-metric .diag-detail { grid-column: 1 / -1; color: var(--muted); line-height: 1.35; }
 .diagnostic-metric.level-good .diag-value { color: var(--ok); }
 .diagnostic-metric.level-fair .diag-value { color: var(--warn); }
 .diagnostic-metric.level-weak .diag-value { color: var(--danger); }
 .diagnostic-metric.level-unknown .diag-value { color: var(--muted); }
-.diagnostic-priority {
-  margin: 8px 0 5px; padding: 6px 8px; border-radius: 6px;
-  background: var(--warn-bg); color: var(--warn); font-size: 11px;
-}
 .diagnostic-advice { font-size: 11px; }
 .diagnostic-advice ul { margin: 3px 0 7px; padding-left: 20px; }
 .diagnostic-advice li { margin: 2px 0; }

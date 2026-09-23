@@ -67,21 +67,19 @@ function linesFromQuad(quad) {
   ];
 }
 
-/** 把首轮误差推荐值格式化到两位小数；区间太窄时保留更多位数。 */
-function formatRecommendedThreshold(value) {
+/** 把统计离群帧检测分界值格式化到两位小数；区间太窄时保留更多位数。 */
+function formatOutlierBoundary(value) {
   const two = Number(value).toFixed(2);
   if (Math.abs(Number(two) - value) < 1e-9) return two;
   return Number(value).toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
 }
 
-/** 展示首轮建议与最近一次完整标定的实际结果。 */
+/** 展示首轮统计离群帧检查与最近一次完整标定的实际结果。 */
 function renderCalibrationSummary(fit) {
   const recommendation = $('calib-recommendation');
-  const useButton = $('btn-use-recommended');
   const result = $('calib-final-result');
   if (!fit) {
-    recommendation.textContent = '尚无首轮误差数据。';
-    useButton.disabled = true;
+    recommendation.textContent = '尚无首轮统计离群帧检查结果。';
     result.textContent = '';
     return;
   }
@@ -93,20 +91,15 @@ function renderCalibrationSummary(fit) {
   if (status === 'recommended' && Number.isFinite(threshold)) {
     const outliers = fit.recommended_outlier_count || 0;
     const samples = fit.recommendation_sample_count || total;
-    recommendation.textContent = `推荐阈值：${formatRecommendedThreshold(threshold)} px · 首轮异常 ${outliers} / ${samples} 张`;
-    useButton.disabled = false;
+    recommendation.textContent = `统计离群帧检查：发现 ${outliers} / ${samples} 张候选；分界值 ${formatOutlierBoundary(threshold)} px。它只识别误差分布中的离群候选，不代表按此筛选能提高标定质量。`;
   } else if (status === 'too_few_samples') {
-    recommendation.textContent = '首轮有效视图不足 5 张，暂不推荐筛选阈值。';
-    useButton.disabled = true;
+    recommendation.textContent = '首轮有效视图不足 5 张，暂不判断统计离群帧；这不妨碍你按实际用途手动设置误差上限。';
   } else if (status === 'mad_degenerate') {
-    recommendation.textContent = '首轮误差分布的 MAD 为 0（或接近 0），无法可靠自动计算推荐阈值，请结合柱状图人工判断。';
-    useButton.disabled = true;
+    recommendation.textContent = '首轮误差分布的 MAD 为 0（或接近 0），无法可靠判断统计离群帧；这不等同于没有高误差照片。如有需要，可手动设置误差上限。';
   } else if (status === 'no_outliers') {
-    recommendation.textContent = '本批数据未发现明显高误差离群帧';
-    useButton.disabled = true;
+    recommendation.textContent = '未发现明显统计离群帧。这不代表所有照片误差都低，也不代表模型比较后建议全部保留；如有需要，可手动设置更严格的误差上限。';
   } else {
-    recommendation.textContent = '当前无法计算推荐阈值。';
-    useButton.disabled = true;
+    recommendation.textContent = '当前无法判断统计离群帧；如有需要，可手动设置误差上限。';
   }
 
   const used = (fit.used_names || []).length;
@@ -114,7 +107,7 @@ function renderCalibrationSummary(fit) {
   const rms = Number.isFinite(fit.rms) ? `${fit.rms.toFixed(3)} px` : '不可用';
   result.textContent = `最近一次标定：最终使用 ${used} 张（首轮 ${total} 张）；最终剔除 ${dropped} 张；最终 RMS ${rms}。`
     + (fit.threshold_stop_reason ? ` ${fit.threshold_stop_reason}` : '')
-    + ' 推荐阈值仅是首轮数据的辅助建议，不是标定质量合格标准。';
+    + ' 统计离群帧检查不评估筛选后模型的泛化表现，也不是标定质量合格标准。';
 }
 
 /** 展示质量诊断摘要、补拍行动项和逐照片技术数据。 */
@@ -122,7 +115,6 @@ function renderCalibrationDiagnostics(diagnostics) {
   const section = $('calib-diagnostics');
   const count = $('calib-diagnostic-count');
   const metrics = $('calib-diagnostic-metrics');
-  const priority = $('calib-diagnostic-priority');
   const recommendations = $('calib-diagnostic-recommendations');
   const heatmapPanel = $('calib-heatmap-panel');
   const detailPanel = $('calib-diagnostic-detail-panel');
@@ -158,17 +150,13 @@ function renderCalibrationDiagnostics(diagnostics) {
     const value = document.createElement('span');
     value.className = 'diag-value';
     value.textContent = item.value;
-    card.append(name, value);
+    const detail = document.createElement('span');
+    detail.className = 'diag-detail';
+    detail.textContent = item.detail || '';
+    card.append(name, value, detail);
     metrics.appendChild(card);
   });
 
-  if (!diagnostics.priority) {
-    priority.textContent = '当前没有可用的优先建议。';
-  } else if (diagnostics.priority.topic === '采集分布') {
-    priority.textContent = `未发现突出的采集薄弱项。${diagnostics.priority.text}`;
-  } else {
-    priority.textContent = `当前最需要改善：${diagnostics.priority.topic}。${diagnostics.priority.text}`;
-  }
   recommendations.replaceChildren();
   (diagnostics.recommendations || []).forEach((text) => {
     const item = document.createElement('li');
@@ -1216,12 +1204,6 @@ function bindControls() {
     if (!state.fit) return;
     drawErrorChart(state.fit, currentThreshold());
   });
-  $('btn-use-recommended').onclick = () => {
-    const value = state.fit && state.fit.recommended_threshold;
-    if (!Number.isFinite(value)) return;
-    $('in-reproj').value = String(value);
-    drawErrorChart(state.fit, currentThreshold());
-  };
   $('btn-coverage-heatmap').onclick = () => {
     const panel = $('calib-heatmap-panel');
     panel.hidden = !panel.hidden;

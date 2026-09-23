@@ -47,10 +47,14 @@ def test_per_view_heatmap_weighting_and_repetition():
     check(any('重复出现较多' in text for text in diagnostics['recommendations']),
           '重复位置诊断给出继续拍相似位置帮助有限的行动建议')
     check(len(diagnostics['std_intrinsics']) == 4
-          and '估计不确定性参考' in diagnostics['std_intrinsics_note'],
-          '详细数据提供 fx/fy/cx/cy 标准差及其解释边界')
+          and 'fx/fy/cx/cy' in diagnostics['std_intrinsics_note']
+          and '不包含畸变参数' in diagnostics['std_intrinsics_note'],
+          '内参标准差明确限于 fx/fy/cx/cy，不暗示畸变参数也稳定')
     check('score' not in diagnostics and '合格标准' in diagnostics['heuristics_note'],
           '诊断不生成伪精确总分，并明确不是合格判据')
+    check('priority' not in diagnostics
+          and all('：' in text for text in diagnostics['recommendations']),
+          '建议逐项标注主题，不生成固定顺序的“最需要改善项”')
     try:
         json.dumps(diagnostics, ensure_ascii=False)
         serializable = True
