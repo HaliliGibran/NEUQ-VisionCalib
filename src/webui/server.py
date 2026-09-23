@@ -1504,10 +1504,26 @@ def ensure_data_folders() -> None:
         folder.mkdir(parents=True, exist_ok=True)
 
 
+def force_line_buffering() -> None:
+    """把 stdout / stderr 切成行缓冲。
+
+    冻结成 exe 之后，stdout 一旦接的是管道或文件就是块缓冲的：启动横幅只有两百来
+    字节，而进程又长期不退出，缓冲区于是永远不 flush——重定向出来的日志一片空白，
+    Release 流水线也就等不到"请在浏览器打开 http://..."那一行，只能干等到超时。
+
+    PYTHONUNBUFFERED 对 PyInstaller 冻结出来的应用不生效（实测），所以只能在这里
+    自己 reconfigure。stdout 可能不存在（windowed 构建下为 None），一律忽略异常。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(AttributeError, ValueError, OSError):
+            stream.reconfigure(line_buffering=True)
+
+
 def main() -> None:
     """解析参数并启动服务。"""
     global HTTPD
 
+    force_line_buffering()
     ap = argparse.ArgumentParser(description='NEUQ-VisionCalib 智能车视觉标定工具（本地 Web 界面）')
     ap.add_argument('--port', type=int, default=8770, help='监听端口，默认 8770')
     ap.add_argument('--host', default='127.0.0.1', help='监听地址，默认仅本机')
