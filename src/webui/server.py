@@ -178,10 +178,13 @@ def make_calibrator(quad, phys_w, phys_h, anchor_x, anchor_y, heading, scale=Non
 
 
 def guess_quad(img: np.ndarray) -> list:
-    """给四点拖拽一个起点：取画面里最亮连通域（地面标定纸）的凸包四角。
+    """给四点拖拽提供一个粗略起点。
 
-    现场照片是"深色地板上铺浅色标定纸"，Otsu 一亮一暗就分开了。这只作起点，
-    精度无所谓——真正的位置由用户在画布上拖。
+    当前智能车赛道通常是深色底面上的浅色赛道，十字路口区域往往属于画面中
+    较大的高亮连通区域，因此这里用 Otsu 二值化 + 最大亮连通域的凸包估计四角。
+
+    这只是交互初值，不负责自动完成精确标定；最终四个角点仍由用户根据
+    十字路口的实际边界手动确认。
     """
     w, h = img.shape[1], img.shape[0]
     fallback = [[w * 0.12, h * 0.35], [w * 0.88, h * 0.32],
@@ -972,10 +975,11 @@ def recommended_layout(cal) -> dict:
     采用"，绝不把常量抄进 JS）；二是自动布局模式下 preview 与 commit 都从这里取
     参数，眼睛看到的 BirdView 与最终导出的 H/LUT 因此同源。
 
-    口径是 IpmCalibrator.target_layout()：把**目标地面范围**（自标定矩形近边向前
-    target_forward_cm、横向 target_width_cm）贴住输出图底边并最大化装入，anchor_y
-    与 scale 一起解出来。若误把整幅 valid FOV 当构图目标，会把 ±300 cm 的地面
-    压进 1280x720，48% 的输出像素来自不到 0.04 个源像素——整幅图是放射状拉丝。
+    口径是 IpmCalibrator.target_layout()：以逆透视坐标参考原点为 (0,0)，**目标地面
+    范围**向前 target_forward_cm、横向关于参考原点对称且总宽 target_width_cm，贴住
+    输出图底边并最大化装入，anchor_y 与 scale 一起解出来。若误把整幅 valid FOV 当
+    构图目标，会把 ±300 cm 的地面压进 1280x720，48% 的输出像素来自不到 0.04 个
+    源像素——整幅图是放射状拉丝。
 
     source 字段区分两种来源：
       'target_window'  算出了可行布局，anchor_y 与 scale 都是它给的；

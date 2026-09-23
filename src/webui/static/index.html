@@ -102,7 +102,7 @@
     <article class="card" id="step-source">
       <div class="card-head"><span class="num">3</span><h3>选择地面标定原图</h3></div>
       <p class="hint">接下来做<b>逆透视</b>（IPM，把这张透视图变成地面俯视图）。
-        从 <code>ipm_input/</code> 里挑一张白纸摆位最正、边缘最清楚的。</p>
+        从 <code>ipm_input/</code> 中选择一张<b>十字路口四个角点清晰、赛道边界容易辨认</b>的照片。</p>
       <div id="candidates" class="thumbs"></div>
       <div id="source-info" class="kv"></div>
       <button id="btn-ipm-gallery" class="ghost" type="button" disabled>查看逆透视成果<span
@@ -180,7 +180,8 @@
         <label>宽 cm <input id="in-phys-w" type="number" step="0.5" min="0.1" value="45"></label>
         <label>高 cm <input id="in-phys-h" type="number" step="0.5" min="0.1" value="45"></label>
       </div>
-      <p class="hint">必须实测。这一项直接决定比例尺（px/cm）与车上距离测量的正确性。</p>
+      <p class="hint">当前智能车赛道使用十字路口的方形区域进行标定，默认尺寸为 45×45 cm。若实际赛道尺寸不同，请以实测值为准。
+        这一项直接决定比例尺（px/cm）与车上距离测量的正确性。</p>
       <p class="hint">量的是地面上那个矩形（四点框住的那一块）的外框边长，
         与第 0 步「相机标定板规格」的棋盘格内角点数、方格边长是两回事，不要互相照抄。</p>
     </article>
