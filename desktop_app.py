@@ -1,4 +1,4 @@
-"""桌面壳实验原型：把现有本地 Web 控制台套进一个 WebView2 窗口。
+"""桌面壳实验原型：把现有本地 Web 界面套进一个 WebView2 窗口。
 
     python desktop_app.py                    开窗口（关掉窗口即退出）
     python desktop_app.py --selftest 6       开窗口 6 秒后自动关闭，用于验证可行性
@@ -27,7 +27,7 @@ import urllib.request
 from contextlib import suppress
 from pathlib import Path
 
-TITLE = 'NEUQ 视觉标定控制台'
+TITLE = 'NEUQ-VisionCalib · 智能车视觉标定工具'
 
 # WebView2 Runtime 的注册表位置。x64 系统上它装在 32 位视图里，所以要查 WOW6432Node；
 # 也查一遍 HKCU，用户级安装（部分企业环境）会落在那儿。
