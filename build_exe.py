@@ -1,4 +1,4 @@
-"""把 NEUQ 视觉标定控制台打包成 Windows 可执行文件。
+"""把 NEUQ-VisionCalib 智能车视觉标定工具打包成 Windows 可执行文件。
 
 用法:
     python build_exe.py            打包

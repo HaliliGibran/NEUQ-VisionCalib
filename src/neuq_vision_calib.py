@@ -45,7 +45,7 @@ T/S/R 第三行均为 [0,0,1]，故 H[2,:] 恒等于 H0[2,:]，地平线只随�
   python src/neuq_vision_calib.py                        跑全流程（交互逆透视标定）
   python src/neuq_vision_calib.py --stage tables --quad ...
                                                          无 GUI 跑完整链路
-  python src/webui/server.py                             打开浏览器控制台（推荐）
+  python src/webui/server.py                             打开浏览器中的 Web 界面（推荐）
 不带任何参数时会从 calib_input/ 标定，再用 ipm_input/ 的原图交互完成逆透视标定。
 """
 

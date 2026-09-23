@@ -1,4 +1,4 @@
-# NEUQ 相机标定程序（NEUQ-VisionCalib）
+# NEUQ-VisionCalib · 智能车视觉标定工具
 
 各位 NEUQ 的智能车 er，这是一套整合了相机标定、去畸变、逆透视（IPM）以及板端查找表导出的
 全流程视觉标定工具。它可以完成相机内参与畸变系数的标定，计算并导出去畸变相关参数、
@@ -65,7 +65,7 @@ python -m venv .venv
 ".venv/Scripts/python.exe" -m pip install -r requirements.txt   # Windows
 source .venv/bin/activate && pip install -r requirements.txt     # macOS / Linux
 
-python app.py                    # 启动网页控制台，浏览器自动打开
+python app.py                    # 启动本地 Web 工具，浏览器自动打开
 python src/webui/server.py --port 9000 --no-browser   # 换端口 / 不开浏览器
 ```
 
@@ -219,7 +219,7 @@ RMS 只说明"模型在**有数据的地方**拟合得好"，不能说明边缘�
 
 ### 标定数据诊断与补拍建议
 
-Web 控制台会对**最终参与本轮标定的照片**给出画面覆盖、边缘覆盖、位置重复、姿态变化、
+Web 界面会对**最终参与本轮标定的照片**给出画面覆盖、边缘覆盖、位置重复、姿态变化、
 尺度变化和内参稳定性提示，并分别列出触发的补拍建议，不把固定顺序包装成“最需要改善项”。覆盖热力图按 8×6 个归一化
 图像网格统计：一张照片在同一格最多计一次；颜色表示有角点落入该格的不同照片数，因而能同时
 看出从未覆盖、偶尔覆盖和反复覆盖的区域。覆盖状态按至少有 2 张不同照片观测的网格计算，
@@ -543,7 +543,7 @@ python -m venv .venv-lint && .venv-lint/Scripts/python -m pip install -r require
 ### 源码结构
 
 ```
-app.py                    本地 Web 控制台启动入口
+app.py                    本地 Web 工具启动入口
 build_exe.py              PyInstaller 打包
 start_webui.bat           Windows 一键启动
 src/
@@ -555,7 +555,7 @@ src/
 │   ├── calibration.py    棋盘检出与 calibrateCamera 的算法核
 │   ├── lut.py            查找表的数学核
 │   └── fs_transaction.py 目录换装事务（暂存 → 整体替换 → 失败回滚）
-└── webui/                本地 HTTP 控制台（无第三方 Web 框架）
+└── webui/                本地 HTTP 服务与 Web 界面（无第三方 Web 框架）
 tools/
 ├── scan_dataset.py       标定前摸清素材：分辨率分布 + 棋盘检出率
 └── verify_outputs.py     校验导出产物（第 9 节）

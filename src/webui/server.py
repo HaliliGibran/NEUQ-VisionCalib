@@ -1,4 +1,4 @@
-"""NEUQ 视觉标定工具的本地 Web 控制台——主算法外面的一层薄壳。
+"""NEUQ-VisionCalib 智能车视觉标定工具的本地 Web 界面——主算法外面的一层薄壳。
 
 它把 neuq_vision_calib.py 的能力接到浏览器：素材导入、相机标定、逆透视四点拖拽、
 实时 BirdView 预览、矩阵与查找表导出、批量测试。HTTP 层只负责校验请求、保存短期
@@ -1508,7 +1508,7 @@ def main() -> None:
     """解析参数并启动服务。"""
     global HTTPD
 
-    ap = argparse.ArgumentParser(description='NEUQ 视觉标定工具 Web 控制台')
+    ap = argparse.ArgumentParser(description='NEUQ-VisionCalib 智能车视觉标定工具（本地 Web 界面）')
     ap.add_argument('--port', type=int, default=8770, help='监听端口，默认 8770')
     ap.add_argument('--host', default='127.0.0.1', help='监听地址，默认仅本机')
     ap.add_argument('--root', type=Path, help='工程根目录，默认取主脚本所在目录')
@@ -1522,7 +1522,7 @@ def main() -> None:
     HTTPD = httpd
     url = f'http://{args.host}:{port}/'
     print('=' * 56)
-    print('  NEUQ 视觉标定控制台已启动')
+    print('  NEUQ-VisionCalib 智能车视觉标定工具已启动')
     print(f'  请在浏览器打开:  {url}')
     print(f'  工程根目录:      {core.SCRIPT_DIR}')
     print('  退出: 点页面右上角「退出」按钮；或按 Ctrl+C；或直接关窗口')

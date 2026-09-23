@@ -1,8 +1,8 @@
 @echo off
 rem ===================================================================
-rem  NEUQ 视觉标定本地 Web 控制台启动脚本
+rem  NEUQ-VisionCalib 智能车视觉标定工具启动脚本
 rem
-rem  双击此文件启动本地 Web 控制台。
+rem  双击此文件启动本地 Web 工具。
 rem  按以下顺序查找 Python 解释器：
 rem    1. .venv\Scripts\python.exe   工程本地虚拟环境（推荐）
 rem    2. "py"                       Windows Python 启动器
@@ -12,7 +12,7 @@ rem ===================================================================
 
 chcp 65001 >nul 2>nul
 cd /d "%~dp0"
-title NEUQ 视觉标定本地 Web 控制台
+title NEUQ-VisionCalib - 智能车视觉标定工具
 
 rem server.py 输出中文；强制使用 UTF-8，避免乱码
 set "PYTHONIOENCODING=utf-8"
@@ -73,5 +73,5 @@ echo.
 "%PY%" src\webui\server.py %*
 
 echo.
-echo   控制台已停止。
+echo   本地 Web 工具已停止。
 pause

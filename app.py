@@ -1,4 +1,4 @@
-"""NEUQ 视觉标定工具 —— 本地 Web 控制台启动入口。
+"""NEUQ-VisionCalib —— 智能车视觉标定工具的本地 Web 启动入口。
 
 双击 exe（或 `python app.py`）后：在程序旁边补齐数据目录 → 起本地服务 →
 自动打开浏览器。命令行参数原样透传给 server，例如：
@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 def main() -> None:
-    """启动控制台。"""
+    """启动本地 Web 工具。"""
     # 源码方式运行时把 src/ 挂到 sys.path，好让 `webui` 包与主脚本能被找到；
     # 打包成 exe 后主脚本已经并进可执行文件，这个补丁既没必要也可能指错地方。
     if not getattr(sys, 'frozen', False):

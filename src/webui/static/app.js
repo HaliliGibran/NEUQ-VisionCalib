@@ -1660,11 +1660,11 @@ function bindActions() {
   // 退出：走服务端的 /api/shutdown，用户就不必去命令行按 Ctrl+C
   //（Windows 下 cmd.exe 还会追问一句 "Terminate batch job (Y/N)?"）
   $('btn-quit').onclick = async () => {
-    if (!confirm('确定退出本地控制台吗？已导出的结果不受影响；尚未导出的四点、锚点、比例尺等当前交互状态不会保存。退出后需要重新启动程序才能再用。')) return;
+    if (!confirm('确定退出 NEUQ-VisionCalib 吗？已导出的结果不受影响；尚未导出的四点、锚点、比例尺等当前交互状态不会保存。退出后需要重新启动程序才能再用。')) return;
     try {
       await api('/api/shutdown', {});
       document.body.innerHTML =
-        '<div class="quit-screen"><h2>控制台已退出</h2>' +
+        '<div class="quit-screen"><h2>NEUQ-VisionCalib 已退出</h2>' +
         '<p>可以关掉这个标签页和黑色命令行窗口了。</p></div>';
     } catch (e) {
       log('退出失败: ' + e.message, 'err');
