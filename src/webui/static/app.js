@@ -97,8 +97,14 @@ function renderCalibrationSummary(fit) {
   } else if (status === 'too_few_samples') {
     recommendation.textContent = '首轮有效视图不足 5 张，暂不推荐筛选阈值。';
     useButton.disabled = true;
-  } else {
+  } else if (status === 'mad_degenerate') {
+    recommendation.textContent = '首轮误差分布的 MAD 为 0（或接近 0），无法可靠自动计算推荐阈值，请结合柱状图人工判断。';
+    useButton.disabled = true;
+  } else if (status === 'no_outliers') {
     recommendation.textContent = '本批数据未发现明显高误差离群帧';
+    useButton.disabled = true;
+  } else {
+    recommendation.textContent = '当前无法计算推荐阈值。';
     useButton.disabled = true;
   }
 
