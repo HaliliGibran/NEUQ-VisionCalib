@@ -49,9 +49,9 @@ LUT：每个输出像素应该去原图哪里取颜色
 
 > 在本项目里对应：
 >
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   calibrate_camera、IpmCalibrator、export_all、batch_test
-> - [src/neuq_core/lut.py](../src/neuq_core/lut.py) 的
+> - [src/neuq_core/lut.py](src/neuq_core/lut.py) 的
 >   build_composite_reverse_map
 
 ---
@@ -92,11 +92,11 @@ LUT：每个输出像素应该去原图哪里取颜色
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/geometry.py](../src/neuq_core/geometry.py) 的
+> - [src/neuq_core/geometry.py](src/neuq_core/geometry.py) 的
 >   physical_rect、ground_reference_origin、reference_origin_px、target_window_cm
-> - [src/neuq_core/lut.py](../src/neuq_core/lut.py) 的
+> - [src/neuq_core/lut.py](src/neuq_core/lut.py) 的
 >   table_spaces、pixel_grid
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   IpmCalibrator.ground_transform
 
 ---
@@ -138,7 +138,7 @@ A。很多“旋转中心怎么跑了”的错误，本质上都是把这条顺�
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/geometry.py](../src/neuq_core/geometry.py) 的
+> - [src/neuq_core/geometry.py](src/neuq_core/geometry.py) 的
 >   translation_matrix、rotation_matrix、scale_matrix、apply_homography
 > - apply_homography 最后除以第三个齐次分量，完成“去齐次化”
 
@@ -183,9 +183,9 @@ K 只描述相机内部成像尺度，所以叫**内参**。每张棋盘照片�
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/calibration.py](../src/neuq_core/calibration.py) 的
+> - [src/neuq_core/calibration.py](src/neuq_core/calibration.py) 的
 >   _calibrate_once、report_reprojection_error
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的 fit_camera、
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的 fit_camera、
 >   calibration_payload、resolve_new_camera_matrix
 > - fit_camera 返回每张图的 rvecs、tvecs；calib_data/calib.json 持久化共享的
 >   camera_matrix 与 dist_coeffs
@@ -225,9 +225,9 @@ r²。像素值动辄上千，模型定义却是在归一化坐标上；少了 K
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/lut.py](../src/neuq_core/lut.py) 的 distort_points：
+> - [src/neuq_core/lut.py](src/neuq_core/lut.py) 的 distort_points：
 >   Knew 像素 → 归一化坐标 → 按 K、D 重新施加畸变
-> - [src/neuq_core/calibration.py](../src/neuq_core/calibration.py) 返回的 dist
+> - [src/neuq_core/calibration.py](src/neuq_core/calibration.py) 返回的 dist
 > - calib_data/calib.json 中的 dist_coeffs
 
 ---
@@ -285,10 +285,10 @@ RMS；一些工具更常报告平均欧氏距离，不能只看数字大小就�
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/config.py](../src/neuq_core/config.py) 的 CheckerboardSpec
-> - [src/neuq_core/calibration.py](../src/neuq_core/calibration.py) 的
+> - [src/neuq_core/config.py](src/neuq_core/config.py) 的 CheckerboardSpec
+> - [src/neuq_core/calibration.py](src/neuq_core/calibration.py) 的
 >   detect_chessboard、_calibrate_once、report_reprojection_error
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   fit_camera、calibrate_camera、commit_calibration
 
 ---
@@ -325,9 +325,9 @@ forward 表。reverse 渲染问的却是“给我理想输出点，原图去哪�
 
 > 在本项目里对应：
 >
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   resolve_new_camera_matrix、calibration_basis_hash、calibration_basis_stale
-> - [src/neuq_core/lut.py](../src/neuq_core/lut.py) 的
+> - [src/neuq_core/lut.py](src/neuq_core/lut.py) 的
 >   undistorted_grid、distort_points
 
 ---
@@ -364,9 +364,9 @@ q = (x'/w', y'/w')
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/geometry.py](../src/neuq_core/geometry.py) 的
+> - [src/neuq_core/geometry.py](src/neuq_core/geometry.py) 的
 >   compute_homography、apply_homography、homography_denominator
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   IpmCalibrator.recompute、IpmCalibrator.compose
 
 ---
@@ -405,10 +405,10 @@ h 是把 H 的 9 个元素排成的向量。奇异值分解（SVD）寻找最接
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/geometry.py](../src/neuq_core/geometry.py) 的
+> - [src/neuq_core/geometry.py](src/neuq_core/geometry.py) 的
 >   normalize_points_for_dlt、compute_homography、quad_area、is_convex_quad、
 >   order_corners_tl_tr_bl_br
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   IpmCalibrator.build_corners
 
 ---
@@ -469,10 +469,10 @@ anchor_px = (anchor_x · (W-1), anchor_y · (H-1))
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/geometry.py](../src/neuq_core/geometry.py) 的
+> - [src/neuq_core/geometry.py](src/neuq_core/geometry.py) 的
 >   physical_rect、ground_reference_origin、rotation_matrix、scale_matrix、
 >   translation_matrix
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   IpmCalibrator.anchor_px、ground_transform、compose、recompute
 
 ---
@@ -511,10 +511,10 @@ valid_fov_polygon 先在去畸变图像素平面用半平面裁剪去掉错误�
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/geometry.py](../src/neuq_core/geometry.py) 的
+> - [src/neuq_core/geometry.py](src/neuq_core/geometry.py) 的
 >   homography_denominator、horizon_sign、clip_polygon_halfplane、DEN_EPS
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的 valid_fov_polygon
-> - [src/neuq_core/lut.py](../src/neuq_core/lut.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的 valid_fov_polygon
+> - [src/neuq_core/lut.py](src/neuq_core/lut.py) 的
 >   build_composite_reverse_map 对地平线有限侧的再次检查
 
 ---
@@ -555,9 +555,9 @@ full_fov_fit_scale 的含义不同：它是“若想把整个数学有效视野�
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/geometry.py](../src/neuq_core/geometry.py) 的
+> - [src/neuq_core/geometry.py](src/neuq_core/geometry.py) 的
 >   target_window_cm、fit_bottom_aligned、max_scale_for_fov
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   IpmCalibrator.target_window、target_layout、apply_target_layout、
 >   full_fov_fit_scale
 
@@ -590,10 +590,10 @@ TL→BL 应等于 phys_h_cm × scale，且两条边仍应垂直。
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/geometry.py](../src/neuq_core/geometry.py) 的 scale_matrix
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_core/geometry.py](src/neuq_core/geometry.py) 的 scale_matrix
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   IpmCalibrator.scale、compose
-> - [tools/verify_outputs.py](../tools/verify_outputs.py) 的 check_homography
+> - [tools/verify_outputs.py](tools/verify_outputs.py) 的 check_homography
 
 ---
 
@@ -633,9 +633,9 @@ LUT 有两个尺寸概念：
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/lut.py](../src/neuq_core/lut.py) 的
+> - [src/neuq_core/lut.py](src/neuq_core/lut.py) 的
 >   MapPair、table_spaces、undistorted_grid、build_composite_reverse_map
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   export_undistort_tables、export_composite_tables、export_all
 
 ---
@@ -666,9 +666,9 @@ forward 表仍然有价值：它可以回答“原图某点最终会去哪”，
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/lut.py](../src/neuq_core/lut.py) 的
+> - [src/neuq_core/lut.py](src/neuq_core/lut.py) 的
 >   build_composite_reverse_map、mask_out_of_range
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的 batch_test 使用
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的 batch_test 使用
 >   reverse MapPair 重建实际交付图
 
 ---
@@ -706,9 +706,9 @@ I(x, y) =
 
 > 在本项目里对应：
 >
-> - [tools/verify_outputs.py](../tools/verify_outputs.py) 的 bilinear_at
+> - [tools/verify_outputs.py](tools/verify_outputs.py) 的 bilinear_at
 > - OpenCV 的 cv2.remap(..., INTER_LINEAR) 用同类思想按 reverse 表取色
-> - [src/neuq_core/lut.py](../src/neuq_core/lut.py) 的 resample_map_pair
+> - [src/neuq_core/lut.py](src/neuq_core/lut.py) 的 resample_map_pair
 
 ---
 
@@ -759,9 +759,9 @@ full = (0 + 0.5) · 4 - 0.5 = 1.5
 
 > 在本项目里对应：
 >
-> - [src/neuq_core/lut.py](../src/neuq_core/lut.py) 的
+> - [src/neuq_core/lut.py](src/neuq_core/lut.py) 的
 >   downsample_factor、table_grid_factors、resample_map_pair
-> - [tools/verify_outputs.py](../tools/verify_outputs.py) 的
+> - [tools/verify_outputs.py](tools/verify_outputs.py) 的
 >   grid_from_full、full_from_grid、check_grid_isotropy
 
 ---
@@ -808,9 +808,9 @@ X/Y 必须同时无效。若 X 是 sentinel、Y 却合法，C 端会拼出一个
 
 > 在本项目里对应：
 >
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   quantize_table、dequantize_table、prepare_map_pair、BIN_SENTINEL
-> - [tools/verify_outputs.py](../tools/verify_outputs.py) 的
+> - [tools/verify_outputs.py](tools/verify_outputs.py) 的
 >   quant_tolerance、check_sentinel、compare_to_pipeline
 
 ---
@@ -849,9 +849,9 @@ J = [                   ]
 
 > 在本项目里对应：
 >
-> - [tools/verify_outputs.py](../tools/verify_outputs.py) 的
+> - [tools/verify_outputs.py](tools/verify_outputs.py) 的
 >   check_forward_reverse、bilinear_at
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   full_fov_fit_scale 与目标地面范围布局，帮助识别过度拉伸
 
 ---
@@ -969,16 +969,16 @@ old。中途失败就 rollback。pending 和 residue 表示上次换装可能没
 
 > 在本项目里对应：
 >
-> - [tools/verify_outputs.py](../tools/verify_outputs.py) 的
+> - [tools/verify_outputs.py](tools/verify_outputs.py) 的
 >   check_homography、check_grid_isotropy、check_undistort_tables、
 >   check_composite_tables、check_forward_reverse、check_sentinel、
 >   check_export_fidelity
-> - [src/neuq_core/fs_transaction.py](../src/neuq_core/fs_transaction.py) 的
+> - [src/neuq_core/fs_transaction.py](src/neuq_core/fs_transaction.py) 的
 >   DirectorySwapTransaction、commit_dirs
-> - [src/neuq_core/config.py](../src/neuq_core/config.py) 的
+> - [src/neuq_core/config.py](src/neuq_core/config.py) 的
 >   MaterialImportTransaction、material_transaction_state、
 >   material_stale_reason、require_no_material_residue
-> - [src/neuq_vision_calib.py](../src/neuq_vision_calib.py) 的
+> - [src/neuq_vision_calib.py](src/neuq_vision_calib.py) 的
 >   calibration_basis_hash、require_calibration_basis、recorded_source
 
 ---

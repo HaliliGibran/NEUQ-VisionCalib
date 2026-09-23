@@ -9,7 +9,7 @@
 
 这里的函数刻意保持无状态，方便单独验证公式。需要读取运行时范围的
 ``valid_fov_polygon``，以及负责交互的 ``IpmCalibrator``，留在应用编排层。
-完整直觉与推导见 ``docs/KNOWLEDGE_GUIDE.md`` 的第 2、7～11 节。
+完整直觉与推导见 ``KNOWLEDGE_GUIDE.md`` 的第 2、7～11 节。
 """
 
 from typing import List, Optional, Tuple

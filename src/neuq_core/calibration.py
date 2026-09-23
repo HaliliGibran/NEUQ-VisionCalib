@@ -7,7 +7,7 @@
 换到画面边缘却不可信。
 
 本模块只保留不依赖目录与界面的计算。素材读取、异常帧剔除和结果提交由
-``neuq_vision_calib.py`` 编排。背景知识见 ``docs/KNOWLEDGE_GUIDE.md`` 第 3～6 节。
+``neuq_vision_calib.py`` 编排。背景知识见 ``KNOWLEDGE_GUIDE.md`` 第 3～6 节。
 """
 
 from typing import Optional, Tuple
