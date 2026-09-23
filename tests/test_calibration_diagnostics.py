@@ -96,9 +96,32 @@ def test_pose_scale_and_edge_diagnostics():
           '详细视图数据同时包含由 rvec/tvec 估计的棋盘中心距离')
 
 
+def test_distinct_positions_in_small_batch_are_not_repeated():
+    width, height = 100, 80
+    centers = [(0.125, 1 / 6), (0.375, 1 / 6), (0.625, 1 / 6),
+               (0.875, 1 / 6), (0.125, 0.5)]
+    image_points = [np.array([[x * (width - 1), y * (height - 1)]], dtype=np.float32)
+                    for x, y in centers]
+    object_points = [np.zeros((1, 3), dtype=np.float32) for _ in centers]
+    rvecs = [np.zeros((3, 1), dtype=np.float64) for _ in centers]
+    tvecs = [np.array([[0.0], [0.0], [500.0]]) for _ in centers]
+    diagnostics = diagnose_calibration_views(
+        image_points, object_points, rvecs, tvecs,
+        np.array([[800.0, 0, 50], [0, 800.0, 40], [0, 0, 1]]),
+        np.array([1.0, 1.0, 1.0, 1.0]), (width, height),
+        [f'view_{i}.jpg' for i in range(len(centers))], [0.5] * len(centers))
+    repetition = next(item for item in diagnostics['metrics']
+                      if item['key'] == 'position_repetition')
+
+    check(repetition['value'] == '较少',
+          '5 张照片各落在不同的位置网格时不提示位置重复')
+
+
 if __name__ == '__main__':
     print('逐图覆盖与位置重复')
     test_per_view_heatmap_weighting_and_repetition()
     print('姿态、尺度与边缘覆盖')
     test_pose_scale_and_edge_diagnostics()
+    print('小批次的无重复位置')
+    test_distinct_positions_in_small_batch_are_not_repeated()
     sys.exit(1 if FAILED else 0)

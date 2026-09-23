@@ -35,6 +35,7 @@ CALIBRATION_DIAGNOSTIC_HEURISTICS = {
     'position_rows': 3,
     'position_repeat_min_views': 3,
     'position_repeat_fraction': 0.35,
+    'position_some_min_views': 2,
     'position_some_fraction': 0.20,
     'pose_tilt_deg': 12.0,
     'pose_spread_good_deg': 25.0,
@@ -349,7 +350,8 @@ def diagnose_calibration_views(image_points, object_points, rvecs, tvecs,
     if (repeated_count >= rules['position_repeat_min_views']
             and repeated_fraction >= rules['position_repeat_fraction']):
         repetition_label, repetition_level = '较多', 'weak'
-    elif repeated_fraction >= rules['position_some_fraction']:
+    elif (repeated_count >= rules['position_some_min_views']
+          and repeated_fraction >= rules['position_some_fraction']):
         repetition_label, repetition_level = '一般', 'fair'
     else:
         repetition_label, repetition_level = '较少', 'good'
