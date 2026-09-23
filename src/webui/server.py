@@ -288,9 +288,10 @@ def api_status() -> dict:
         ('calib_data', core.DIR_CALIB_DATA, '标定结果 calib.json'),
         ('calib_preview', core.DIR_CALIB_PREVIEW, '标定图去畸变验收'),
         ('ipm_input', core.DIR_IPM_IN, '逆透视标定原图'),
-        ('ipm_output', core.DIR_IPM_OUT, '去畸变图 + BirdView'),
+        ('ipm_output', core.DIR_IPM_OUT, '去畸变图 + 俯视图结果'),
         ('matrix', core.DIR_MATRIX, '六矩阵与逆透视状态'),
-        ('lookup_table', core.DIR_TABLE, '两套查找表'),
+        ('lookup_table', core.DIR_TABLE,
+         '两类查找表（去畸变、去畸变+逆透视），每类各含正向/反向，共 4 组 LUT'),
         ('test_input', core.DIR_TEST_IN, '批量测试输入'),
         ('test_output', core.DIR_TEST_OUT, '批量测试输出'),
     )
@@ -1209,7 +1210,8 @@ def run_auto_batch(pair) -> dict:
 
 
 def api_commit(body: dict) -> dict:
-    """落盘：保存逆透视状态、导出六矩阵与两套查找表，再跑自动批量测试。
+    """落盘并批量测试：导出六矩阵及两类查找表（去畸变、去畸变+逆透视），
+    每类各含正向/反向，共 4 组 LUT。
 
     前置条件是当前四点能构成 H、表网格合法，且相机参数与选中原图已经在 STATE 中。
     回包里 export_ok 与 batch 是两件事，必须分开看。自动批测是**交付之后**的验证，

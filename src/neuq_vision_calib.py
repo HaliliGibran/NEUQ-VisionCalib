@@ -15,7 +15,8 @@
   4. 交互逆透视标定：四条线的交点定义地平面度量关系；以去畸变图底边中点对应的
      地面点作为逆透视坐标参考原点；再用横向锚点、纵向锚点、朝向偏移、比例尺控制俯视图布局
   5. 六矩阵导出 → matrix/
-  6. 两套打表（各含正向映射/反向映射）→ lookup_table/undistort/、lookup_table/undistort_ipm/
+  6. 两类查找表（去畸变、去畸变+逆透视），每类各含正向/反向，共 4 组 LUT
+     → lookup_table/undistort/、lookup_table/undistort_ipm/
   7. 批量测试 test_input/ → test_output/
 
 坐标约定：全程 OpenCV 0-based 像素坐标。物理坐标单位 cm，x 向右、y 向下（朝向车辆）；
@@ -32,10 +33,10 @@
   T     : 平移到锚点指定的俯视图位置
 T/S/R 第三行均为 [0,0,1]，故 H[2,:] 恒等于 H0[2,:]，地平线只随四点变化。
 
-查找表约定（交付给嵌入式 C 端）：
+查找表约定（交付给嵌入式端 C 代码）：
   reverse/ : 对每个输出像素，给出源图（原始畸变图）的采样坐标
   forward/ : 对每个源图像素，给出它在输出图中的落点
-  两套表的无效点统一写 -1（映射到无穷远、落在地平线另一侧、或超出图像范围）。
+  4 组 LUT 的无效点统一写 -1（映射到无穷远、落在地平线另一侧、或超出图像范围）。
 
 命令行（在工程根目录下执行）：
   python src/neuq_vision_calib.py --list                 查看各目录现状
@@ -1809,7 +1810,7 @@ def report_table_size(out_dir: Path, shape: Tuple[int, int]) -> None:
 def export_undistort_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                             size: Tuple[int, int],
                             table_root: Optional[Path] = None) -> MapPair:
-    """导出原图 ↔ 去畸变图的正反两套表，返回可直接 remap 的最终 reverse 表。
+    """导出去畸变这一类查找表，含正向、反向两组 LUT；返回可直接 remap 的最终 reverse 表。
 
     reverse 的索引是 Knew 去畸变图像素，值是原始畸变图采样坐标；forward 正好反向。
     两种 value 都以原始完整分辨率的 px 表示，即使 LUT 索引网格被等比降采样也不变。
@@ -1838,7 +1839,7 @@ def export_composite_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                             H: np.ndarray, H0: np.ndarray, sign: float,
                             size: Tuple[int, int],
                             table_root: Optional[Path] = None) -> MapPair:
-    """导出原图 ↔ BirdView 的复合正反表，返回最终交付的 reverse 表。
+    """导出去畸变+逆透视这一类查找表，含正向、反向两组 LUT；返回最终交付的 reverse 表。
 
     reverse 把“逆 H + 镜头正向畸变”预先合成，因此嵌入式端一次 ``remap`` 就能从
     原始畸变图得到 BirdView。forward 则把原始像素先去畸变再过 H，供点坐标换算。
@@ -1871,13 +1872,14 @@ def export_all(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                H: np.ndarray, H0: np.ndarray, sign: float, extra: dict,
                size: Tuple[int, int],
                ipm_state: Optional[dict] = None) -> MapPair:
-    """事务式导出：六矩阵 + 逆透视状态 + 两套表，全部成功才落到正式目录。
+    """事务式导出六个矩阵、逆透视状态和两类查找表（去畸变、去畸变+逆透视），
+    每类各含正向/反向，共 4 组 LUT；只有全部成功才落到正式目录。
 
     前置条件是 K/Knew/H 可逆、H0 与 horizon sign 已由同一轮 IPM 标定得到、LUT 网格
     满足整数倍等比约束。成功返回的 MapPair 正是磁盘交付物的内存视图；任一步失败
     都只清理暂存区，已有的正式 matrix/ 与 lookup_table/ 保持成套不变。
 
-    原先的顺序是"先写 matrix/，再写两套表"。中间任何一步失败（打表溢出、
+    原先的顺序是"先写 matrix/，再写两类查找表"。中间任何一步失败（打表溢出、
     磁盘满、被 Ctrl+C）都会留下"新矩阵配旧表"的组合，而两边的文件单看都正常，
     几乎无法察觉。这里改成：
 
@@ -2401,9 +2403,10 @@ def print_inventory() -> None:
         ('calib_data', DIR_CALIB_DATA, '标定结果 calib.json', False),
         ('calib_preview', DIR_CALIB_PREVIEW, '标定图去畸变验收', False),
         ('ipm_input', DIR_IPM_IN, '逆透视标定原图', False),
-        ('ipm_output', DIR_IPM_OUT, '去畸变图 + BirdView 结果', False),
+        ('ipm_output', DIR_IPM_OUT, '去畸变图 + 俯视图结果', False),
         ('matrix', DIR_MATRIX, '六矩阵与逆透视状态', False),
-        ('lookup_table', DIR_TABLE, '两套查找表（正/反向）', True),
+        ('lookup_table', DIR_TABLE,
+         '两类查找表（去畸变、去畸变+逆透视），每类各含正向/反向，共 4 组 LUT', True),
         ('test_input', DIR_TEST_IN, '批量测试输入', False),
         ('test_output', DIR_TEST_OUT, '批量测试输出', False),
         ('backups', DIR_BACKUP, '备份并清空产生的归档', True),

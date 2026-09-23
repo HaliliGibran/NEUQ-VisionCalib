@@ -111,7 +111,7 @@
 
     <article class="card" id="step-export">
       <div class="card-head"><span class="num">4</span><h3>导出</h3></div>
-      <p class="hint">落盘六个矩阵、两套查找表（正向映射 / 反向映射），并跑一遍批量测试。</p>
+      <p class="hint">落盘六个矩阵和两类查找表（去畸变、去畸变+逆透视），每类各含正向/反向，共 4 组 LUT；随后运行批量测试。</p>
       <div class="pair">
         <label>表格式
           <select id="in-table-format">
@@ -144,7 +144,7 @@
       <div class="canvas-tools">
         <div class="mode-toggle" role="tablist">
           <button id="btn-mode-corner" class="active" type="button">四角点</button>
-          <button id="btn-mode-line" type="button">交点</button>
+          <button id="btn-mode-line" type="button">四条线</button>
         </div>
         <span id="cursor-pos" class="mono">—</span>
         <button id="btn-zoom-fit" class="ghost sm">适应窗口</button>
@@ -161,7 +161,7 @@
     <p class="hint pad">
       滚轮缩放 · 空白处拖动平移 · 方向键微调选中点（<kbd>Shift</kbd> 加速 10 倍）·
       选中某个点后右上角出现 5x 放大窗并锁定它，松手不消失 ·
-      「交点」模式下拖的是四条线本身，角点由交点实时算出来
+      四条线模式下拖动上下左右四条边线，角点由交点实时计算。
     </p>
   </section>
 

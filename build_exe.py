@@ -4,8 +4,9 @@
     python build_exe.py            打包
     python build_exe.py --clean    先清掉 build/ 与 dist/ 再打包
 
-产物在 dist/NEUQ-VisionCalib/，里面已经补齐了空的数据目录与棋盘靶标，
-整个文件夹拷给别人即可运行（不需要装 Python）。
+产物在 dist/NEUQ-VisionCalib/。目录预置 data/import/、data/backups/ 与
+assets/checkerboard/，其余工作目录按需创建；发行目录根部同时复制 README.md 与
+KNOWLEDGE_GUIDE.md。整个文件夹拷给别人即可运行（不需要装 Python）。
 """
 
 from __future__ import annotations
@@ -27,9 +28,7 @@ EXCLUDES = (
     'notebook', 'jupyter', 'sqlite3', 'pydoc',
 )
 
-# 预先放好 data/import/ 与 data/backups/ 这两个"用户投放区"。
-# 其余工作目录不预建：它们都是跑起来才产生的产物，提前铺一排空文件夹只会
-# 让 exe 目录显得杂乱，真正写入时程序自己会 mkdir(parents=True)。
+# 预置两个用户素材目录；其余工作目录由程序按需创建。
 IMPORT_FOLDERS = ('data/import', 'data/backups')
 
 
@@ -63,10 +62,14 @@ def build(clean: bool) -> Path:
     for name in IMPORT_FOLDERS:
         (out / name).mkdir(parents=True, exist_ok=True)
 
-    # 棋盘靶标是参考资料不是产物，跟源码里的位置保持一致，放 assets/ 下
+    # 棋盘靶标是参考资料，不是运行产物；复制到发行目录的原位置。
     checker = ROOT / 'assets' / 'checkerboard'
     if checker.is_dir():
         shutil.copytree(checker, out / 'assets' / 'checkerboard', dirs_exist_ok=True)
+
+    # 把使用说明放在发行目录根部，便携版用户解压后即可查阅。
+    for filename in ('README.md', 'KNOWLEDGE_GUIDE.md'):
+        shutil.copy2(ROOT / filename, out / filename)
 
     return out
 

@@ -10,7 +10,7 @@ const state = {
   quad: null,         // [[x,y] x4]，图像坐标系
   quadGuess: null,    // 载入时服务端给的起点，供"复位四点"用
   committedQuad: null,// 上次成功导出的四点，供"载入上次结果"用
-  linePoints: null,   // [[p1,p2] x4]，交点模式下的四条线（TOP/BOTTOM/LEFT/RIGHT）
+  linePoints: null,   // [[p1,p2] x4]，四条线模式下的边线（TOP/BOTTOM/LEFT/RIGHT）
   editMode: 'corner', // 'corner' = 拖角点；'line' = 拖四条线，角点由交点实时算出
   view: { scale: 1, tx: 0, ty: 0 },
   drag: null,         // { mode:'handle'|'pan'|'line-end', i, ei, ox, oy, tx0, ty0 }
@@ -915,7 +915,7 @@ function fillTableFactors(options) {
       : `1/${o.factor}：${o.width}×${o.height}`;
     sel.appendChild(opt);
   });
-  // 默认选 4×：1280×720 下就是 320×180，四组表约 0.9 MB，是当前推荐的上车规格
+  // 默认选 4×：1280×720 下就是 320×180，所有 LUT 合计约 0.9 MB，是当前推荐的上车规格
   const want = options.some((o) => String(o.factor) === keep) ? keep
     : (options.some((o) => o.factor === 4) ? '4' : String(options[0].factor));
   sel.value = want;
@@ -1121,7 +1121,7 @@ function bindControls() {
     log('已载入上次导出的四点。');
   };
 
-  // 模式切换：四角点 ↔ 交点
+  // 模式切换：四角点 ↔ 四条线
   const setMode = (mode) => {
     if (state.editMode === mode) return;
     // 切换前先把当前的角点同步到 linePoints（反之亦然），两种模式共享同一组角点
@@ -1443,7 +1443,7 @@ function bindActions() {
   // 退出：走服务端的 /api/shutdown，用户就不必去命令行按 Ctrl+C
   //（Windows 下 cmd.exe 还会追问一句 "Terminate batch job (Y/N)?"）
   $('btn-quit').onclick = async () => {
-    if (!confirm('确定退出本地控制台吗？未保存的交互标定不会丢失，但页面需要重新启动程序才能再用。')) return;
+    if (!confirm('确定退出本地控制台吗？已导出的结果不受影响；尚未导出的四点、锚点、比例尺等当前交互状态不会保存。退出后需要重新启动程序才能再用。')) return;
     try {
       await api('/api/shutdown', {});
       document.body.innerHTML =

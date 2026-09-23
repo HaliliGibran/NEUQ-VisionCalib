@@ -2,8 +2,8 @@
 
 各位 NEUQ 的智能车 er 们：这是一套通用的摄像头标定、去畸变与逆透视工具。它在智能车老登们的打表工具传承之上，融入了本人浅薄的图像经验，尽量做得功能齐全、上手方便，希望能帮各位在往后的学习和比赛里少在相机标定上费工夫。
 
-把一个普通摄像头拍到的**透视地面图**，变成可以直接量距离的**俯视图**，并把整条
-变换链导出成嵌入式端能直接查表使用的产物。全流程在本地网页控制台里完成，
+把一个普通摄像头拍到的**透视地面图**，变成可以直接量距离的**俯视图（BirdView）**，并把整条
+变换链导出成嵌入式端（C 代码）能直接查表使用的产物。全流程在本地网页控制台里完成，
 不需要 MATLAB。
 
 ```
@@ -16,7 +16,7 @@
       ├─ 逆透视（IPM，把透视图变成地面俯视图）
       │     地面上取 4 个点 + 实测矩形尺寸 ──► 单应 H
       │
-      ├─ 导出 ──────────► 6 个矩阵 + 畸变系数 + 4 套查找表（LUT）
+      ├─ 导出 ──────────► 6 个矩阵 + 畸变系数 + 两类查找表（去畸变、去畸变+逆透视），每类各含正向/反向，共 4 组 LUT
       │
       └─ 批量验证 ──────► 用交付的那份表逐张跑俯视图，肉眼与数值一起核
 ```
@@ -40,7 +40,9 @@
 
 ## 1. 快速开始
 
-**Windows 最省事**：双击 `start_webui.bat`（自动挑解释器、缺依赖自动装）。
+**普通 Windows 用户（推荐）**：便携版发布后，从 [GitHub Releases](https://github.com/HaliliGibran/NEUQ-VisionCalib/releases) 下载最新版本，解压后运行 `NEUQ-VisionCalib.exe`，无需安装 Python。
+
+**开发者从源码启动**：双击 `start_webui.bat`（自动挑解释器、缺依赖自动安装）。
 
 其他情况：
 
@@ -55,7 +57,7 @@ python src/webui/server.py --port 9000 --no-browser   # 换端口 / 不开浏览
 
 默认地址 `http://127.0.0.1:8770`。需要 Python 3.10+、`opencv-python`、`numpy`。
 
-不想装 Python：见第 11 节打包成 exe，整个文件夹拷走即可运行。
+开发者自行构建 Windows 便携版的方法见第 11 节。
 
 ---
 
@@ -121,10 +123,10 @@ python src/webui/server.py --port 9000 --no-browser   # 换端口 / 不开浏览
 | `D`    | 畸变参数 `[k1, k2, p1, p2, k3]`                                            |
 | `Knew` | 去畸变输出内参矩阵。默认与 `K` 相同；用 `--undist-alpha` 时会不同 |
 
-`calib.json` 保存原始内参 `K`、畸变系数 `D`、标定分辨率与 provenance。
+`calib.json` 保存原始内参 `K`、畸变系数 `D`、标定分辨率与来源追溯信息（provenance）。
 `Knew` 根据 `K / D / UNDIST_ALPHA` 得到；最终导出时写入
 `matrix/matrices.json`，并参与 `calibration_basis_hash`。因此 `Knew` 改变时，
-旧 IPM/LUT 也会被判为 stale（见第 12 节的标定基准）。
+旧 IPM/LUT 也会被判为过期（stale）（见第 12 节的标定基准）。
 
 ### 误差怎么读
 
@@ -151,7 +153,7 @@ python src/webui/server.py --port 9000 --no-browser   # 换端口 / 不开浏览
 被剔掉的照片不会生成去畸变预览，所以画廊里它们右侧是空的，并标注
 「未参与本次标定」——这不是文件丢了。
 
-### calib.json 记录了什么（provenance）
+### calib.json 记录了什么（来源追溯信息）
 
 ```json
 {
@@ -274,7 +276,9 @@ H = T(画布锚点) · S(比例尺) · R(朝向偏移) · T(−参考原点) · 
   4 个源点、目标地面范围、参考原点、标定基准指纹）。
 - `ipm_state.json`：逆透视标定状态。下次打开网页会用它恢复上次的 4 个点。
 
-### `lookup_table/` —— 4 套表
+### `lookup_table/`
+
+两类查找表（去畸变、去畸变+逆透视），每类各含正向/反向，共 4 组 LUT。
 
 ```
 lookup_table/
@@ -286,7 +290,7 @@ lookup_table/
     └── forward/      索引 = 原始畸变图像素，取值 = 俯视图落点
 ```
 
-每套目录下是 `MapW`（x 坐标）、`MapH`（y 坐标）与一份 `metadata.json`。
+每一类目录下都含正向与反向两组 LUT；每组包括 `MapW`（x 坐标）、`MapH`（y 坐标）与一份 `metadata.json`。
 
 **方向怎么选**：实时生成俯视图要的是 `reverse` —— 遍历输出像素、去原图取色，
 每个输出像素都有值。`forward` 用于反查"原图某点落到俯视图哪里"，它天然有空洞。
@@ -298,7 +302,7 @@ lookup_table/
 
 | 格式    | 说明                                              |
 | ------- | ------------------------------------------------- |
-| `txt` | 逗号分隔文本，便于肉眼查看；720p 下四套表约 56 MB |
+| `txt` | 逗号分隔文本，便于肉眼查看；720p 下所有 LUT 约 56 MB |
 | `bin` | 裸`int16` 小端定点，**上车用这个**        |
 | `c`   | C 头文件，可直接`#include`                      |
 
@@ -315,7 +319,7 @@ lookup_table/
 嵌入式端拿它算角度、曲率、横向偏差全部失真。
 
 1280×720 的可用倍率：`1× / 2× / 4× / 5× / 8× / 10× / 16×`。
-**当前推荐 `4×（320×180）`**，各向同性，四套表合计 900 KiB。
+**当前推荐 `4×（320×180）`**，各向同性，所有 LUT 合计 900 KiB。
 
 ---
 
@@ -400,11 +404,11 @@ python tools/scan_dataset.py <图片目录> --board-squares 12 9
 ```
 calib_input/      相机标定照片（_incomplete/ 放只检出局部棋盘的）
 calib_preview/    参与标定那些照片的去畸变结果，逐张验收用
-calib_data/       calib.json —— 内参、畸变系数、标定 provenance
+calib_data/       calib.json —— 内参、畸变系数、标定来源追溯信息
 ipm_input/        地面标定原图（候选）
 ipm_output/       去畸变图 + 俯视图结果
 matrix/           6 个矩阵、逆透视状态
-lookup_table/     4 套查找表
+lookup_table/     两类查找表（去畸变、去畸变+逆透视），每类各含正向/反向，共 4 组 LUT
 test_input/       批量测试输入（_auto_ipm/ 是导出时自动建的测试集）
 test_output/      批量测试输出
 data/import/      导入前的原始素材（网页上传的落点）
@@ -412,7 +416,8 @@ data/backups/     「备份并清空」产生的归档
 project.json      工程级配置：标定板规格、素材库状态
 ```
 
-这些目录**跑起来才会创建**，不需要提前铺空文件夹。素材导入有两种方式：网页上
+源码运行时，这些工作目录按需创建，不需要提前铺空文件夹。Windows 便携版预置
+`data/import/`、`data/backups/` 和 `assets/checkerboard/`；其余工作目录按需创建。素材导入有两种方式：网页上
 「选择文件夹…」直接上传（推荐），或填路径让程序按 `工程根 → data/import/` 查找。
 
 「备份并清空」会把产物打包进 `data/backups/`，再清空各目录等待新素材。备份里的
@@ -421,15 +426,16 @@ project.json      工程级配置：标定板规格、素材库状态
 
 ---
 
-## 11. 打包成 exe
+## 11. 自行构建 Windows 便携版（开发者）
 
 ```bash
 pip install -r requirements-dev.txt
 python build_exe.py             # 或加 --clean
 ```
 
-产物在 `dist/NEUQ-VisionCalib/`，已预置 `data/` 空目录与 `assets/checkerboard/`。
-整个文件夹拷走即可运行，目标机器不需要装 Python。
+产物在 `dist/NEUQ-VisionCalib/`。其中预置 `data/import/`、`data/backups/` 与
+`assets/checkerboard/`；其余工作目录按需创建。`README.md` 与 `KNOWLEDGE_GUIDE.md`
+会复制到发行目录根部。整个文件夹拷走即可运行，目标机器不需要装 Python。
 
 ---
 
@@ -451,7 +457,7 @@ python src/neuq_vision_calib.py --stage tables \
 `--table-size` 同样只接受整数倍等比的网格，不合法会直接报错并列出可用尺寸。
 只给标定板参数中的一项时，没给的字段沿用**当前工程**的规格，不是仓库默认值。
 
-### 标定基准与 stale
+### 标定基准（calibration basis）与过期状态
 
 `calib.json` / `ipm_state.json` / `matrices.json` 里都有
 `calibration_basis_hash = SHA256(K, D, Knew, 标定分辨率)`。重新标定后只要它变了：
@@ -462,7 +468,7 @@ python src/neuq_vision_calib.py --stage tables \
 旧文件**一个都不会被删**，只是不允许继续消费。看到这类提示不是出错，而是提醒
 "这份产物属于上一次标定，需要重做逆透视并重新导出"。
 
-刻意不对 `calib.json` 整个文件取哈希：`rms_px`、`used_images` 这些 provenance
+刻意不对 `calib.json` 整个文件取哈希：`rms_px`、`used_images` 这些来源追溯信息
 字段变了并不改变几何，不该让下游全部失效。也刻意包含 `Knew`：4 个点在去畸变图上，
 `--undist-alpha` 改了 `Knew` 就不能复用旧点。
 
@@ -486,7 +492,7 @@ python -m venv .venv-lint && .venv-lint/Scripts/python -m pip install -r require
 ### 源码结构
 
 ```
-app.py                    桌面入口，等价于启动网页控制台
+app.py                    本地 Web 控制台启动入口
 build_exe.py              PyInstaller 打包
 start_webui.bat           Windows 一键启动
 src/

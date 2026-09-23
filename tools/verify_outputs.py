@@ -1,4 +1,5 @@
-"""把一次导出当成小型验收项目：检查矩阵、图像效果与四组 LUT。
+"""把一次导出当成小型验收项目：检查矩阵、图像效果与以下导出物：
+两类查找表（去畸变、去畸变+逆透视），每类各含正向/反向，共 4 组 LUT。
 
 交付给嵌入式 C 端的是预先算好的坐标；方向写反、坐标系错一层或量化溢出，往往仍能
 生成一张“有画面”的图，所以只看文件存在远远不够。本脚本按由几何到字节的顺序检查：
@@ -8,7 +9,7 @@
   3. ``undistort/reverse`` 重建图是否等于 OpenCV ``undistort``
   4. ``undistort_ipm/reverse`` 重建图是否等于 OpenCV 两步参考链
   5. IPM forward/reverse 往返误差（降采样时只作诊断）
-  6. 四组表的 X/Y 无效哨兵是否同步、值是否统一
+  6. 导出 LUT 的 X/Y 无效哨兵是否同步、值是否统一
   7. 落盘 forward/reverse 是否分别等于流水线应生成的最终数组
 
 这里故意使用两类 oracle（判定参照）：第 3、4 项走 OpenCV 的独立图像 API，回答
@@ -638,7 +639,7 @@ def check_sentinel(root: Path) -> bool:
 
 
 def print_table_inventory(root: Path) -> None:
-    """打印四组表的落盘格式、网格与体积。
+    """打印各组 LUT 的落盘格式、网格与体积。
 
     不是通过/失败判据，而是让"交付给 C 端的到底是什么"一目了然——
     换过 --table-format 或 --table-size 之后最容易搞混的就是这个。
@@ -710,7 +711,7 @@ def main() -> int:
         check_composite_tables(root, calib, matrices),
         # 5. forward/reverse 往返；降采样时明确降级为诊断。
         check_forward_reverse(root),
-        # 6. 四组表的无效哨兵在 X/Y 两分量上是否成对。
+        # 6. 各组表的无效哨兵在 X/Y 两分量上是否成对。
         check_sentinel(root),
         # 7. 正反两张落盘数组各自是否忠实于生成流水线。
         check_export_fidelity(root, calib, matrices),

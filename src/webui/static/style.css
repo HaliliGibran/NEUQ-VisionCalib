@@ -165,7 +165,7 @@ button.danger-outline:hover {
 #backup-info { margin-top: 6px; color: var(--faint); }
 #backup-info.warn { color: var(--warn); }
 
-/* 画布四角点/交点模式切换 */
+/* 画布四角点/四条线模式切换 */
 .mode-toggle {
   display: inline-flex;
   border: 1px solid var(--border-2);
