@@ -18,6 +18,8 @@ build/
 dist/
 *.spec
 *.manifest
+# tools/build_release.py 的产物：ZIP、校验和与 manifest，都是可重新生成的大文件
+/release/
 
 # ---------------- 运行数据 ----------------
 # 工程根下这些目录是标定链路的输入与产物：体积大、可重新生成，一律不入库。
