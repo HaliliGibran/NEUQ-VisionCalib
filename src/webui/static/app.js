@@ -619,9 +619,15 @@ async function refreshStatus() {
   // 选不到 320×180。所有 /api/status 刷新都走这一条路径，不再有两套。
   fillTableFactors(st.table_grid_options);
   const calib = st.calib;
+  $('in-camera-model').value = st.camera_model || 'standard';
   if (calib) {
-    setChip($('chip-calib'), `已标定 ${calib.width}×${calib.height}`, 'ok');
+    const modelMatches = calib.camera_model === (st.camera_model || 'standard');
+    setChip($('chip-calib'), modelMatches
+      ? `已标定 ${calib.width}×${calib.height}` : '镜头模型已更改，请重新标定',
+    modelMatches ? 'ok' : 'warn');
     kv($('calib-info'), [
+      ['镜头模型', calib.camera_model === 'fisheye'
+        ? '鱼眼镜头（Fisheye）' : '标准镜头（针孔）'],
       ['fx / fy', `${calib.fx.toFixed(1)} / ${calib.fy.toFixed(1)}`],
       ['cx / cy', `${calib.cx.toFixed(1)} / ${calib.cy.toFixed(1)}`],
       ['水平视场角', `${calib.hfov.toFixed(1)}°`],
@@ -1708,6 +1714,7 @@ function bindGallery() {
 async function runCalibration({ force = false, threshold } = {}) {
   const payload = {
     force,
+    camera_model: $('in-camera-model').value,
     max_reproj_err: threshold === undefined ? $('in-reproj').value : (threshold ?? ''),
     board: boardPayload(),
   };
@@ -1810,6 +1817,43 @@ function bindActions() {
       renderTransactionWarning(b.material_transaction);
       if (b.material_stale) log('⚠ ' + b.material_stale, 'err');
     } catch (e) { log('规格设置失败: ' + e.message, 'err'); }
+  });
+
+  $('in-camera-model').addEventListener('change', async () => {
+    try {
+      const result = await api('/api/camera_model', {
+        camera_model: $('in-camera-model').value,
+      });
+      // 去畸变坐标系随镜头模型变化，旧的 IPM 四点和预览不能沿用。
+      state.img = null;
+      state.quad = null;
+      state.quadGuess = null;
+      state.committedQuad = null;
+      state.linePoints = null;
+      state.lineGuess = null;
+      state.lastPreview = null;
+      state.selected = -1;
+      $('canvas-empty').style.display = '';
+      $('source-info').innerHTML = '';
+      $('scale-info').innerHTML = '';
+      setChip($('preview-state'), '待载入');
+      const preview = $('c-preview');
+      const previewContext = preview.getContext('2d');
+      previewContext.setTransform(1, 0, 0, 1, 0, 0);
+      previewContext.clearRect(0, 0, preview.width, preview.height);
+      drawSource();
+      state.fit = null;
+      renderCalibrationDiagnostics(null);
+      drawErrorChart(null, null);
+      $('calib-final-result').textContent = '';
+      await pollCalibrationSelection();
+      await refreshStatus();
+      log(`当前镜头模型已设为 ${result.camera_model === 'fisheye'
+        ? '鱼眼镜头（Fisheye）' : '标准镜头（针孔）'}。请运行标定并重新选择逆透视原图。`, 'ok');
+    } catch (e) {
+      log('镜头模型设置失败: ' + e.message, 'err');
+      await refreshStatus();
+    }
   });
 
   $('btn-board-reset').onclick = () => withBusy($('btn-board-reset'), async () => {

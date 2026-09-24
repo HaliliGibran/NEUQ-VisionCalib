@@ -360,7 +360,8 @@ def main() -> int:
                      ('export_all', 'build_ipm_state', 'batch_test', 'safe_imwrite')}
         recorded: dict = {}
 
-        def fake_export_all(K, D, Knew, H, H0, sign, extra, size, ipm_state=None):
+        def fake_export_all(K, D, Knew, H, H0, sign, extra, size,
+                            ipm_state=None, camera_model=None):
             """只记下导出用的 H 与参数：导出事务本身另有专门的测试文件。"""
             recorded['H'] = np.asarray(H, dtype=np.float64).copy()
             recorded['extra'] = dict(extra)
@@ -635,7 +636,8 @@ def main() -> int:
             sentinel = identity_pair()
             seen: dict = {}
 
-            def fake_export_all(K, D, Knew, H, H0, sign, extra, size, ipm_state=None):
+            def fake_export_all(K, D, Knew, H, H0, sign, extra, size,
+                                ipm_state=None, camera_model=None):
                 """只落两个产物标记：导出事务本身另有专门的测试文件。"""
                 core.DIR_MATRIX.mkdir(parents=True, exist_ok=True)
                 (core.DIR_MATRIX / 'matrices.json').write_text('{}', encoding='utf-8')

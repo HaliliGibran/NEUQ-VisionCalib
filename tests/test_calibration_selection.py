@@ -253,7 +253,8 @@ def test_webui_releases_compute_lock_during_assessment():
     assessment_started = Event()
     lock_was_available = []
 
-    def fake_assess(*_args, cancel_event=None, progress_callback=None):
+    def fake_assess(*_args, cancel_event=None, progress_callback=None,
+                    camera_model=None):
         acquired = server.LOCK.acquire(blocking=False)
         lock_was_available.append(acquired)
         if acquired:

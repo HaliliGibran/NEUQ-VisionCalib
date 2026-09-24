@@ -48,6 +48,7 @@ try:
     import numpy as np
 
     import neuq_vision_calib as core
+    from neuq_core import camera_model as camera_models
 except ImportError as exc:
     raise SystemExit(
         f'\n启动失败: 缺少依赖 ({exc})\n'
@@ -87,6 +88,7 @@ STATE: dict = {
     'D': None,          # 原始镜头的畸变系数
     'Knew': None,       # 去畸变输出所采用的像素坐标系
     'img_size': None,   # 标定分辨率 (W, H)
+    'camera_model': 'standard',  # 当前 K/D 的模型；不依赖选择控件的临时状态
     'src_path': None,   # 当前 IPM 原图路径
     'src_raw': None,    # 当前原始畸变图
     'src_undist': None, # 当前 Knew 去畸变图；四点在这个坐标系中拖拽
@@ -155,10 +157,10 @@ def api_shutdown() -> dict:
 
 def ensure_calibration() -> None:
     """确保内存里有 K/D/Knew；K/D 可读 calib.json，Knew 始终按当前视角参数计算。"""
-    if STATE['K'] is not None:
+    if STATE['K'] is not None and STATE['camera_model'] == core.CAMERA_MODEL:
         return
-    K, D, Knew, img_size = core.load_or_run_calibration()
-    STATE.update(K=K, D=D, Knew=Knew, img_size=img_size)
+    K, D, Knew, img_size, model = core.load_or_run_calibration_with_model()
+    STATE.update(K=K, D=D, Knew=Knew, img_size=img_size, camera_model=model)
 
 
 def make_calibrator(quad, phys_w, phys_h, anchor_x, anchor_y, heading, scale=None,
@@ -327,6 +329,7 @@ def _run_calibration_selection(task_id: str, event: threading.Event) -> None:
         result = core.assess_calibration_filter(
             views.obj_points, views.img_points, views.used, views.img_size,
             cancel_event=event,
+            camera_model=core.CAMERA_MODEL,
             progress_callback=lambda progress: _selection_progress(
                 task_id, event, progress),
         )
@@ -460,6 +463,8 @@ def api_status() -> dict:
             calib = {
                 'width': int(data['image_width']),
                 'height': int(data['image_height']),
+                'camera_model': camera_models.normalize_camera_model(
+                    data.get('camera_model')),
                 'fx': float(K[0, 0]), 'fy': float(K[1, 1]),
                 'cx': float(K[0, 2]), 'cy': float(K[1, 2]),
                 'dist': [float(v) for v in np.asarray(data['dist_coeffs']).ravel()],
@@ -511,6 +516,7 @@ def api_status() -> dict:
         'root': str(core.SCRIPT_DIR),
         'dirs': dirs,
         'calib': calib,
+        'camera_model': core.CAMERA_MODEL,
         'calib_board': core.calib_board_meta(),
         'board': board_payload(),
         # 素材是否按旧规格分拣的，必须常驻可见：只在"应用规格"那一刻回显一次的话，
@@ -708,6 +714,19 @@ def apply_board(body: dict) -> dict:
 def api_board(body: dict) -> dict:
     """设置规格的接口包装。"""
     return apply_board(body)
+
+
+def api_camera_model(body: dict) -> dict:
+    """Persist the selected lens model without altering any calibration artifacts."""
+    requested = body.get('camera_model')
+    if requested in (None, ''):
+        raise ValueError('需要选择 standard 或 fisheye 相机模型。')
+    model = core.configure_camera_model(requested, persist=True)
+    if STATE['camera_model'] != model:
+        STATE.update(K=None, D=None, Knew=None, img_size=None,
+                     camera_model=model, src_path=None, src_raw=None,
+                     src_undist=None, ipm_results=[])
+    return {'camera_model': model}
 
 
 def _apply_board_if_given(body: dict) -> None:
@@ -1004,13 +1023,21 @@ def api_calibrate(body: dict) -> dict:
     返回 fit_result 是给前端画柱状图用的——逐帧误差、接受/被剔除的清单、整体 RMS。
     """
     _apply_board_if_given(body)
+    if body.get('camera_model') not in (None, ''):
+        core.configure_camera_model(body['camera_model'], persist=True)
+    model = core.CAMERA_MODEL
     err = body.get('max_reproj_err')
     core.MAX_REPROJ_ERR = float(err) if err not in (None, '') else None
 
     # 复用旧标定前先对规格：已有 calib.json 是用另一块棋盘标的话，界面会显示
     # "当前 12x9、运行标定成功"，实际却复用了 9x7 的旧参数。数学没错，
     # 但 provenance 被写错，事后完全说不清。这里明确拒绝，不静默复用。
-    if not body.get('force') and core.CALIB_JSON.is_file():
+    should_calibrate = bool(body.get('force')) or not core.CALIB_JSON.is_file()
+    if core.CALIB_JSON.is_file() and not should_calibrate:
+        existing = core.load_calibration_with_model()
+        if existing is not None and existing[3] != model:
+            should_calibrate = True
+    if not should_calibrate and core.CALIB_JSON.is_file():
         conflict = core.board_conflict(core.calib_board_meta())
         if conflict:
             raise ValueError(conflict)
@@ -1018,9 +1045,10 @@ def api_calibrate(body: dict) -> dict:
     fit = None
     buf = io.StringIO()
     with redirect_stdout(buf):
-        if body.get('force') or not core.CALIB_JSON.is_file():
+        if should_calibrate:
             spec = core.BOARD     # 显式捕获：provenance 跟着本次实际用的板走
-            K, D, img_size, fit = core.calibrate_camera(board=spec)
+            K, D, img_size, fit = core.calibrate_camera(board=spec,
+                                                        camera_model=model)
             # calib.json 与 calib_preview/ 由 calibrate_camera 内部作为一个事务提交；
             # 这里再单独写一次 calib.json 就会留下"新预览 + 旧参数"的窗口。
             # 重标之后旧成果一律作废：那些 BirdView 是用**上一版** K/D 与上一份 LUT
@@ -1029,11 +1057,11 @@ def api_calibrate(body: dict) -> dict:
         else:
             print(f'复用已有标定文件 {core.CALIB_JSON.name}'
                   '（勾选"强制重新标定"可从头再算一遍）。')
-            K, D, img_size = core.load_calibration()
-        Knew = core.resolve_new_camera_matrix(K, D, img_size)
+            K, D, img_size, model = core.load_calibration_with_model()
+        Knew = core.resolve_new_camera_matrix(K, D, img_size, model)
         core.assert_invertible('K', K)
         core.assert_invertible('Knew', Knew)
-    STATE.update(K=K, D=D, Knew=Knew, img_size=img_size,
+    STATE.update(K=K, D=D, Knew=Knew, img_size=img_size, camera_model=model,
                  src_path=None, src_raw=None, src_undist=None)
 
     response = {'log': buf.getvalue(), 'size': list(img_size)}
@@ -1073,7 +1101,8 @@ def api_source(body: dict) -> dict:
         raise ValueError(f'无法读取 {path}')
     # 与命令行共用同一套尺寸契约：宽高比不同直接报错，不静默硬缩
     raw = core.normalize_camera_image(raw, STATE['img_size'], f'{path.name}')
-    undist = cv2.undistort(raw, STATE['K'], STATE['D'], None, STATE['Knew'])
+    undist = camera_models.undistort_image(
+        raw, STATE['K'], STATE['D'], STATE['Knew'], STATE['camera_model'])
     STATE.update(src_path=path, src_raw=raw, src_undist=undist)
 
     return {
@@ -1417,7 +1446,8 @@ def api_commit(body: dict) -> dict:
             'max_range_cm': core.MAX_RANGE_CM,
             'max_lateral_cm': core.MAX_LATERAL_CM,
             'calibration_basis_hash': core.current_calibration_basis(),
-        }, **origin), img_size, ipm_state=ipm_state)
+        }, **origin), img_size, ipm_state=ipm_state,
+            camera_model=STATE['camera_model'])
         # 导出已成功，这时才写结果图（与矩阵、查找表同属一批产物）
         core.safe_imwrite(core.IPM_RESULT, cal.birdview)
         print('去畸变逆透视结果图已保存:', core.IPM_RESULT)
@@ -1570,6 +1600,7 @@ class Handler(BaseHTTPRequestHandler):
             '/api/backup_clear': api_backup_clear,
             '/api/clear_all': api_clear_all,
             '/api/board': api_board,
+            '/api/camera_model': api_camera_model,
             '/api/shutdown': lambda b: api_shutdown(),    # 同上
         }
         handler = routes.get(parsed.path)
@@ -1578,11 +1609,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self.read_body()
             if parsed.path in ('/api/import', '/api/calibrate', '/api/board',
+                               '/api/camera_model',
                                '/api/backup_clear', '/api/clear_all', '/api/shutdown'):
                 request_calibration_selection_cancel()
             with LOCK:
                 result = handler(body)
                 if parsed.path in ('/api/import', '/api/calibrate', '/api/board',
+                                   '/api/camera_model',
                                    '/api/backup_clear', '/api/clear_all'):
                     invalidate_calibration_selection()
             self.send_json({'ok': True, **result})

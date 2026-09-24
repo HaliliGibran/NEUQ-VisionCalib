@@ -2,9 +2,9 @@
 
 一张棋盘照片提供两组彼此对应的点：棋盘平面上已知的 ``object points``（mm）和
 照片中检测到的 ``image points``（px）。多张不同距离、倾角和画面位置的照片共同
-约束相机内参 ``K``、五个畸变参数 ``D=[k1,k2,p1,p2,k3]``，以及每张照片各自的
-姿态 ``rvec/tvec``。只拍一张正对镜头的棋盘，许多参数会彼此“冒充”，数值看似能拟合，
-换到画面边缘却不可信。
+约束相机内参 ``K``、所选模型的畸变参数 ``D``，以及每张照片各自的姿态 ``rvec/tvec``。
+标准模型使用 ``D=[k1,k2,p1,p2,k3]``；鱼眼模型使用独立的四参数模型。只拍一张正对镜头的棋盘，
+许多参数会彼此“冒充”，数值看似能拟合，换到画面边缘却不可信。
 
 本模块只保留不依赖目录与界面的计算。素材读取、异常帧剔除和结果提交由
 ``neuq_vision_calib.py`` 编排。背景知识见 ``KNOWLEDGE_GUIDE.md`` 第 3～6 节。
@@ -17,6 +17,7 @@ from typing import Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from . import camera_model as _camera_model
 from . import config
 
 SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
@@ -119,7 +120,7 @@ def detect_chessboard_partial(gray: np.ndarray,
     return None
 
 
-def _calibrate_once(obj_points, img_points, img_size):
+def _calibrate_once(obj_points, img_points, img_size, *, camera_model='standard'):
     """用当前全部观测跑一次标定，返回 ``(rms, K, D, rvecs, tvecs, ...)``。
 
     ``obj_points`` 是每张图对应的棋盘平面点（mm），``img_points`` 是同序角点（px），
@@ -131,6 +132,10 @@ def _calibrate_once(obj_points, img_points, img_size):
     优先用 calibrateCameraExtended 以拿到每张图的 RMS 与内参标准差；旧版 OpenCV
     没有这个接口时退回 calibrateCamera，此时这两个量以空数组代替。
     """
+    model = _camera_model.normalize_camera_model(camera_model)
+    if model == _camera_model.FISHEYE:
+        return _camera_model.calibrate_fisheye(obj_points, img_points, img_size)
+
     if hasattr(cv2, 'calibrateCameraExtended'):
         rms, K, D, rvecs, tvecs, std_int, _std_ext, per_view = cv2.calibrateCameraExtended(
             obj_points, img_points, img_size, None, None)
@@ -147,7 +152,8 @@ def _calibrate_once(obj_points, img_points, img_size):
 
 
 def report_reprojection_error(obj_points, img_points, rvecs, tvecs,
-                              K: np.ndarray, D: np.ndarray) -> float:
+                              K: np.ndarray, D: np.ndarray,
+                              camera_model: str = 'standard') -> float:
     """返回所有角点的平均欧氏重投影误差（px）。
 
     做法是把已知棋盘点按拟合出的 ``K/D/rvec/tvec`` 重新投回照片，再量预测点与实测
@@ -161,7 +167,8 @@ def report_reprojection_error(obj_points, img_points, rvecs, tvecs,
     total_err = 0.0
     total_pts = 0
     for objp, imgp, rvec, tvec in zip(obj_points, img_points, rvecs, tvecs, strict=True):
-        proj, _ = cv2.projectPoints(objp, rvec, tvec, K, D)
+        proj, _ = _camera_model.project_points(
+            objp, rvec, tvec, K, D, camera_model)
         diff = proj.reshape(-1, 2) - imgp.reshape(-1, 2)
         total_err += float(np.sum(np.linalg.norm(diff, axis=1)))
         total_pts += diff.shape[0]

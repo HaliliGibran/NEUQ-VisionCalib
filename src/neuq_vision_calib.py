@@ -70,6 +70,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from neuq_core import camera_model as _camera_model
 from neuq_core import config as _config
 from neuq_core.calibration import (  # noqa: F401
     SUBPIX_CRITERIA,
@@ -168,6 +169,7 @@ from neuq_core.lut import (  # noqa: F401
 # 当前工程的标定板规格。命令行 --board-squares / 网页上的规格卡片都会改它，
 # 之后素材导入、在线拍摄、相机标定、结果落盘全部读这一份，不再各留一套常量。
 BOARD: CheckerboardSpec = DEFAULT_BOARD
+CAMERA_MODEL = _camera_model.STANDARD
 
 
 def restore_board() -> CheckerboardSpec:
@@ -191,6 +193,58 @@ def restore_board() -> CheckerboardSpec:
                   f'{from_calib.label}')
         return from_calib
     return DEFAULT_BOARD
+
+
+def camera_model_meta() -> Optional[str]:
+    """Read the model recorded with calib.json; files without it are standard."""
+    if not CALIB_JSON.is_file():
+        return None
+    try:
+        data = json.loads(CALIB_JSON.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    check_schema(data, str(CALIB_JSON))
+    try:
+        return _camera_model.normalize_camera_model(data.get('camera_model'))
+    except ValueError as exc:
+        raise SystemExit(f'{CALIB_JSON} 的 camera_model 无效: {exc}') from None
+
+
+def restore_camera_model() -> str:
+    """Resolve the model from project settings, then calibration metadata, then legacy default."""
+    cfg = load_project_config()
+    if 'camera_model' in cfg:
+        try:
+            return _camera_model.normalize_camera_model(cfg['camera_model'])
+        except ValueError as exc:
+            raise SystemExit(f'{PROJECT_JSON_NAME} 的 camera_model 无效: {exc}') from None
+    saved = camera_model_meta()
+    if saved is not None:
+        if CALIB_JSON.is_file():
+            try:
+                data = json.loads(CALIB_JSON.read_text(encoding='utf-8'))
+            except (json.JSONDecodeError, OSError):
+                data = {}
+            if isinstance(data, dict) and 'camera_model' in data:
+                update_project_config(camera_model=saved)
+                print(f'相机模型已从 calib.json 迁移进 {PROJECT_JSON_NAME}: {saved}')
+        return saved
+    return _camera_model.STANDARD
+
+
+def configure_camera_model(model: Optional[str],
+                           persist: bool = False) -> str:
+    """Set the project camera model; a missing legacy value means standard."""
+    global CAMERA_MODEL
+    try:
+        CAMERA_MODEL = _camera_model.normalize_camera_model(model)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    if persist:
+        update_project_config(camera_model=CAMERA_MODEL)
+    return CAMERA_MODEL
 
 
 def configure_board(spec: CheckerboardSpec,
@@ -427,6 +481,7 @@ def configure_paths(root: Optional[Path] = None,
     # 棋盘规格属于项目级配置，随工程根一起重新解析。
     # 不写回盘：这是"读配置"，不是"用户改了设置"。
     configure_board(restore_board())
+    configure_camera_model(restore_camera_model())
 
 
 # ================================================================ 相机标定
@@ -603,7 +658,7 @@ def collect_calibration_views(board: Optional[CheckerboardSpec] = None,
 
 def fit_camera(obj_points, img_points, used, img_size, *, threshold=_USE_GLOBAL_THRESHOLD,
                iteration_callback=None, cancel_event: Optional[Event] = None,
-               verbose: bool = True):
+               verbose: bool = True, camera_model: Optional[str] = None):
     """标定，并在阈值给定时迭代剔除高误差视图。
 
     threshold 默认沿用 MAX_REPROJ_ERR；显式 None 表示不剔除。内部 LOOCV 可传入
@@ -630,13 +685,20 @@ def fit_camera(obj_points, img_points, used, img_size, *, threshold=_USE_GLOBAL_
       stop_reason — 达到 3 张下限仍有视图超限时的说明，否则为 None。
     """
     applied_threshold = MAX_REPROJ_ERR if threshold is _USE_GLOBAL_THRESHOLD else threshold
+    model = _camera_model.normalize_camera_model(
+        CAMERA_MODEL if camera_model is None else camera_model)
     dropped: List[Tuple[str, float]] = []
     first_pass: Optional[Tuple[List[str], np.ndarray]] = None
     stop_reason = None
     while True:
         _check_cancel(cancel_event)
-        rms, K, D, rvecs, tvecs, std_int, per_view = _calibrate_once(
-            obj_points, img_points, img_size)
+        if model == _camera_model.STANDARD:
+            # Preserve the existing standard-model call contract for integrations and tests.
+            rms, K, D, rvecs, tvecs, std_int, per_view = _calibrate_once(
+                obj_points, img_points, img_size)
+        else:
+            rms, K, D, rvecs, tvecs, std_int, per_view = _calibrate_once(
+                obj_points, img_points, img_size, camera_model=model)
         _check_cancel(cancel_event)
         if first_pass is None:
             first_pass = ([p.name for p in used], np.asarray(per_view, dtype=np.float64))
@@ -645,7 +707,7 @@ def fit_camera(obj_points, img_points, used, img_size, *, threshold=_USE_GLOBAL_
                 'rms': float(rms), 'K': K, 'D': D, 'rvecs': rvecs, 'tvecs': tvecs,
                 'std_int': std_int, 'per_view': np.asarray(per_view, dtype=np.float64),
                 'obj_points': list(obj_points), 'img_points': list(img_points),
-                'used': list(used), 'dropped': list(dropped),
+                'used': list(used), 'dropped': list(dropped), 'camera_model': model,
             })
         if applied_threshold is None or per_view.size == 0:
             break
@@ -718,6 +780,7 @@ def _evaluate_calibration_fold(task: dict, *, cancel_event=None,
     train_img = task['train_img']
     train_used = task['train_used']
     img_size = task['img_size']
+    model = task.get('camera_model', _camera_model.STANDARD)
     heldout_obj = task['heldout_obj']
     heldout_img = task['heldout_img']
 
@@ -743,7 +806,7 @@ def _evaluate_calibration_fold(task: dict, *, cancel_event=None,
     # 后面不用为每个保留数量再次从头运行同一串 calibrateCamera。
     fit_camera(train_obj, train_img, train_used, img_size,
                threshold=-math.inf, iteration_callback=record_model,
-               cancel_event=cancel_event, verbose=False)
+               cancel_event=cancel_event, verbose=False, camera_model=model)
     if len(fold_path) != total_views - 3:
         raise ValueError('OpenCV 未提供完整训练折逐视图 RMS，无法进行 LOOCV。')
     if any(len(model['per_view']) != len(model['used']) for model in fold_path):
@@ -792,13 +855,14 @@ def _evaluate_calibration_fold(task: dict, *, cancel_event=None,
                     geometry_regressions = calibration_filter_geometry_regressions(
                         baseline_diagnostics, candidate_diagnostics)
                 _check_cancel(cancel_event)
-                success, rvec, tvec = cv2.solvePnP(
+                success, rvec, tvec = _camera_model.solve_pnp(
                     np.asarray(heldout_obj, dtype=np.float32),
                     np.asarray(heldout_img, dtype=np.float32),
-                    model['K'], model['D'], flags=cv2.SOLVEPNP_ITERATIVE)
+                    model['K'], model['D'], camera_model=model['camera_model'])
                 if success:
-                    projected, _jacobian = cv2.projectPoints(
-                        heldout_obj, rvec, tvec, model['K'], model['D'])
+                    projected, _jacobian = _camera_model.project_points(
+                        heldout_obj, rvec, tvec, model['K'], model['D'],
+                        model['camera_model'])
                     delta = (projected.reshape(-1, 2)
                              - np.asarray(heldout_img).reshape(-1, 2))
                     error = float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
@@ -913,7 +977,8 @@ def assess_calibration_filter(obj_points: Sequence[np.ndarray],
                               img_points: Sequence[np.ndarray], used: Sequence[Path],
                               img_size: Tuple[int, int], *,
                               progress_callback=None,
-                              cancel_event: Optional[Event] = None) -> dict:
+                              cancel_event: Optional[Event] = None,
+                              camera_model: Optional[str] = None) -> dict:
     """用逐折 LOOCV 比较保留数量策略，并验证全数据可执行阈值。
 
     候选由“保留 N、N-1、……、4 张”定义。每个 fold 只用 N-1 张训练照片，从头
@@ -926,6 +991,8 @@ def assess_calibration_filter(obj_points: Sequence[np.ndarray],
     重复标定。每个 OpenCV 标定完成后检查取消信号。
     """
     total_views = len(used)
+    model = _camera_model.normalize_camera_model(
+        CAMERA_MODEL if camera_model is None else camera_model)
     if total_views < 4:
         raise ValueError('LOOCV 至少需要 4 张有效棋盘照片；当前数学标定下限仍为 3 张。')
 
@@ -961,6 +1028,7 @@ def assess_calibration_filter(obj_points: Sequence[np.ndarray],
             'img_size': img_size,
             'heldout_obj': obj_points[heldout_index],
             'heldout_img': img_points[heldout_index],
+            'camera_model': model,
         })
 
     cv_total = len(candidates) * total_views
@@ -1039,7 +1107,7 @@ def assess_calibration_filter(obj_points: Sequence[np.ndarray],
 
     fit_camera(obj_points, img_points, used, img_size, threshold=-math.inf,
                iteration_callback=record_full_model, cancel_event=cancel_event,
-               verbose=False)
+               verbose=False, camera_model=model)
     if len(full_path) != path_total or any(
             len(model['per_view']) != len(model['used']) for model in full_path):
         raise ValueError('OpenCV 未提供完整逐视图 RMS，无法反推并复核正式阈值。')
@@ -1076,7 +1144,7 @@ def assess_calibration_filter(obj_points: Sequence[np.ndarray],
         try:
             replay = fit_camera(obj_points, img_points, used, img_size,
                                 threshold=threshold_value, cancel_event=cancel_event,
-                                verbose=False)
+                                verbose=False, camera_model=model)
         except CalibrationCancelled:
             raise
         except (cv2.error, ValueError, RuntimeError):
@@ -1127,7 +1195,8 @@ def assess_calibration_filter(obj_points: Sequence[np.ndarray],
     }
 
 
-def calibrate_camera(board: Optional[CheckerboardSpec] = None
+def calibrate_camera(board: Optional[CheckerboardSpec] = None,
+                     camera_model: Optional[str] = None
                      ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], dict]:
     """运行完整棋盘标定阶段，返回 ``(K, D, (W, H), fit_result)``。
 
@@ -1143,17 +1212,20 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
     只是精度和 provenance 都对不上。要换板子，就得按新规格重新导入。
     """
     spec = BOARD if board is None else board
+    model = _camera_model.normalize_camera_model(
+        CAMERA_MODEL if camera_model is None else camera_model)
     views = collect_calibration_views(spec)
     obj_points, img_points, used = views.obj_points, views.img_points, views.used
     img_size, file_count = views.img_size, views.file_count
 
     (rms, K, D, rvecs, tvecs, per_view, std_int,
      obj_points, img_points, used, dropped, first_pass, stop_reason) = fit_camera(
-        obj_points, img_points, used, img_size)
+        obj_points, img_points, used, img_size, camera_model=model)
 
     first_names, first_errors = first_pass if first_pass else ([], np.array([]))
     recommendation = recommend_reprojection_threshold(first_errors)
-    mean_err = report_reprojection_error(obj_points, img_points, rvecs, tvecs, K, D)
+    mean_err = report_reprojection_error(
+        obj_points, img_points, rvecs, tvecs, K, D, camera_model=model)
     diagnostics = diagnose_calibration_views(
         img_points, obj_points, rvecs, tvecs, K, std_int, img_size,
         [path.name for path in used], per_view)
@@ -1172,6 +1244,7 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
         'recommendation_status': recommendation['status'],
         'diagnostics': diagnostics,
         'opencv_version': str(cv2.__version__),
+        'camera_model': model,
         # 第一轮尚未剔除任何视图时的误差，供阈值预览与推荐值使用。
         'all_names': list(first_names),
         'all_errors': np.asarray(first_errors, dtype=np.float64).tolist(),
@@ -1193,7 +1266,8 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
 
     # 标定数据与去畸变预览作为**一套**一起提交：两者都描述同一份 K/D，
     # 不能一个换成新的、另一个还留着旧的。详见 commit_calibration。
-    commit_calibration(K, D, img_size, used, board=spec, fit_result=fit_result)
+    commit_calibration(K, D, img_size, used, board=spec, fit_result=fit_result,
+                       camera_model=model)
 
     # 返回值从 3 元组扩到 4 元组：前三个保留旧签名给命令行路径用，
     # 第四个 fit_result 是给 Web 端画柱状图用的逐帧数据。
@@ -1201,37 +1275,42 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
 
 
 def render_undistort_previews(files: List[Path], K: np.ndarray, D: np.ndarray,
-                              img_size: Tuple[int, int], out_dir: Path) -> None:
+                              img_size: Tuple[int, int], out_dir: Path,
+                              camera_model: Optional[str] = None) -> None:
     """把参与标定的每张图去畸变后写进 out_dir，等价 cameraCalibrator 的 Show Undistorted。
 
     只负责渲染，不做任何换装——目录事务归 commit_calibration 统一管。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    Knew = resolve_new_camera_matrix(K, D, img_size)
+    model = _camera_model.normalize_camera_model(
+        CAMERA_MODEL if camera_model is None else camera_model)
+    Knew = resolve_new_camera_matrix(K, D, img_size, model)
     for path in files:
         img = safe_imread(path)
         if img is None:
             continue
-        undist = cv2.undistort(img, K, D, None, Knew)
+        undist = _camera_model.undistort_image(img, K, D, Knew, model)
         safe_imwrite(out_dir / f'{path.stem}_undist.jpg', undist)
 
 
 def resolve_new_camera_matrix(K: np.ndarray, D: np.ndarray,
-                              img_size: Tuple[int, int]) -> np.ndarray:
+                              img_size: Tuple[int, int],
+                              camera_model: Optional[str] = None) -> np.ndarray:
     """按 UNDIST_ALPHA 决定去畸变输出像素坐标系的内参 ``Knew``。
 
     ``K`` 描述原始相机像素；``Knew`` 还决定去畸变图保留多少视野、是否出现黑边。
     IPM 四点是在这张去畸变图上选的，因此 K/D 不变而 Knew 改变时，旧四点照样失效。
     """
-    if UNDIST_ALPHA is None:
-        return K.copy()
-    Knew, _roi = cv2.getOptimalNewCameraMatrix(K, D, img_size, float(UNDIST_ALPHA), img_size)
-    return np.asarray(Knew, dtype=np.float64)
+    model = _camera_model.normalize_camera_model(
+        CAMERA_MODEL if camera_model is None else camera_model)
+    return _camera_model.estimate_new_camera_matrix(
+        K, D, img_size, UNDIST_ALPHA, model)
 
 
 def calibration_payload(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
                         board: Optional[CheckerboardSpec] = None,
-                        fit_result: Optional[dict] = None) -> dict:
+                        fit_result: Optional[dict] = None,
+                        camera_model: Optional[str] = None) -> dict:
     """组装 calib.json 的内容：内参、畸变系数、标定分辨率、板规格与 provenance。
 
     board 显式传入时以它为准：provenance 必须跟着"实际用于标定的那块板"走，
@@ -1239,12 +1318,16 @@ def calibration_payload(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
     落盘的就会是 A 的参数配 B 的规格。
     """
     spec = BOARD if board is None else board
-    Knew = resolve_new_camera_matrix(K, D, img_size)
+    model = _camera_model.normalize_camera_model(
+        (fit_result or {}).get('camera_model', CAMERA_MODEL)
+        if camera_model is None else camera_model)
+    Knew = resolve_new_camera_matrix(K, D, img_size, model)
     payload = {
         'image_width': int(img_size[0]),
         'image_height': int(img_size[1]),
         'camera_matrix': K.tolist(),
         'dist_coeffs': D.tolist(),
+        'camera_model': model,
         'schema_version': SCHEMA_VERSION,
         'tool_version': TOOL_VERSION,
         'board': spec.to_dict(),
@@ -1253,7 +1336,7 @@ def calibration_payload(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
         'square_size_mm': spec.square_size_mm,
         # 这一份几何基准的指纹。下游（ipm_state / matrices）记同一个值，
         # 重标之后对不上就知道旧四点与旧表已经不属于当前标定。
-        'calibration_basis_hash': calibration_basis_hash(K, D, Knew, img_size),
+        'calibration_basis_hash': calibration_basis_hash(K, D, Knew, img_size, model),
     }
     payload.update(calibration_provenance(fit_result))
     return payload
@@ -1261,7 +1344,8 @@ def calibration_payload(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
 
 def commit_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
                        used: List[Path], board: Optional[CheckerboardSpec] = None,
-                       fit_result: Optional[dict] = None) -> None:
+                       fit_result: Optional[dict] = None,
+                       camera_model: Optional[str] = None) -> None:
     """把 calib.json 与全部去畸变预览作为**一个事务**提交。
 
     如果只把 calib_preview/ 整体换装，会留下一个窗口：预览已经换成 B 的了，
@@ -1287,8 +1371,9 @@ def commit_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
         else:
             data_stage.mkdir(parents=True, exist_ok=True)
         write_json_atomic(data_stage / CALIB_JSON.name,
-                          calibration_payload(K, D, img_size, board, fit_result))
-        render_undistort_previews(used, K, D, img_size, prev_stage)
+                          calibration_payload(K, D, img_size, board, fit_result,
+                                              camera_model))
+        render_undistort_previews(used, K, D, img_size, prev_stage, camera_model)
     except BaseException:
         # 本轮没准备完：两个暂存区一起作废，正式目录一个字节都没动过
         for stage in (data_stage, prev_stage):
@@ -1302,8 +1387,9 @@ def commit_calibration(K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int],
 
 
 def calibration_basis_hash(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
-                           img_size: Tuple[int, int]) -> str:
-    """标定几何基准的指纹：SHA256(canonical_json(K, D, Knew, image_size))。
+                           img_size: Tuple[int, int],
+                           camera_model: Optional[str] = None) -> str:
+    """Hash K/D/Knew, resolution and camera model as one geometry basis.
 
     刻意**不是**对 calib.json 整个文件取哈希：provenance 字段（RMS、用了哪些图、
     OpenCV 版本）变了并不改变几何，不该让下游全部失效。
@@ -1317,6 +1403,8 @@ def calibration_basis_hash(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
         'D': np.asarray(D, dtype=np.float64).ravel().tolist(),
         'Knew': np.asarray(Knew, dtype=np.float64).reshape(3, 3).tolist(),
         'image_size': [int(img_size[0]), int(img_size[1])],
+        'camera_model': _camera_model.normalize_camera_model(
+            CAMERA_MODEL if camera_model is None else camera_model),
     }, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
 
@@ -1324,13 +1412,26 @@ def calibration_basis_hash(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
 def current_calibration_basis() -> Optional[str]:
     """当前工程的标定基准指纹；标定数据读不出来时返回 None。"""
     try:
-        K, D, img_size = load_calibration()
+        K, D, img_size, model = load_calibration_with_model()
     except (SystemExit, OSError, ValueError, KeyError, TypeError, IndexError):
         return None
     if K is None or D is None or not img_size:
         return None
-    return calibration_basis_hash(K, D, resolve_new_camera_matrix(K, D, img_size),
-                                  img_size)
+    return calibration_basis_hash(
+        K, D, resolve_new_camera_matrix(K, D, img_size, model), img_size, model)
+
+
+def _legacy_standard_calibration_basis_hash(K: np.ndarray, D: np.ndarray,
+                                            Knew: np.ndarray,
+                                            img_size: Tuple[int, int]) -> str:
+    """Read-only compatibility for pre-model standard-camera exports."""
+    canonical = json.dumps({
+        'K': np.asarray(K, dtype=np.float64).reshape(3, 3).tolist(),
+        'D': np.asarray(D, dtype=np.float64).ravel().tolist(),
+        'Knew': np.asarray(Knew, dtype=np.float64).reshape(3, 3).tolist(),
+        'image_size': [int(img_size[0]), int(img_size[1])],
+    }, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
 
 
 def calibration_basis_stale(recorded: Optional[str]) -> Optional[str]:
@@ -1340,12 +1441,22 @@ def calibration_basis_stale(recorded: Optional[str]) -> Optional[str]:
     但把"要不要重做"留给用户。老产物没有这个字段时也算不可判定，同样要拦：
     老产物没有这个字段时也无法证明它属于当前标定。
     """
-    current = current_calibration_basis()
-    if current is None:
+    try:
+        K, D, img_size, model = load_calibration_with_model()
+    except (SystemExit, OSError, ValueError, KeyError, TypeError, IndexError):
+        K = D = img_size = model = None
+    if K is None or D is None or not img_size:
         return '读不出当前的相机标定数据，无法确认这份产物属于哪一次标定'
     if not recorded:
         return ('这份产物没有记录它对应的相机标定（早期版本导出的），'
                 '无法确认它属于当前标定')
+    Knew = resolve_new_camera_matrix(K, D, img_size, model)
+    current = calibration_basis_hash(K, D, Knew, img_size, model)
+    if recorded == current:
+        return None
+    if (model == _camera_model.STANDARD
+            and recorded == _legacy_standard_calibration_basis_hash(K, D, Knew, img_size)):
+        return None
     if recorded != current:
         return ('相机标定已变化，这份产物属于上一次标定'
                 f'（产物记 {recorded[:12]}…，当前 {current[:12]}…）')
@@ -1413,8 +1524,9 @@ def calib_board_meta() -> Optional[dict]:
     return None
 
 
-def load_calibration() -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int]]]:
-    """载入 calib.json，文件不存在时返回 None。
+def load_calibration_with_model(
+        ) -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int], str]]:
+    """载入 calib.json 与相机模型；缺少 camera_model 的旧文件按标准模型读取。
 
     这个文件允许用户手工从 MATLAB 导出，所以不能假定字段齐全：缺键或形状不对时
     给出明确提示而不是抛 KeyError/ValueError 崩栈。
@@ -1446,16 +1558,25 @@ def load_calibration() -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int]
         K = np.asarray(data['camera_matrix'], dtype=np.float64).reshape(3, 3)
         D = np.asarray(data['dist_coeffs'], dtype=np.float64).ravel()
         img_size = (int(data['image_width']), int(data['image_height']))
+        model = _camera_model.normalize_camera_model(data.get('camera_model'))
     except (ValueError, TypeError) as exc:
         raise SystemExit(f'{CALIB_JSON} 字段格式不正确: {exc}') from None
 
     if D.size == 0:
         raise SystemExit(f'{CALIB_JSON} 的 dist_coeffs 为空。')
+    if model == _camera_model.FISHEYE and D.size != 4:
+        raise SystemExit(f'{CALIB_JSON} 的鱼眼畸变系数应为 4 个，当前 {D.size} 个。')
     if img_size[0] <= 0 or img_size[1] <= 0:
         raise SystemExit(f'{CALIB_JSON} 的分辨率非法: {img_size[0]}x{img_size[1]}')
 
-    print(f'已载入标定数据: {CALIB_JSON}（{img_size[0]}x{img_size[1]}）')
-    return K, D, img_size
+    print(f'已载入标定数据: {CALIB_JSON}（{img_size[0]}x{img_size[1]}，{model}）')
+    return K, D, img_size, model
+
+
+def load_calibration() -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int]]]:
+    """Backward-compatible 3-value loader; old calib.json files default to standard."""
+    loaded = load_calibration_with_model()
+    return None if loaded is None else loaded[:3]
 
 
 # ================================================================ 逆透视几何
@@ -1945,7 +2066,8 @@ def table_convention_text() -> str:
 
 def export_matrices(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                     H: np.ndarray, extra: dict,
-                    matrix_root: Optional[Path] = None) -> None:
+                    matrix_root: Optional[Path] = None,
+                    camera_model: Optional[str] = None) -> None:
     """导出六矩阵、畸变系数与坐标约定，并写高精度文本便于粘贴。
 
     这一步只保存可由矩阵表达的部分：K/Knew、H 及其逆。镜头畸变随半径非线性变化，
@@ -1953,6 +2075,8 @@ def export_matrices(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
     ``extra`` 还携带比例尺、锚点、参考原点与来源指纹，使矩阵离开当前进程仍可解释。
     """
     out_dir = Path(matrix_root) if matrix_root is not None else DIR_MATRIX
+    model = _camera_model.normalize_camera_model(
+        CAMERA_MODEL if camera_model is None else camera_model)
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         'schema_version': SCHEMA_VERSION,
@@ -1960,6 +2084,7 @@ def export_matrices(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
         # 这份矩阵是哪块棋盘标出来的 —— 以 calib.json 记录的为准，
         # 而不是当次的全局变量：provenance 要跟着标定结果走。
         'board': (spec_from_meta(calib_board_meta()) or BOARD).to_dict(),
+        'camera_model': model,
         'note': (
             '去畸变的非线性部分由 dist_coeffs 承载，无法写成矩阵；'
             f'因此原图->BirdView 的复合变换只以查表形式给出，见 {DIR_TABLE.name}/undistort/ '
@@ -2190,7 +2315,8 @@ def prepare_map_pair(map_x: np.ndarray, map_y: np.ndarray,
     return MapPair(x=x, y=y, source_size=source_size)
 
 
-def serialize_map_pair(pair: MapPair, out_dir: Path, tag: str, desc: str) -> None:
+def serialize_map_pair(pair: MapPair, out_dir: Path, tag: str, desc: str,
+                       camera_model: Optional[str] = None) -> None:
     """把 MapPair 写成文件，并附一份自描述的 metadata.json。
 
     只做序列化，不再改动任何数值。
@@ -2215,6 +2341,8 @@ def serialize_map_pair(pair: MapPair, out_dir: Path, tag: str, desc: str) -> Non
     meta = {
         'schema_version': SCHEMA_VERSION,
         'tool_version': TOOL_VERSION,
+        'camera_model': _camera_model.normalize_camera_model(
+            CAMERA_MODEL if camera_model is None else camera_model),
         'format': TABLE_FORMAT,
         'tag': tag,
         'description': desc,
@@ -2354,7 +2482,8 @@ def report_table_size(out_dir: Path, shape: Tuple[int, int]) -> None:
 
 def export_undistort_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                             size: Tuple[int, int],
-                            table_root: Optional[Path] = None) -> MapPair:
+                            table_root: Optional[Path] = None,
+                            camera_model: Optional[str] = None) -> MapPair:
     """导出去畸变这一类查找表，含正向、反向两组 LUT；返回可直接 remap 的最终 reverse 表。
 
     reverse 的索引是 Knew 去畸变图像素，值是原始畸变图采样坐标；forward 正好反向。
@@ -2362,18 +2491,20 @@ def export_undistort_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
     """
     out_dir = (Path(table_root) if table_root is not None else DIR_TABLE) / 'undistort'
     w, h = size
+    model = _camera_model.normalize_camera_model(
+        CAMERA_MODEL if camera_model is None else camera_model)
 
-    map_x, map_y = cv2.initUndistortRectifyMap(K, D, None, Knew, size, cv2.CV_32FC1)
+    map_x, map_y = _camera_model.init_undistort_rectify_map(K, D, Knew, size, model)
     rev = mask_out_of_range(np.column_stack((map_x.ravel(), map_y.ravel())), size)
-    fwd = mask_out_of_range(undistorted_grid(K, D, Knew, size), size)
+    fwd = mask_out_of_range(undistorted_grid(K, D, Knew, size, model), size)
 
     # 先加工成最终交付的那一份，再序列化：写盘与后续测试同源
     rev_pair = prepare_map_pair(rev[:, 0].reshape(h, w), rev[:, 1].reshape(h, w), size)
     fwd_pair = prepare_map_pair(fwd[:, 0].reshape(h, w), fwd[:, 1].reshape(h, w), size)
     serialize_map_pair(rev_pair, out_dir / 'reverse', 'undistort_reverse',
-                       '去畸变 反向表（去畸变图像素 -> 原始畸变图采样坐标）')
+                       '去畸变 反向表（去畸变图像素 -> 原始畸变图采样坐标）', model)
     serialize_map_pair(fwd_pair, out_dir / 'forward', 'undistort_forward',
-                       '去畸变 正向表（原始畸变图像素 -> 去畸变图落点）')
+                       '去畸变 正向表（原始畸变图像素 -> 去畸变图落点）', model)
 
     print('去畸变表已写入:', out_dir)
     report_table_size(out_dir, rev_pair.size)
@@ -2383,7 +2514,8 @@ def export_undistort_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
 def export_composite_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                             H: np.ndarray, H0: np.ndarray, sign: float,
                             size: Tuple[int, int],
-                            table_root: Optional[Path] = None) -> MapPair:
+                            table_root: Optional[Path] = None,
+                            camera_model: Optional[str] = None) -> MapPair:
     """导出去畸变+逆透视这一类查找表，含正向、反向两组 LUT；返回最终交付的 reverse 表。
 
     reverse 把“逆 H + 镜头正向畸变”预先合成，因此嵌入式端一次 ``remap`` 就能从
@@ -2392,9 +2524,11 @@ def export_composite_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
     """
     out_dir = (Path(table_root) if table_root is not None else DIR_TABLE) / 'undistort_ipm'
     w, h = size
+    model = _camera_model.normalize_camera_model(
+        CAMERA_MODEL if camera_model is None else camera_model)
 
-    map_x, map_y = build_composite_reverse_map(K, D, Knew, H, H0, sign, size)
-    und = undistorted_grid(K, D, Knew, size)
+    map_x, map_y = build_composite_reverse_map(K, D, Knew, H, H0, sign, size, model)
+    und = undistorted_grid(K, D, Knew, size, model)
     # 与反向表同一判据：地平线另一侧的源图像素经 H 会得到符号翻转的镜像落点，
     # 地平线附近则得到 1e15 量级的坐标，两者都必须标成无效而不是原样写出去。
     valid = np.isfinite(und).all(axis=1)
@@ -2404,9 +2538,9 @@ def export_composite_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
     rev_pair = prepare_map_pair(map_x, map_y, size)
     fwd_pair = prepare_map_pair(fwd[:, 0].reshape(h, w), fwd[:, 1].reshape(h, w), size)
     serialize_map_pair(rev_pair, out_dir / 'reverse', 'undistort_ipm_reverse',
-                       '逆透视 反向表（BirdView 输出像素 -> 原始畸变图采样坐标）')
+                       '逆透视 反向表（BirdView 输出像素 -> 原始畸变图采样坐标）', model)
     serialize_map_pair(fwd_pair, out_dir / 'forward', 'undistort_ipm_forward',
-                       '逆透视 正向表（原始畸变图像素 -> BirdView 落点）')
+                       '逆透视 正向表（原始畸变图像素 -> BirdView 落点）', model)
 
     print('去畸变逆透视表已写入:', out_dir)
     report_table_size(out_dir, rev_pair.size)
@@ -2416,7 +2550,8 @@ def export_composite_tables(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
 def export_all(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                H: np.ndarray, H0: np.ndarray, sign: float, extra: dict,
                size: Tuple[int, int],
-               ipm_state: Optional[dict] = None) -> MapPair:
+               ipm_state: Optional[dict] = None,
+               camera_model: Optional[str] = None) -> MapPair:
     """事务式导出六个矩阵、逆透视状态和两类查找表（去畸变、去畸变+逆透视），
     每类各含正向/反向，共 4 组 LUT；只有全部成功才落到正式目录。
 
@@ -2444,6 +2579,8 @@ def export_all(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
     # 但它发生在矩阵已经写进暂存区之后，日志上会先冒出一句"六矩阵已保存"再报错，
     # 读起来像是写坏了一半。提前拦一次纯粹为了这句话不误导人。
     downsample_factor(size, TABLE_SIZE)
+    model = _camera_model.normalize_camera_model(
+        CAMERA_MODEL if camera_model is None else camera_model)
 
     table_stage = DIR_TABLE.with_name(DIR_TABLE.name + '.staging')
     matrix_stage = DIR_MATRIX.with_name(DIR_MATRIX.name + '.staging')
@@ -2453,13 +2590,15 @@ def export_all(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
             shutil.copytree(target, stage, dirs_exist_ok=True)
 
     try:
-        export_matrices(K, D, Knew, H, extra, matrix_root=matrix_stage)
+        export_matrices(K, D, Knew, H, extra, matrix_root=matrix_stage,
+                        camera_model=model)
         if ipm_state is not None:
             (matrix_stage / 'ipm_state.json').write_text(
                 json.dumps(ipm_state, indent=2, ensure_ascii=False), encoding='utf-8')
-        export_undistort_tables(K, D, Knew, size, table_root=table_stage)
+        export_undistort_tables(K, D, Knew, size, table_root=table_stage,
+                                camera_model=model)
         pair = export_composite_tables(K, D, Knew, H, H0, sign, size,
-                                       table_root=table_stage)
+                                       table_root=table_stage, camera_model=model)
     except BaseException:
         # 任何一步出问题：丢掉暂存区，正式目录一个字节都没动过
         shutil.rmtree(table_stage, ignore_errors=True)
@@ -2625,6 +2764,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          help='单格边长毫米；不给则沿用当前工程里存的规格')
 
     cal_g = ap.add_argument_group('标定参数')
+    cal_g.add_argument('--camera-model', choices=_camera_model.CAMERA_MODELS,
+                       help='相机模型：standard（默认）或 fisheye；切换后会按新模型重新标定')
     cal_g.add_argument('--force-calib', action='store_true',
                        help='忽略已有的 calib.json，重新标定（换了标定板时必须）')
     cal_g.add_argument('--undist-alpha', type=float,
@@ -2689,6 +2830,10 @@ def apply_options(args: argparse.Namespace) -> None:
             raise SystemExit(f'标定板规格不合法: {exc}') from None
         configure_board(board, persist=True)
         print(f'标定板规格: {board.label}')
+
+    if args.camera_model is not None:
+        configure_camera_model(args.camera_model, persist=True)
+        print(f'相机模型: {CAMERA_MODEL}')
 
     if args.undist_alpha is not None:
         UNDIST_ALPHA = args.undist_alpha
@@ -3299,7 +3444,8 @@ def run_ipm_calibration(src: np.ndarray, img_size: Tuple[int, int],
 
 
 def rebuild_reverse_map_from_state(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
-                                   img_size: Tuple[int, int]) -> MapPair:
+                                   img_size: Tuple[int, int],
+                                   camera_model: Optional[str] = None) -> MapPair:
     """从 ipm_state.json 重建 BirdView 反向表（已加工成最终交付形态）。"""
     state = load_ipm_state()
     if state is None:
@@ -3312,7 +3458,9 @@ def rebuild_reverse_map_from_state(K: np.ndarray, D: np.ndarray, Knew: np.ndarra
     H = np.asarray(state['H'], dtype=np.float64).reshape(3, 3)
     H0 = np.asarray(state['H0'], dtype=np.float64).reshape(3, 3)
     sign = float(state.get('horizon_sign', 1.0))
-    map_x, map_y = build_composite_reverse_map(K, D, Knew, H, H0, sign, img_size)
+    model = _camera_model.normalize_camera_model(
+        CAMERA_MODEL if camera_model is None else camera_model)
+    map_x, map_y = build_composite_reverse_map(K, D, Knew, H, H0, sign, img_size, model)
     return prepare_map_pair(map_x, map_y, img_size)
 
 
@@ -3342,21 +3490,28 @@ def load_exported_reverse_pair(img_size: Tuple[int, int]) -> MapPair:
     return load_map_pair(folder, img_size, grid, fixed_point)
 
 
-def load_or_run_calibration(force: bool = False
-                            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]:
-    """取得 (K, D, Knew, img_size)：calib.json 提供 K/D，Knew 按当前参数现场计算。
+def load_or_run_calibration_with_model(
+        force: bool = False, camera_model: Optional[str] = None
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int], str]:
+    """取得 (K, D, Knew, img_size, camera_model)，缺结果时现场标定。
 
     没有 calib.json 时才现场标定并落盘。复用之前会先核对标定板规格：已有文件若是
     用另一块棋盘标的，
     直接复用会让后面写出的 matrices.json 记上错误的 provenance
     （K/D 来自旧棋盘，board 段却写着新棋盘）。这种情况一律要求显式重标。
     """
-    calib = None if force else load_calibration()
+    model = _camera_model.normalize_camera_model(
+        CAMERA_MODEL if camera_model is None else camera_model)
+    calib = None if force else load_calibration_with_model()
     if calib is not None:
+        K, D, img_size, stored_model = calib
+        if stored_model != model:
+            raise SystemExit(
+                f'当前选择的是 {model} 模型，但已有 calib.json 使用 {stored_model} 模型。'
+                '请在相机标定页选择「强制重新标定」后再继续。')
         conflict = board_conflict(calib_board_meta())
         if conflict:
             raise SystemExit(conflict)
-        K, D, img_size = calib
     else:
         if force:
             print('按要求忽略已有 calib.json，重新标定。')
@@ -3365,11 +3520,17 @@ def load_or_run_calibration(force: bool = False
         spec = BOARD          # 显式捕获：provenance 跟着本次实际用的板走
         # calib.json 与 calib_preview/ 由 calibrate_camera 内部作为一个事务提交，
         # 这里不再单独写一次——分两步就会留下"新预览 + 旧 calib.json"的窗口。
-        K, D, img_size, _fit = calibrate_camera(board=spec)
-    Knew = resolve_new_camera_matrix(K, D, img_size)
+        K, D, img_size, _fit = calibrate_camera(board=spec, camera_model=model)
+    Knew = resolve_new_camera_matrix(K, D, img_size, model)
     assert_invertible('K', K)
     assert_invertible('Knew', Knew)
-    return K, D, Knew, img_size
+    return K, D, Knew, img_size, model
+
+
+def load_or_run_calibration(force: bool = False
+                            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]:
+    """Backward-compatible loader returning (K, D, Knew, img_size)."""
+    return load_or_run_calibration_with_model(force=force)[:4]
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -3407,7 +3568,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if CAPTURE_ONLINE:
         capture_calibration_images()
 
-    K, D, Knew, img_size = load_or_run_calibration(force=args.force_calib)
+    model_changed = (args.camera_model is not None
+                     and camera_model_meta() != CAMERA_MODEL)
+    K, D, Knew, img_size, model = load_or_run_calibration_with_model(
+        force=args.force_calib or model_changed, camera_model=CAMERA_MODEL)
 
     if stage == 'test':
         # 优先用真正落盘的那份表；表不在（或被删了）才退回按状态重算。
@@ -3420,7 +3584,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             print(f'未使用已导出的表（{exc}），改为按 ipm_state.json 重算。')
             require_calibration_basis((load_ipm_state() or {}).get('calibration_basis_hash'),
                                       'ipm_state.json 也不可用')
-            pair = rebuild_reverse_map_from_state(K, D, Knew, img_size)
+            pair = rebuild_reverse_map_from_state(K, D, Knew, img_size, model)
         batch_test(pair)
         print('\n批量测试完成。')
         return
@@ -3446,7 +3610,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                           dict(state,
                                max_range_cm=MAX_RANGE_CM,
                                max_lateral_cm=MAX_LATERAL_CM),
-                          img_size)
+                          img_size, camera_model=model)
         batch_test(pair)
         print('\n全部完成（复用已有逆透视标定）。')
         return
@@ -3463,7 +3627,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print('逆透视标定原图:', src_path)
     src = normalize_camera_image(src, img_size, '逆透视标定原图')
 
-    undist = cv2.undistort(src, K, D, None, Knew)
+    undist = _camera_model.undistort_image(src, K, D, Knew, model)
     safe_imwrite(UNDIST_RESULT, undist)
     print('去畸变图已保存:', UNDIST_RESULT)
 
@@ -3503,7 +3667,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         'max_range_cm': MAX_RANGE_CM,
         'max_lateral_cm': MAX_LATERAL_CM,
         'calibration_basis_hash': current_calibration_basis(),
-    }, **ground_origin_meta(calibrator)), img_size, ipm_state=ipm_state)
+    }, **ground_origin_meta(calibrator)), img_size, ipm_state=ipm_state,
+        camera_model=model)
 
     # 导出已经成功，这时才写结果图：它和矩阵、查找表属于同一批产物
     safe_imwrite(IPM_RESULT, calibrator.birdview)

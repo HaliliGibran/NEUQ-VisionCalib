@@ -16,6 +16,7 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+from . import camera_model as _camera_model
 from .geometry import (
     DEN_EPS,
     apply_homography,
@@ -196,7 +197,8 @@ def mask_out_of_range(pts: np.ndarray, size: Tuple[int, int],
 
 
 def undistorted_grid(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
-                     size: Tuple[int, int]) -> np.ndarray:
+                     size: Tuple[int, int],
+                     camera_model: str = 'standard') -> np.ndarray:
     """计算 ``原始畸变像素 → Knew 去畸变像素`` 的 forward 点映射。
 
     索引点来自 ``size=(W,H)`` 的原始图，返回 ``(H*W, 2)``、单位 px。
@@ -204,11 +206,12 @@ def undistorted_grid(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
     它不能直接回答 reverse 渲染所需的“给理想输出点，去原图哪里取色”。
     """
     grid = pixel_grid(size).reshape(-1, 1, 2)
-    return cv2.undistortPoints(grid, K, D, P=Knew).reshape(-1, 2)
+    return _camera_model.undistort_points(grid, K, D, Knew, camera_model)
 
 
 def distort_points(pts_undist: np.ndarray, K: np.ndarray, D: np.ndarray,
-                   Knew: np.ndarray) -> np.ndarray:
+                   Knew: np.ndarray,
+                   camera_model: str = 'standard') -> np.ndarray:
     """计算 ``Knew 去畸变像素 → 原始畸变像素``，输入输出单位都是 px。
 
     去畸变不是一张全局 3×3 矩阵：径向位移含 ``r²/r⁴/r⁶``，会随点离主点的距离
@@ -219,13 +222,15 @@ def distort_points(pts_undist: np.ndarray, K: np.ndarray, D: np.ndarray,
     norm = apply_homography(np.linalg.inv(Knew), pts_undist)
     obj = np.column_stack((norm, np.ones(norm.shape[0])))
     zeros = np.zeros(3, dtype=np.float64)
-    proj, _ = cv2.projectPoints(obj.reshape(-1, 1, 3), zeros, zeros, K, D)
+    proj, _ = _camera_model.project_points(
+        obj.reshape(-1, 1, 3), zeros, zeros, K, D, camera_model)
     return proj.reshape(-1, 2)
 
 
 def build_composite_reverse_map(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
                                 H: np.ndarray, H0: np.ndarray, sign: float,
-                                size: Tuple[int, int]
+                                size: Tuple[int, int],
+                                camera_model: str = 'standard'
                                 ) -> Tuple[np.ndarray, np.ndarray]:
     """构建 ``BirdView 输出像素 → 原始畸变图采样坐标`` 的复合 reverse LUT。
 
@@ -250,7 +255,7 @@ def build_composite_reverse_map(K: np.ndarray, D: np.ndarray, Knew: np.ndarray,
 
     dist = np.full_like(und, np.nan)
     if valid.any():
-        dist[valid] = distort_points(und[valid], K, D, Knew)
+        dist[valid] = distort_points(und[valid], K, D, Knew, camera_model)
 
     dist = mask_out_of_range(dist, size, valid)
     return dist[:, 0].reshape(h, w), dist[:, 1].reshape(h, w)

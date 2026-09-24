@@ -14,6 +14,7 @@ from pathlib import Path
 TESTS = ('test_static_names.py', 'test_board_spec.py', 'test_calibration_threshold.py',
          'test_calibration_selection.py',
          'test_calibration_diagnostics.py', 'test_webui_state.py',
+         'test_camera_models.py',
          'test_lut_roundtrip.py', 'test_export_transaction.py',
          'test_release_packaging.py', 'test_gitee_redirect.py', 'test_gitee_upload.py')
 

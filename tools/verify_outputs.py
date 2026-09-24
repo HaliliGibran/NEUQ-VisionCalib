@@ -47,6 +47,7 @@ if str(_ROOT / 'src') not in sys.path:
     sys.path.insert(0, str(_ROOT / 'src'))
 
 import neuq_vision_calib as core  # noqa: E402
+from neuq_core import camera_model as camera_models  # noqa: E402
 
 VISIBLE_FRAC = 0.005  # 允许的"肉眼可见差异"像素占比（灰度差 > 8）
 
@@ -70,6 +71,7 @@ KNEW: np.ndarray | None = None               # 去畸变输出矩阵，来自 ma
 IS_TEXT_TABLE = True                         # 表格式是否为 %.2f 文本，影响量化容差
 SKIPPED = 0                                  # 因降采样而跳过的检查条数
 DIAGNOSED = 0                                # 只报告、不判定通过/失败的条数
+CAMERA_MODEL = 'standard'
 
 
 def undistort_reference(src: np.ndarray, K: np.ndarray, D: np.ndarray) -> np.ndarray:
@@ -78,7 +80,8 @@ def undistort_reference(src: np.ndarray, K: np.ndarray, D: np.ndarray) -> np.nda
     表的坐标是 build_composite_reverse_map 用 Knew 反投影出来的；若这里用 K
     去构造参考，只在 UNDIST_ALPHA 为 None（Knew == K）时才对得上。
     """
-    return cv2.undistort(src, K, D, None, K if KNEW is None else KNEW)
+    return camera_models.undistort_image(
+        src, K, D, K if KNEW is None else KNEW, CAMERA_MODEL)
 
 
 
@@ -214,9 +217,10 @@ def pipeline_composite_maps(calib: dict, matrices: dict) -> dict:
     sign = float(matrices['horizon_sign'])
     w, h = IMAGE_SIZE
 
-    rev = core.build_composite_reverse_map(K, D, Knew, H, H0, sign, IMAGE_SIZE)
+    model = camera_models.normalize_camera_model(calib.get('camera_model'))
+    rev = core.build_composite_reverse_map(K, D, Knew, H, H0, sign, IMAGE_SIZE, model)
 
-    und = core.undistorted_grid(K, D, Knew, IMAGE_SIZE)
+    und = core.undistorted_grid(K, D, Knew, IMAGE_SIZE, model)
     valid = np.isfinite(und).all(axis=1)
     valid &= sign * core.homography_denominator(H0, und) >= core.DEN_EPS
     fwd = core.mask_out_of_range(core.apply_homography(H, und), IMAGE_SIZE, valid)
@@ -659,6 +663,7 @@ def print_table_inventory(root: Path) -> None:
 def main() -> int:
     """入口。"""
     global FIXED_POINT, TABLE_SHAPE, IMAGE_SIZE, SKIPPED, IS_TEXT_TABLE, DIAGNOSED
+    global CAMERA_MODEL
 
     root = (Path(sys.argv[1]).resolve() if len(sys.argv) > 1
             else Path(__file__).resolve().parent.parent)
@@ -671,6 +676,8 @@ def main() -> int:
 
     calib = json.loads(calib_path.read_text(encoding='utf-8'))
     matrices = json.loads(matrix_path.read_text(encoding='utf-8'))
+    CAMERA_MODEL = camera_models.normalize_camera_model(calib.get('camera_model'))
+    matrix_model = camera_models.normalize_camera_model(matrices.get('camera_model'))
 
     fmt = matrices.get('table_format', 'txt')
     # Q0 是合法配置，不能用 `or 4` 兜底——0 在这里会被当成假值，静默变成 Q4
@@ -693,6 +700,7 @@ def main() -> int:
     print(f'表格式 {fmt}' + (f'（Q{FIXED_POINT} 定点）' if fmt != 'txt' else '')
           + f'，源图 {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]}，表网格 {TABLE_SHAPE[0]}x{TABLE_SHAPE[1]}')
     print(f'去畸变输出矩阵 Knew: {"来自 matrices.json" if KNEW is not None else "缺省，回退用 K"}')
+    print(f'相机模型: calib.json={CAMERA_MODEL}, matrices.json={matrix_model}')
 
     print('查找表清单:')
     print_table_inventory(root)
@@ -701,6 +709,8 @@ def main() -> int:
     # 按“几何语义 → 网格契约 → 独立图像 oracle → 双向诊断 → 字节忠实度”排列。
     # 保留逐项结果而不是遇首错就退出：一次运行可以同时告诉同学问题落在哪几层。
     results = [
+        report('标定与导出相机模型一致', matrix_model == CAMERA_MODEL,
+               f'calib.json={CAMERA_MODEL}, matrices.json={matrix_model}'),
         # 1. H 自己是否仍表达实测矩形、朝向与参考原点。
         check_homography(matrices),
         # 2. 降采样是否保持 x/y 同一个公制倍率。

@@ -90,6 +90,13 @@
 
     <article class="card" id="step-calib">
       <div class="card-head"><span class="num">2</span><h3>相机标定</h3></div>
+      <label>镜头模型
+        <select id="in-camera-model">
+          <option value="standard">标准镜头（针孔模型）</option>
+          <option value="fisheye">鱼眼镜头（Fisheye 模型）</option>
+        </select>
+      </label>
+      <p class="hint">普通摄像头和常见广角镜头选标准镜头；镜头明确是鱼眼或边缘弯曲、压缩特别明显时选鱼眼。不确定时优先选标准镜头。</p>
       <div id="calib-info" class="kv"></div>
       <div id="calib-count" class="hint mono"></div>
       <div class="chart-wrap">
