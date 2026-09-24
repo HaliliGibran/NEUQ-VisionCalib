@@ -51,7 +51,6 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         new = urllib.parse.urlsplit(redirected.full_url)
         if new.scheme != 'https' or (old.scheme, old.netloc) != (new.scheme, new.netloc):
             redirected.remove_header('Authorization')
-            redirected.remove_unredirected_header('Authorization')
         return redirected
 
 
