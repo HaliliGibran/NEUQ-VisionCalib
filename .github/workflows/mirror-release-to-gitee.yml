@@ -1,8 +1,6 @@
 name: Mirror release to Gitee
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       release_tag:
@@ -14,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: mirror-release-to-gitee-${{ github.repository }}-${{ github.event.release.tag_name || inputs.release_tag || github.run_id }}
+  group: mirror-release-to-gitee-${{ github.repository }}-${{ inputs.release_tag || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -36,7 +34,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_OWNER: ${{ vars.GITEE_OWNER }}
           GITEE_REPO: ${{ vars.GITEE_REPO }}

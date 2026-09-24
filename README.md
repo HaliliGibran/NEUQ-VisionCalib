@@ -63,7 +63,12 @@ LUT、定点量化等相关的数学与图像知识，可以配合源码一起�
 
 ## 1. 快速开始
 
-**普通 Windows 用户（推荐）**：便携版发布后，从 [GitHub Releases](https://github.com/HaliliGibran/NEUQ-VisionCalib/releases) 下载最新版本，解压后运行 `NEUQ-VisionCalib.exe`，无需安装 Python。
+**普通 Windows 用户（推荐）**：下载最新 Windows x64 便携版。GitHub Releases 是官方发布源，Gitee Releases 是国内镜像；两边提供同一份发行文件：
+
+- [GitHub Releases（官方发布源）](https://github.com/HaliliGibran/NEUQ-VisionCalib/releases)
+- [Gitee Releases（国内下载镜像）](https://gitee.com/Gibran_Halili/NEUQ-VisionCalib/releases)
+
+下载 ZIP 后解压并运行 `NEUQ-VisionCalib.exe`，无需安装 Python。
 
 **开发者从源码启动**：双击 `start_webui.bat`（自动挑解释器、缺依赖自动安装）。
 
@@ -80,7 +85,7 @@ python src/webui/server.py --port 9000 --no-browser   # 换端口 / 不开浏览
 
 默认地址 `http://127.0.0.1:8770`。需要 Python 3.10+、`opencv-python`、`numpy`。
 
-开发者自行构建 Windows 便携版的方法见第 11 节。
+开发者自行构建 Windows 便携版的方法见第 11 节；正式发布步骤见 [RELEASE.md](RELEASE.md)。
 
 ---
 
