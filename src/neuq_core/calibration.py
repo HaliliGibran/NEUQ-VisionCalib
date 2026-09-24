@@ -10,6 +10,8 @@
 ``neuq_vision_calib.py`` 编排。背景知识见 ``KNOWLEDGE_GUIDE.md`` 第 3～6 节。
 """
 
+from math import isfinite, sqrt
+from statistics import stdev
 from typing import Optional, Sequence, Tuple
 
 import cv2
@@ -216,6 +218,62 @@ def recommend_reprojection_threshold(errors: Sequence[float]) -> dict:
     result.update(threshold=float(threshold), outlier_count=outlier_count,
                   status='recommended')
     return result
+
+
+def calibration_filter_geometry_regressions(baseline: dict, candidate: dict) -> list[str]:
+    """列出相对“不剔除”基线明显降级的采集几何维度。
+
+    只比较现有诊断给出的等级，不引入新的覆盖、姿态或尺度阈值。
+    """
+    keys = ('image_coverage', 'edge_coverage', 'pose_diversity', 'scale_diversity')
+    rank = {'weak': 0, 'fair': 1, 'good': 2}
+    base_metrics = {item.get('key'): item for item in baseline.get('metrics', [])}
+    next_metrics = {item.get('key'): item for item in candidate.get('metrics', [])}
+    regressions = []
+    for key in keys:
+        base = base_metrics.get(key)
+        current = next_metrics.get(key)
+        if (base is None or current is None
+                or base.get('level') not in rank or current.get('level') not in rank
+                or rank[current['level']] < rank[base['level']]):
+            label = (current or base or {}).get('label', key)
+            regressions.append(str(label))
+    return regressions
+
+
+def select_calibration_filter_candidate(candidates: Sequence[dict], fold_count: int) -> dict:
+    """按 LOOCV 平方误差的一标准误规则选候选，并在接近最优时保留更多照片。"""
+    valid = []
+    for candidate in candidates:
+        errors = candidate.get('fold_errors', [])
+        try:
+            finite_errors = [float(value) for value in errors]
+        except (TypeError, ValueError):
+            continue
+        if (not candidate.get('geometry_safe', False) or len(errors) != fold_count
+                or any(not isfinite(value) or value < 0 for value in finite_errors)):
+            continue
+        losses = [value ** 2 for value in finite_errors]
+        mean_loss = sum(losses) / fold_count
+        valid.append({**candidate, 'fold_losses': losses,
+                      'mean_squared_error': mean_loss,
+                      'cv_rms': sqrt(mean_loss)})
+    if not valid:
+        return {'best_cv_rms': None, 'one_se_limit_mse': None, 'near_best': []}
+
+    best = min(valid, key=lambda item: item['mean_squared_error'])
+    best_losses = best['fold_losses']
+    standard_error = stdev(best_losses) / sqrt(fold_count) if fold_count > 1 else 0.0
+    one_se_limit = best['mean_squared_error'] + standard_error
+    near_best = [item for item in valid
+                 if item['mean_squared_error'] <= one_se_limit + 1e-12]
+    near_best.sort(key=lambda item: (-int(item['retained_count']),
+                                     item['mean_squared_error']))
+    return {
+        'best_cv_rms': float(best['cv_rms']),
+        'one_se_limit_mse': float(one_se_limit),
+        'near_best': near_best,
+    }
 
 
 def diagnose_calibration_views(image_points, object_points, rvecs, tvecs,
@@ -557,10 +615,12 @@ __all__ = [
     'CALIBRATION_DIAGNOSTIC_HEURISTICS',
     'SUBPIX_CRITERIA',
     '_calibrate_once',
+    'calibration_filter_geometry_regressions',
     'detect_chessboard',
     'detect_chessboard_partial',
     'diagnose_calibration_views',
     'recommend_reprojection_threshold',
     'report_reprojection_error',
+    'select_calibration_filter_candidate',
 ]
 

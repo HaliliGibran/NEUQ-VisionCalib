@@ -133,6 +133,16 @@ main {
 .reproj-recommendation .hint { margin: 0; }
 .reproj-recommendation button { flex: 0 0 auto; }
 #calib-final-result { line-height: 1.45; }
+.filter-assessment {
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+  margin: 8px 0; background: var(--panel);
+}
+.filter-assessment h4 { margin: 0 0 5px; font-size: 12px; font-weight: 600; }
+.filter-assessment progress { width: 100%; height: 8px; margin: 0 0 5px; accent-color: var(--accent); }
+.filter-assessment button.primary.sm { padding: 3px 8px; font-size: 11px; }
+.filter-assessment-result { font-size: 11px; line-height: 1.45; }
+.filter-assessment-result p { margin: 3px 0; }
+.filter-assessment-result ul { margin: 3px 0; padding-left: 18px; color: var(--muted); }
 .calib-diagnostics {
   border-top: 1px solid var(--border); margin: 10px 0; padding-top: 8px;
 }

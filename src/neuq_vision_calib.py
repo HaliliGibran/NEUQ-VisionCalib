@@ -53,11 +53,14 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import re
 import shutil
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -67,11 +70,13 @@ from neuq_core import config as _config
 from neuq_core.calibration import (  # noqa: F401
     SUBPIX_CRITERIA,
     _calibrate_once,
+    calibration_filter_geometry_regressions,
     detect_chessboard,
     detect_chessboard_partial,
     diagnose_calibration_views,
     recommend_reprojection_threshold,
     report_reprojection_error,
+    select_calibration_filter_candidate,
 )
 from neuq_core.config import (  # noqa: F401
     BACKUP_SUFFIX,
@@ -309,6 +314,18 @@ _config.bind_board(BOARD)
 # 运行期可被命令行覆盖的量，默认 None 表示沿用上面的模块级配置。
 MAX_REPROJ_ERR: Optional[float] = None   # 标定迭代剔除的误差上限（px），None 不剔除
 
+
+class CalibrationCancelled(RuntimeError):
+    """标定或筛选评估在两次 OpenCV 运算之间被用户取消。"""
+
+
+_USE_GLOBAL_THRESHOLD = object()
+
+
+def _check_cancel(cancel_event: Optional[Event]) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise CalibrationCancelled('用户已取消自动筛选评估。')
+
 # 查找表导出。默认值保证与历史产物完全一致（1280x720 的逗号分隔文本）。
 # 全尺寸文本表在 720p 下约 55 MB，单片机放不下，所以另给了定点二进制与 C 头文件两条路。
 TABLE_FORMAT = 'txt'                      # txt | bin | c
@@ -481,8 +498,111 @@ def capture_calibration_images() -> None:
         cv2.destroyWindow(win)
 
 
-def fit_camera(obj_points, img_points, used, img_size):
-    """标定，并在 MAX_REPROJ_ERR 给定时迭代剔除高误差视图。
+@dataclass
+class CalibrationViews:
+    """同一棋盘规格下检出的标定观测及其来源。"""
+
+    obj_points: List[np.ndarray]
+    img_points: List[np.ndarray]
+    used: List[Path]
+    img_size: Tuple[int, int]
+    file_count: int
+    failed: List[str]
+
+
+def collect_calibration_views(board: Optional[CheckerboardSpec] = None,
+                              progress_callback=None,
+                              cancel_event: Optional[Event] = None
+                              ) -> CalibrationViews:
+    """读取并检测 calib_input/，供正式标定与独立筛选评估共用。"""
+    spec = BOARD if board is None else board
+    require_material_basis('相机标定', block_unknown=False)
+    files = list_images(DIR_CALIB_IN)
+    if len(files) < 3:
+        raise SystemExit(f'{DIR_CALIB_IN} 中标定图不足（当前 {len(files)} 张），'
+                         '至少需要 3 张，建议 15 张以上。')
+
+    cols, rows = spec.corners
+    objp = np.zeros((rows * cols, 3), dtype=np.float32)
+    objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
+    objp *= spec.square_size_mm
+
+    failed: List[str] = []
+    size_votes: Dict[Tuple[int, int], int] = {}
+    total_steps = len(files) * 2
+    completed = 0
+    for path in files:
+        _check_cancel(cancel_event)
+        img = safe_imread(path)
+        if img is None:
+            failed.append(f'{path.name}（无法读取）')
+        else:
+            key = (img.shape[1], img.shape[0])
+            size_votes[key] = size_votes.get(key, 0) + 1
+        completed += 1
+        if progress_callback:
+            progress_callback('detecting', completed, total_steps,
+                              f'统计图像分辨率：{path.name}')
+    if not size_votes:
+        raise SystemExit(f'{DIR_CALIB_IN} 中没有任何可读图片。')
+
+    img_size = max(size_votes, key=lambda k: (size_votes[k], k[0] * k[1]))
+    if len(size_votes) > 1:
+        others = ', '.join(f'{w}x{h}（{n} 张）' for (w, h), n
+                           in sorted(size_votes.items(), key=lambda kv: -kv[1])
+                           if (w, h) != img_size)
+        print(f'注意: calib_input/ 存在多种分辨率，按众数取 '
+              f'{img_size[0]}x{img_size[1]}，以下将被剔除: {others}')
+
+    obj_points: List[np.ndarray] = []
+    img_points: List[np.ndarray] = []
+    used: List[Path] = []
+    for path in files:
+        _check_cancel(cancel_event)
+        img = safe_imread(path)
+        if img is not None:
+            gray = to_gray(img)
+            if (gray.shape[1], gray.shape[0]) != img_size:
+                failed.append(f'{path.name}（分辨率 {gray.shape[1]}x{gray.shape[0]} '
+                              f'与 {img_size[0]}x{img_size[1]} 不一致）')
+            else:
+                found, corners = detect_chessboard(gray, board=spec)
+                if not found or corners is None:
+                    failed.append(f'{path.name}（未检出完整 {spec.corners[0]}x'
+                                  f'{spec.corners[1]} 内角点，当前规格 {spec.label}）')
+                else:
+                    obj_points.append(objp.copy())
+                    img_points.append(np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2))
+                    used.append(path)
+        completed += 1
+        if progress_callback:
+            progress_callback('detecting', completed, total_steps,
+                              f'检测棋盘角点：{path.name}')
+
+    if failed:
+        print(f'\n以下 {len(failed)} 张未参与标定:')
+        for item in failed:
+            print('  ', item)
+        if len(failed) > len(files) // 2:
+            px_per_square = min(img_size[0] / (spec.corners[0] + 1),
+                                img_size[1] / (spec.corners[1] + 1))
+            print(f'  过半图片检出失败。当前 {img_size[0]}x{img_size[1]} 下 '
+                  f'{spec.corners[0]}x{spec.corners[1]} 内角点，'
+                  f'每格满屏时也只有约 {px_per_square:.0f} px；'
+                  '低于 20 px 就很难稳定检出，建议换更粗的棋盘（更少角点、更大方格）重拍。')
+
+    if len(obj_points) < 3:
+        raise SystemExit(f'成功检出棋盘的图片只有 {len(obj_points)} 张，不足以标定。')
+    return CalibrationViews(obj_points, img_points, used, img_size, len(files), failed)
+
+
+def fit_camera(obj_points, img_points, used, img_size, *, threshold=_USE_GLOBAL_THRESHOLD,
+               iteration_callback=None, cancel_event: Optional[Event] = None,
+               verbose: bool = True):
+    """标定，并在阈值给定时迭代剔除高误差视图。
+
+    threshold 默认沿用 MAX_REPROJ_ERR；显式 None 表示不剔除。内部 LOOCV 可传入
+    fold-local 阈值、逐轮回调和取消信号，正常 CLI/Web 标定仍走原默认路径。
 
     棋盘照片是手持拍的，个别帧的运动模糊会把整体误差抬高。剔除必须逐轮做：
     每轮完整标定后，只移除当前 RMS 最大且超过阈值的一张，再对剩余视图**完整重标定**。
@@ -504,23 +624,34 @@ def fit_camera(obj_points, img_points, used, img_size):
     返回值末尾再追加一个量：
       stop_reason — 达到 3 张下限仍有视图超限时的说明，否则为 None。
     """
+    applied_threshold = MAX_REPROJ_ERR if threshold is _USE_GLOBAL_THRESHOLD else threshold
     dropped: List[Tuple[str, float]] = []
     first_pass: Optional[Tuple[List[str], np.ndarray]] = None
     stop_reason = None
     while True:
+        _check_cancel(cancel_event)
         rms, K, D, rvecs, tvecs, std_int, per_view = _calibrate_once(
             obj_points, img_points, img_size)
+        _check_cancel(cancel_event)
         if first_pass is None:
             first_pass = ([p.name for p in used], np.asarray(per_view, dtype=np.float64))
-        if MAX_REPROJ_ERR is None or per_view.size == 0:
+        if iteration_callback:
+            iteration_callback({
+                'rms': float(rms), 'K': K, 'D': D, 'rvecs': rvecs, 'tvecs': tvecs,
+                'std_int': std_int, 'per_view': np.asarray(per_view, dtype=np.float64),
+                'obj_points': list(obj_points), 'img_points': list(img_points),
+                'used': list(used), 'dropped': list(dropped),
+            })
+        if applied_threshold is None or per_view.size == 0:
             break
-        over_limit = [i for i, e in enumerate(per_view) if e > MAX_REPROJ_ERR]
+        over_limit = [i for i, e in enumerate(per_view) if e > applied_threshold]
         if not over_limit:
             break
         if len(obj_points) <= 3:
             stop_reason = (f'已达到至少 3 张视图的标定下限，仍有 {len(over_limit)} 张最终 RMS '
-                           f'超过阈值 {MAX_REPROJ_ERR:.2f} px；未继续剔除。')
-            print(f'  {stop_reason}')
+                           f'超过阈值 {applied_threshold:.2f} px；未继续剔除。')
+            if verbose:
+                print(f'  {stop_reason}')
             break
 
         drop_index = max(over_limit, key=lambda i: per_view[i])
@@ -528,13 +659,332 @@ def fit_camera(obj_points, img_points, used, img_size):
         drop_error = float(per_view[drop_index])
         dropped.append((drop_name, drop_error))
         keep = [i for i in range(len(obj_points)) if i != drop_index]
-        print(f'  剔除当前 RMS 最大的视图 {drop_name}（{drop_error:.4f} px，'
-              f'超过阈值 {MAX_REPROJ_ERR:.2f} px）后重新标定。')
+        if verbose:
+            print(f'  剔除当前 RMS 最大的视图 {drop_name}（{drop_error:.4f} px，'
+                  f'超过阈值 {applied_threshold:.2f} px）后重新标定。')
         obj_points = [obj_points[i] for i in keep]
         img_points = [img_points[i] for i in keep]
         used = [used[i] for i in keep]
     return (rms, K, D, rvecs, tvecs, per_view, std_int,
             obj_points, img_points, used, dropped, first_pass, stop_reason)
+
+
+def _threshold_inside(lower: float, upper: float) -> Optional[float]:
+    """返回严格位于两组逐轮 RMS 之间、可复现对应保留集合的阈值。"""
+    if not (math.isfinite(lower) and math.isfinite(upper) and lower < upper):
+        return None
+    midpoint = (lower + upper) / 2.0
+    for decimals in range(2, 13):
+        candidate = round(midpoint, decimals)
+        if lower < candidate < upper:
+            return float(candidate)
+    return midpoint if lower < midpoint < upper else None
+
+
+def assess_calibration_filter(obj_points: Sequence[np.ndarray],
+                              img_points: Sequence[np.ndarray], used: Sequence[Path],
+                              img_size: Tuple[int, int], *,
+                              progress_callback=None,
+                              cancel_event: Optional[Event] = None) -> dict:
+    """用逐折 LOOCV 比较保留数量策略，并验证全数据可执行阈值。
+
+    候选由“保留 N、N-1、……、4 张”定义。每个 fold 只用 N-1 张训练照片生成
+    自己的阈值边界；之后每个候选都从完整训练折重新调用正式逐张筛选路径。这样
+    留出视图不会影响候选阈值的产生、标定或删帧决策，只用于固定 K/D 后的姿态求解
+    和重投影误差。MAD 首轮统计检查不参与此评估。
+    """
+    total_views = len(used)
+    if total_views < 4:
+        raise ValueError('LOOCV 至少需要 4 张有效棋盘照片；当前数学标定下限仍为 3 张。')
+
+    def report(stage: str, completed: int, total: int, detail: str, **extra) -> None:
+        if progress_callback:
+            progress_callback({
+                'stage': stage, 'completed': int(completed), 'total': int(total),
+                'detail': detail, **extra,
+            })
+
+    candidate_counts = list(range(total_views, 3, -1))
+    candidates = [{
+        'target_count': retained_count,
+        'retained_count': retained_count,
+        'geometry_safe': True,
+        'geometry_regressions': set(),
+        'fold_errors': [],
+    } for retained_count in candidate_counts]
+
+    # 每个外层 fold 只用其训练集建立阈值区间；留出照片完全不参与这一步。
+    folds = []
+    for heldout_index, heldout_path in enumerate(used):
+        _check_cancel(cancel_event)
+        train_indices = [i for i in range(total_views) if i != heldout_index]
+        train_obj = [obj_points[i] for i in train_indices]
+        train_img = [img_points[i] for i in train_indices]
+        train_used = [used[i] for i in train_indices]
+        fold_path = []
+        report('fold_paths', heldout_index, total_views,
+               f'为留出 {heldout_index + 1}/{total_views}（{heldout_path.name}）'
+               '仅用训练照片生成候选阈值区间。',
+               fold_index=heldout_index, fold_name=heldout_path.name, fit_round=0)
+
+        def record_fold_model(model: dict, *, fold_index=heldout_index,
+                              fold_name=heldout_path.name, path=fold_path):
+            path.append(model)
+            report('fold_paths', fold_index, total_views,
+                   f'留出 {fold_index + 1}/{total_views}：训练路径重标至 '
+                   f'{len(model["used"])} 张。',
+                   fold_index=fold_index, fold_name=fold_name,
+                   fit_round=len(path))
+
+        fit_camera(train_obj, train_img, train_used, img_size,
+                   threshold=-math.inf, iteration_callback=record_fold_model,
+                   cancel_event=cancel_event, verbose=False)
+        if len(fold_path) != total_views - 3:
+            raise ValueError('OpenCV 未提供完整训练折逐视图 RMS，无法进行 LOOCV。')
+        if any(len(model['per_view']) != len(model['used']) for model in fold_path):
+            raise ValueError('当前 OpenCV 未提供与视图一一对应的 RMS，无法进行 LOOCV。')
+        folds.append({
+            'heldout_index': heldout_index,
+            'heldout_path': heldout_path,
+            'train_obj': train_obj,
+            'train_img': train_img,
+            'train_used': train_used,
+            'path_by_count': {len(model['used']): model for model in fold_path},
+            'baseline_diagnostics': None,
+        })
+
+    cv_total = len(candidates) * total_views
+    completed = 0
+    for candidate_index, candidate in enumerate(candidates, start=1):
+        retained_count = candidate['target_count']
+        for fold in folds:
+            _check_cancel(cancel_event)
+            heldout_index = fold['heldout_index']
+            heldout_path = fold['heldout_path']
+            if retained_count == total_views:
+                threshold_value = None
+                expected_names = [path.name for path in fold['train_used']]
+            else:
+                fold_model = fold['path_by_count'].get(retained_count - 1)
+                if fold_model is None or not fold_model['per_view'].size:
+                    candidate['geometry_safe'] = False
+                    candidate['geometry_regressions'].add('无法生成训练折候选阈值')
+                    candidate['fold_errors'].append(None)
+                    completed += 1
+                    report('cross_validation', completed, cv_total,
+                           f'候选保留 {retained_count}/{total_views} 张；'
+                           f'留出 {heldout_path.name}：该训练折无法生成严格阈值。',
+                           candidate_index=candidate_index, fold_index=heldout_index,
+                           fold_name=heldout_path.name, fit_round=0)
+                    continue
+                lower = float(np.max(fold_model['per_view']))
+                upper = min((error for _name, error in fold_model['dropped']),
+                            default=math.inf)
+                threshold_value = _threshold_inside(lower, upper)
+                expected_names = [path.name for path in fold_model['used']]
+                if threshold_value is None:
+                    candidate['geometry_safe'] = False
+                    candidate['geometry_regressions'].add('训练折中不存在严格阈值区间')
+                    candidate['fold_errors'].append(None)
+                    completed += 1
+                    report('cross_validation', completed, cv_total,
+                           f'候选保留 {retained_count}/{total_views} 张；'
+                           f'留出 {heldout_path.name}：无法用单一阈值精确到达该保留数。',
+                           candidate_index=candidate_index, fold_index=heldout_index,
+                           fold_name=heldout_path.name, fit_round=0)
+                    continue
+
+            threshold_label = ('不剔除' if threshold_value is None
+                               else f'{threshold_value:.8g} px（本折训练集）')
+            detail_prefix = (f'候选保留 {retained_count}/{total_views} 张，'
+                             f'阈值 {threshold_label}，留出 {heldout_path.name}')
+            fit_round = 0
+            report('cross_validation', completed, cv_total,
+                   f'{detail_prefix}：从完整训练折开始。',
+                   candidate_index=candidate_index, fold_index=heldout_index,
+                   fold_name=heldout_path.name, fit_round=0,
+                   retained_count=retained_count, threshold=threshold_value)
+
+            def fitted(_model, *, done=completed, prefix=detail_prefix,
+                       cand_index=candidate_index, fold_index=heldout_index,
+                       fold_name=heldout_path.name):
+                nonlocal fit_round
+                fit_round += 1
+                _check_cancel(cancel_event)
+                report('cross_validation', done, cv_total,
+                       f'{prefix}，正式路径重标第 {fit_round} 轮（'
+                       f'{len(_model["used"])} 张训练视图）。',
+                       candidate_index=cand_index, fold_index=fold_index,
+                       fold_name=fold_name, fit_round=fit_round)
+
+            error = None
+            try:
+                model_result = fit_camera(
+                    fold['train_obj'], fold['train_img'], fold['train_used'], img_size,
+                    threshold=threshold_value, iteration_callback=fitted,
+                    cancel_event=cancel_event, verbose=False)
+                fold_names = [path.name for path in model_result[9]]
+                if fold_names != expected_names or model_result[12] is not None:
+                    candidate['geometry_safe'] = False
+                    candidate['geometry_regressions'].add('训练折正式筛选未到达候选保留集合')
+                else:
+                    diagnostics = diagnose_calibration_views(
+                        model_result[8], model_result[7], model_result[3], model_result[4],
+                        model_result[1], model_result[6], img_size, fold_names,
+                        model_result[5])
+                    if retained_count == total_views:
+                        fold['baseline_diagnostics'] = diagnostics
+                    elif fold['baseline_diagnostics'] is None:
+                        candidate['geometry_safe'] = False
+                        candidate['geometry_regressions'].add('不剔除训练折基线不可用')
+                    else:
+                        regressions = calibration_filter_geometry_regressions(
+                            fold['baseline_diagnostics'], diagnostics)
+                        if regressions:
+                            candidate['geometry_safe'] = False
+                            candidate['geometry_regressions'].update(regressions)
+
+                    _check_cancel(cancel_event)
+                    success, rvec, tvec = cv2.solvePnP(
+                        np.asarray(obj_points[heldout_index], dtype=np.float32),
+                        np.asarray(img_points[heldout_index], dtype=np.float32),
+                        model_result[1], model_result[2], flags=cv2.SOLVEPNP_ITERATIVE)
+                    if success:
+                        projected, _jacobian = cv2.projectPoints(
+                            obj_points[heldout_index], rvec, tvec,
+                            model_result[1], model_result[2])
+                        delta = (projected.reshape(-1, 2)
+                                 - np.asarray(img_points[heldout_index]).reshape(-1, 2))
+                        error = float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
+                        if not math.isfinite(error):
+                            error = None
+            except CalibrationCancelled:
+                raise
+            except (cv2.error, ValueError, RuntimeError, np.linalg.LinAlgError):
+                error = None
+
+            candidate['fold_errors'].append(error)
+            completed += 1
+            report('cross_validation', completed, cv_total,
+                   f'{detail_prefix}：留出 RMS {error:.4f} px。' if error is not None
+                   else f'{detail_prefix}：该折无法稳定求解。',
+                   candidate_index=candidate_index, fold_index=heldout_index,
+                   fold_name=heldout_path.name, fit_round=fit_round)
+
+    baseline_candidate = candidates[0]
+    baseline_errors = baseline_candidate['fold_errors']
+    if (len(baseline_errors) != total_views
+            or any(value is None for value in baseline_errors)):
+        raise ValueError('不剔除基线未能完成所有 LOOCV 留出折；未提供筛选建议。')
+    for candidate in candidates:
+        errors = candidate['fold_errors']
+        candidate['cv_rms'] = (float(np.sqrt(np.mean(np.square(errors))))
+                               if len(errors) == total_views
+                               and all(value is not None for value in errors) else None)
+
+    selection = select_calibration_filter_candidate(candidates, total_views)
+    near_best = selection['near_best']
+    if not near_best:
+        raise ValueError('LOOCV 无法为任何候选完成所有留出视图评估；未生成筛选建议。')
+
+    # LOOCV 选定保留数量后，才用完整数据反推一个正式阈值，并重新走生产筛选路径。
+    full_path = []
+    path_total = total_views - 2
+    report('full_path', 0, path_total, '在完整数据上反推正式阈值…')
+
+    def record_full_model(model: dict) -> None:
+        full_path.append(model)
+        report('full_path', len(full_path) - 1, path_total,
+               f'完整数据路径已重标至 {len(model["used"])} 张。',
+               fit_round=len(full_path))
+
+    fit_camera(obj_points, img_points, used, img_size, threshold=-math.inf,
+               iteration_callback=record_full_model, cancel_event=cancel_event,
+               verbose=False)
+    if len(full_path) != path_total or any(
+            len(model['per_view']) != len(model['used']) for model in full_path):
+        raise ValueError('OpenCV 未提供完整逐视图 RMS，无法反推并复核正式阈值。')
+    full_models_by_count = {len(model['used']): model for model in full_path}
+    full_baseline = full_path[0]
+    full_baseline_diagnostics = diagnose_calibration_views(
+        full_baseline['img_points'], full_baseline['obj_points'], full_baseline['rvecs'],
+        full_baseline['tvecs'], full_baseline['K'], full_baseline['std_int'], img_size,
+        [path.name for path in full_baseline['used']], full_baseline['per_view'])
+
+    chosen = None
+    replay_total = len(near_best)
+    for replay_index, candidate in enumerate(near_best, start=1):
+        _check_cancel(cancel_event)
+        retained_count = candidate['target_count']
+        full_model = full_models_by_count.get(retained_count)
+        if retained_count == total_views:
+            threshold_value = None
+            expected_names = [path.name for path in used]
+        elif full_model is None or not full_model['per_view'].size:
+            continue
+        else:
+            lower = float(np.max(full_model['per_view']))
+            upper = min((error for _name, error in full_model['dropped']),
+                        default=math.inf)
+            threshold_value = _threshold_inside(lower, upper)
+            if threshold_value is None:
+                continue
+            expected_names = [path.name for path in full_model['used']]
+        threshold_label = ('不剔除' if threshold_value is None
+                           else f'{threshold_value:.8g} px')
+        report('formal_replay', replay_index - 1, replay_total,
+               f'正式全数据筛选路径复核 {replay_index}/{replay_total}：{threshold_label}。')
+        try:
+            replay = fit_camera(obj_points, img_points, used, img_size,
+                                threshold=threshold_value, cancel_event=cancel_event,
+                                verbose=False)
+        except CalibrationCancelled:
+            raise
+        except (cv2.error, ValueError, RuntimeError):
+            continue
+        replay_names = [path.name for path in replay[9]]
+        if replay_names != expected_names or replay[12] is not None:
+            continue
+        replay_diagnostics = diagnose_calibration_views(
+            replay[8], replay[7], replay[3], replay[4], replay[1], replay[6],
+            img_size, replay_names, replay[5])
+        if calibration_filter_geometry_regressions(full_baseline_diagnostics,
+                                                   replay_diagnostics):
+            continue
+        chosen = (candidate, replay, replay_diagnostics, threshold_value)
+        break
+
+    if chosen is None:
+        raise ValueError('一标准误范围内的候选均未通过完整数据正式筛选复核；未提供建议值。')
+
+    candidate, replay, diagnostics, final_threshold = chosen
+    _check_cancel(cancel_event)
+    report('complete', cv_total, cv_total,
+           '自动筛选评估完成；建议已通过完整数据正式路径复核。')
+    return {
+        'status': 'no_filter' if final_threshold is None else 'recommended',
+        'recommended_threshold': (None if final_threshold is None
+                                  else float(final_threshold)),
+        'retained_count': len(replay[9]),
+        'total_count': total_views,
+        'dropped_count': len(replay[10]),
+        'baseline_cv_rms': float(baseline_candidate['cv_rms']),
+        'selected_cv_rms': float(candidate['cv_rms']),
+        'best_cv_rms': float(selection['best_cv_rms']),
+        'one_se_limit_mse': float(selection['one_se_limit_mse']),
+        'candidate_count': len(candidates),
+        'fold_count': total_views,
+        'geometry': [
+            {key: metric[key] for key in ('key', 'label', 'value', 'level', 'detail')}
+            for metric in diagnostics['metrics']
+            if metric['key'] in ('image_coverage', 'edge_coverage',
+                                 'pose_diversity', 'scale_diversity')
+        ],
+        'dropped_names': [name for name, _error in replay[10]],
+        'note': ('各折阈值只由对应训练集生成；LOOCV 使用平方重投影误差的一标准误规则，'
+                 '接近最优时优先保留更多照片。'
+                 '推荐值是当前模型与当前数据下的比较建议，不是标定准确度保证。'),
+    }
 
 
 def calibrate_camera(board: Optional[CheckerboardSpec] = None
@@ -553,80 +1003,9 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
     只是精度和 provenance 都对不上。要换板子，就得按新规格重新导入。
     """
     spec = BOARD if board is None else board
-    require_material_basis('相机标定', block_unknown=False)
-    files = list_images(DIR_CALIB_IN)
-    if len(files) < 3:
-        raise SystemExit(f'{DIR_CALIB_IN} 中标定图不足（当前 {len(files)} 张），'
-                         '至少需要 3 张，建议 15 张以上。')
-
-    cols, rows = spec.corners
-    # OpenCV 的 calibrateCamera 要求 objectPoints 为 Point3f，必须是 float32。
-    objp = np.zeros((rows * cols, 3), dtype=np.float32)
-    objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
-    objp *= spec.square_size_mm
-
-    obj_points: List[np.ndarray] = []
-    img_points: List[np.ndarray] = []
-    used: List[Path] = []
-    failed: List[str] = []
-
-    # 先统计分辨率分布，取众数作为标定分辨率。
-    # 不能拿"第一张图"的分辨率当准绳：目录里只要混进一张旧分辨率的图（例如历史遗留的
-    # 160x120），而它按文件名恰好排在最前，后面所有正常图片都会被判成"分辨率不一致"
-    # 而全部剔除，最后以 0 张有效收场，报错信息还完全指向错误的方向。
-    size_votes: Dict[Tuple[int, int], int] = {}
-    for path in files:
-        img = safe_imread(path)
-        if img is None:
-            failed.append(f'{path.name}（无法读取）')
-            continue
-        key = (img.shape[1], img.shape[0])
-        size_votes[key] = size_votes.get(key, 0) + 1
-    if not size_votes:
-        raise SystemExit(f'{DIR_CALIB_IN} 中没有任何可读图片。')
-
-    # 票数相同时取面积大的，避免 2 张小图与 2 张大图打平后选中了没用的那张。
-    img_size: Tuple[int, int] = max(size_votes, key=lambda k: (size_votes[k], k[0] * k[1]))
-    if len(size_votes) > 1:
-        others = ', '.join(f'{w}x{h}（{n} 张）' for (w, h), n
-                           in sorted(size_votes.items(), key=lambda kv: -kv[1])
-                           if (w, h) != img_size)
-        print(f'注意: calib_input/ 存在多种分辨率，按众数取 '
-              f'{img_size[0]}x{img_size[1]}，以下将被剔除: {others}')
-
-    for path in files:
-        img = safe_imread(path)
-        if img is None:
-            continue
-        gray = to_gray(img)
-        if (gray.shape[1], gray.shape[0]) != img_size:
-            failed.append(f'{path.name}（分辨率 {gray.shape[1]}x{gray.shape[0]} '
-                          f'与 {img_size[0]}x{img_size[1]} 不一致）')
-            continue
-
-        found, corners = detect_chessboard(gray, board=spec)
-        if not found or corners is None:
-            failed.append(f'{path.name}（未检出完整 {spec.corners[0]}x'
-                          f'{spec.corners[1]} 内角点，当前规格 {spec.label}）')
-            continue
-        obj_points.append(objp.copy())
-        img_points.append(np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2))
-        used.append(path)
-
-    if failed:
-        print(f'\n以下 {len(failed)} 张未参与标定:')
-        for item in failed:
-            print('  ', item)
-        if len(failed) > len(files) // 2:
-            px_per_square = min(img_size[0] / (spec.corners[0] + 1),
-                                img_size[1] / (spec.corners[1] + 1))
-            print(f'  过半图片检出失败。当前 {img_size[0]}x{img_size[1]} 下 '
-                  f'{spec.corners[0]}x{spec.corners[1]} 内角点，'
-                  f'每格满屏时也只有约 {px_per_square:.0f} px；'
-                  '低于 20 px 就很难稳定检出，建议换更粗的棋盘（更少角点、更大方格）重拍。')
-
-    if len(obj_points) < 3:
-        raise SystemExit(f'成功检出棋盘的图片只有 {len(obj_points)} 张，不足以标定。')
+    views = collect_calibration_views(spec)
+    obj_points, img_points, used = views.obj_points, views.img_points, views.used
+    img_size, file_count = views.img_size, views.file_count
 
     (rms, K, D, rvecs, tvecs, per_view, std_int,
      obj_points, img_points, used, dropped, first_pass, stop_reason) = fit_camera(
@@ -658,7 +1037,7 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
         'all_errors': np.asarray(first_errors, dtype=np.float64).tolist(),
     }
 
-    print(f'\n标定完成：{len(used)}/{len(files)} 张有效，分辨率 {img_size[0]}x{img_size[1]}')
+    print(f'\n标定完成：{len(used)}/{file_count} 张有效，分辨率 {img_size[0]}x{img_size[1]}')
     print(f'整体重投影误差 RMS = {rms:.4f} px')
     print('（注意：OpenCV 报的是 RMS，MATLAB cameraCalibrator 报的是平均欧氏距离，前者数值偏大）')
     print(f'平均欧氏重投影误差 = {mean_err:.4f} px（这个才和 MATLAB 的口径一致）')

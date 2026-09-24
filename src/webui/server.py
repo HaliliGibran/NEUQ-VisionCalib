@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 import webbrowser
 import zipfile
 from contextlib import redirect_stdout, suppress
@@ -97,6 +98,17 @@ STATE: dict = {
 
 # 当前 HTTP 服务实例，供"退出"接口调用 shutdown()（见 api_shutdown）
 HTTPD = None
+
+# LOOCV 是串行的长任务。状态与取消接口不获取 LOCK，确保计算期间仍可查询进度或取消。
+CALIBRATION_SELECTION_GUARD = threading.Lock()
+CALIBRATION_SELECTION_EVENT = None
+CALIBRATION_SELECTION = {
+    'task_id': None,
+    'status': 'idle',
+    'progress': {'stage': 'idle', 'completed': 0, 'total': 0, 'detail': ''},
+    'result': None,
+    'error': None,
+}
 
 
 # ---------------------------------------------------------------- 工具
@@ -274,6 +286,139 @@ def initial_target_window() -> tuple[float, float]:
     """
     return _state_pair('target_width_cm', 'target_forward_cm',
                        (core.TARGET_WIDTH_CM, core.TARGET_FORWARD_CM))
+
+
+def calibration_selection_status() -> dict:
+    """LOOCV 后台任务快照；查询不等待相机标定锁。"""
+    with CALIBRATION_SELECTION_GUARD:
+        return {
+            **CALIBRATION_SELECTION,
+            'progress': dict(CALIBRATION_SELECTION['progress']),
+        }
+
+
+def _set_calibration_selection(task_id: str, **updates) -> None:
+    with CALIBRATION_SELECTION_GUARD:
+        if CALIBRATION_SELECTION['task_id'] == task_id:
+            CALIBRATION_SELECTION.update(updates)
+
+
+def _selection_progress(task_id: str, event: threading.Event, progress: dict) -> None:
+    if event.is_set():
+        raise core.CalibrationCancelled('用户已取消自动筛选评估。')
+    _set_calibration_selection(task_id, progress=dict(progress))
+
+
+def _run_calibration_selection(task_id: str, event: threading.Event) -> None:
+    try:
+        with LOCK:
+            spec = core.BOARD
+            _set_calibration_selection(task_id, progress={
+                'stage': 'detecting', 'completed': 0, 'total': 0,
+                'detail': '正在读取标定照片并检测棋盘…',
+            })
+            views = core.collect_calibration_views(
+                spec, cancel_event=event,
+                progress_callback=lambda stage, completed, total, detail: _selection_progress(
+                    task_id, event, {'stage': stage, 'completed': completed,
+                                     'total': total, 'detail': detail}),
+            )
+            result = core.assess_calibration_filter(
+                views.obj_points, views.img_points, views.used, views.img_size,
+                cancel_event=event,
+                progress_callback=lambda progress: _selection_progress(
+                    task_id, event, progress),
+            )
+        if event.is_set():
+            raise core.CalibrationCancelled('用户已取消自动筛选评估。')
+        _set_calibration_selection(task_id, status='complete', result=result, error=None,
+                                   progress={
+                                       'stage': 'complete', 'completed': 1, 'total': 1,
+                                       'detail': '自动筛选评估完成。',
+                                   })
+    except core.CalibrationCancelled as exc:
+        _set_calibration_selection(task_id, status='cancelled', result=None,
+                                   error=str(exc), progress={
+                                       'stage': 'cancelled', 'completed': 0, 'total': 0,
+                                       'detail': '评估已取消；未更改标定结果。',
+                                   })
+    except (Exception, SystemExit) as exc:
+        _set_calibration_selection(task_id, status='failed', result=None,
+                                   error=str(exc), progress={
+                                       'stage': 'failed', 'completed': 0, 'total': 0,
+                                       'detail': '自动筛选评估未能完成。',
+                                   })
+
+
+def api_calibration_selection_start(_body: dict) -> dict:
+    """开始一次串行 LOOCV 评估，不改写正式标定结果。"""
+    global CALIBRATION_SELECTION_EVENT
+    with CALIBRATION_SELECTION_GUARD:
+        if CALIBRATION_SELECTION['status'] in ('running', 'cancelling'):
+            return {
+                **CALIBRATION_SELECTION,
+                'progress': dict(CALIBRATION_SELECTION['progress']),
+            }
+        task_id = uuid.uuid4().hex
+        event = threading.Event()
+        CALIBRATION_SELECTION_EVENT = event
+        CALIBRATION_SELECTION.update(
+            task_id=task_id, status='running', result=None, error=None,
+            progress={'stage': 'starting', 'completed': 0, 'total': 0,
+                      'detail': '正在启动自动筛选评估…'},
+        )
+        thread = threading.Thread(target=_run_calibration_selection,
+                                  args=(task_id, event), daemon=True,
+                                  name='calibration-loocv')
+        thread.start()
+        return {
+            **CALIBRATION_SELECTION,
+            'progress': dict(CALIBRATION_SELECTION['progress']),
+        }
+
+
+def api_calibration_selection_cancel(_body: dict) -> dict:
+    """请求后台任务在当前 OpenCV 运算结束后取消。"""
+    with CALIBRATION_SELECTION_GUARD:
+        if CALIBRATION_SELECTION['status'] == 'running':
+            if CALIBRATION_SELECTION_EVENT is not None:
+                CALIBRATION_SELECTION_EVENT.set()
+            CALIBRATION_SELECTION.update(
+                status='cancelling',
+                progress={**CALIBRATION_SELECTION['progress'],
+                          'detail': '正在取消；当前单次 OpenCV 运算结束后会停止。'},
+            )
+        return {
+            **CALIBRATION_SELECTION,
+            'progress': dict(CALIBRATION_SELECTION['progress']),
+        }
+
+
+def invalidate_calibration_selection() -> None:
+    """素材、标定板或正式标定变化后，旧评估不能再应用。"""
+    global CALIBRATION_SELECTION_EVENT
+    with CALIBRATION_SELECTION_GUARD:
+        if CALIBRATION_SELECTION_EVENT is not None:
+            CALIBRATION_SELECTION_EVENT.set()
+        CALIBRATION_SELECTION_EVENT = None
+        CALIBRATION_SELECTION.update(
+            task_id=None, status='idle', result=None, error=None,
+            progress={'stage': 'idle', 'completed': 0, 'total': 0,
+                      'detail': '标定数据已变化，请重新评估。'},
+        )
+
+
+def request_calibration_selection_cancel() -> None:
+    """让占用计算锁的 LOOCV 在当前标定步骤后退出。"""
+    with CALIBRATION_SELECTION_GUARD:
+        if CALIBRATION_SELECTION['status'] == 'running':
+            if CALIBRATION_SELECTION_EVENT is not None:
+                CALIBRATION_SELECTION_EVENT.set()
+            CALIBRATION_SELECTION.update(
+                status='cancelling',
+                progress={**CALIBRATION_SELECTION['progress'],
+                          'detail': '检测到标定数据操作，正在安全停止评估…'},
+            )
 
 
 def api_status() -> dict:
@@ -1376,6 +1521,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.serve_static('index.html')
             if parsed.path.startswith('/static/'):
                 return self.serve_static(parsed.path[len('/static/'):])
+            if parsed.path == '/api/calibration_selection':
+                return self.send_json(calibration_selection_status())
             if parsed.path == '/api/status':
                 with LOCK:
                     return self.send_json(api_status())
@@ -1399,7 +1546,18 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == '/api/upload_import':
             # 上传是 multipart，不是 JSON，单独走一条分支
+            request_calibration_selection_cancel()
             return self.handle_upload()
+        if parsed.path in ('/api/calibration_selection/start',
+                           '/api/calibration_selection/cancel'):
+            try:
+                body = self.read_body()
+                action = (api_calibration_selection_start
+                          if parsed.path.endswith('/start')
+                          else api_calibration_selection_cancel)
+                return self.send_json({'ok': True, **action(body)})
+            except Exception as exc:
+                return self.send_json({'error': str(exc)}, 500)
         routes = {
             '/api/import': api_import,
             '/api/calibrate': api_calibrate,
@@ -1417,8 +1575,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({'error': f'未知接口 {parsed.path}'}, 404)
         try:
             body = self.read_body()
+            if parsed.path in ('/api/import', '/api/calibrate', '/api/board',
+                               '/api/backup_clear', '/api/clear_all', '/api/shutdown'):
+                request_calibration_selection_cancel()
             with LOCK:
                 result = handler(body)
+                if parsed.path in ('/api/import', '/api/calibrate', '/api/board',
+                                   '/api/backup_clear', '/api/clear_all'):
+                    invalidate_calibration_selection()
             self.send_json({'ok': True, **result})
         except (SystemExit, ValueError) as exc:
             # 参数问题（四点退化、尺寸非法、文件不存在）属于用户可修正的输入错误，
@@ -1437,6 +1601,7 @@ class Handler(BaseHTTPRequestHandler):
             fields, files = parse_multipart(self.headers, body)
             with LOCK:
                 result = api_upload_import(fields, files)
+                invalidate_calibration_selection()
             self.send_json({'ok': True, **result})
         except (SystemExit, ValueError) as exc:
             self.send_json({'error': str(exc)}, 400)

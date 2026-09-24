@@ -21,6 +21,8 @@ const state = {
   hoverDof: null,     // 鼠标正悬停在哪个自由度那一行（键盘微调的目标之一）
   lastPreview: null,
   fit: null,          // 最近一次标定的逐帧数据，给柱状图用
+  calibrationSelection: null,
+  calibrationSelectionTimer: null,
 };
 
 const LABELS = ['TL', 'TR', 'BL', 'BR'];
@@ -108,6 +110,104 @@ function renderCalibrationSummary(fit) {
   result.textContent = `最近一次标定：最终使用 ${used} 张（首轮 ${total} 张）；最终剔除 ${dropped} 张；最终 RMS ${rms}。`
     + (fit.threshold_stop_reason ? ` ${fit.threshold_stop_reason}` : '')
     + ' 统计离群帧检查不评估筛选后模型的泛化表现，也不是标定质量合格标准。';
+}
+
+/** 展示独立 LOOCV 自动筛选评估；“使用建议值”只填写阈值，不启动标定。 */
+function renderCalibrationSelection(snapshot) {
+  state.calibrationSelection = snapshot;
+  const start = $('btn-selection-start');
+  const cancel = $('btn-selection-cancel');
+  const use = $('btn-selection-use');
+  const progress = $('calib-selection-progress');
+  const status = $('calib-selection-status');
+  const result = $('calib-selection-result');
+  const running = snapshot && ['running', 'cancelling'].includes(snapshot.status);
+  start.disabled = !!running;
+  cancel.disabled = !running || snapshot.status === 'cancelling';
+  progress.hidden = !running;
+  const p = (snapshot && snapshot.progress) || {};
+  progress.max = Math.max(1, Number(p.total) || 1);
+  progress.value = Math.min(progress.max, Number(p.completed) || 0);
+  status.textContent = (p.detail || '')
+    || (snapshot && snapshot.status === 'idle' ? '尚未运行自动筛选评估。' : '');
+  result.replaceChildren();
+  result.hidden = true;
+  const selectionReady = snapshot && snapshot.status === 'complete' && snapshot.result;
+  use.textContent = (selectionReady && snapshot.result.status === 'no_filter')
+    ? '使用建议（不剔除）' : '使用建议值';
+  use.disabled = !(selectionReady && (
+    snapshot.result.status === 'no_filter'
+    || (snapshot.result.status === 'recommended'
+      && Number.isFinite(snapshot.result.recommended_threshold))));
+
+  if (!snapshot) return;
+  if (snapshot.status === 'failed') {
+    status.textContent = snapshot.error || p.detail || '自动筛选评估未能完成。';
+    return;
+  }
+  if (snapshot.status !== 'complete' || !snapshot.result) return;
+
+  const assessment = snapshot.result;
+  result.hidden = false;
+  const recommendation = document.createElement('p');
+  recommendation.textContent = assessment.status === 'no_filter'
+    ? `建议不剔除：保留全部 ${assessment.retained_count} / ${assessment.total_count} 张。`
+    : `建议阈值：${formatOutlierBoundary(Number(assessment.recommended_threshold))} px · `
+      + `预计保留 ${assessment.retained_count} / ${assessment.total_count} 张。`;
+  result.appendChild(recommendation);
+
+  const comparison = document.createElement('p');
+  comparison.textContent = `LOOCV 留出 RMS：不剔除 ${assessment.baseline_cv_rms.toFixed(3)} px → `
+    + `所选方案 ${assessment.selected_cv_rms.toFixed(3)} px；`
+    + `最佳候选 ${assessment.best_cv_rms.toFixed(3)} px；`
+    + `共比较 ${assessment.candidate_count} 种保留数量策略、${assessment.fold_count} 个留出折。`;
+  result.appendChild(comparison);
+
+  const geometry = document.createElement('ul');
+  (assessment.geometry || []).forEach((metric) => {
+    const item = document.createElement('li');
+    item.textContent = `${metric.label}：${metric.value}`;
+    geometry.appendChild(item);
+  });
+  result.appendChild(geometry);
+  const note = document.createElement('p');
+  note.className = 'hint';
+  note.textContent = assessment.note;
+  result.appendChild(note);
+}
+
+async function pollCalibrationSelection() {
+  if (state.calibrationSelectionTimer) {
+    clearTimeout(state.calibrationSelectionTimer);
+    state.calibrationSelectionTimer = null;
+  }
+  try {
+    const snapshot = await api('/api/calibration_selection');
+    renderCalibrationSelection(snapshot);
+    if (['running', 'cancelling'].includes(snapshot.status)) {
+      state.calibrationSelectionTimer = setTimeout(pollCalibrationSelection, 700);
+    }
+  } catch (e) {
+    $('calib-selection-status').textContent = '读取评估状态失败：' + e.message;
+  }
+}
+
+async function startCalibrationSelection() {
+  try {
+    await api('/api/calibration_selection/start', {});
+    await pollCalibrationSelection();
+  } catch (e) {
+    $('calib-selection-status').textContent = '启动评估失败：' + e.message;
+  }
+}
+
+async function cancelCalibrationSelection() {
+  try {
+    await api('/api/calibration_selection/cancel', {});
+    await pollCalibrationSelection();
+  } catch (e) {
+    $('calib-selection-status').textContent = '取消评估失败：' + e.message;
+  }
 }
 
 /** 展示质量诊断摘要、补拍行动项和逐照片技术数据。 */
@@ -1602,6 +1702,7 @@ async function runCalibration({ force = false, threshold } = {}) {
   // 这一步同时更新状态徽标、内参摘要和"成果图（N 张）"的徽标——
   // 漏掉它就会出现"图有了但徽标还是暂无"。
   await refreshStatus();
+  await pollCalibrationSelection();
   return data;
 }
 
@@ -1674,6 +1775,7 @@ function bindActions() {
   $('btn-board-apply').onclick = () => withBusy($('btn-board-apply'), async () => {
     try {
       const b = await api('/api/board', boardPayload());
+      await pollCalibrationSelection();
       $('board-active').textContent = '当前生效：' + b.label;
       log(`标定板规格已设为 ${b.label}（OpenCV 内角点 ${b.corners_x}×${b.corners_y}）`
         + '，已写入 project.json', 'ok');
@@ -1688,6 +1790,7 @@ function bindActions() {
     try {
       const b = await api('/api/board',
         { squares_x: 12, squares_y: 9, square_size_mm: 20 });
+      await pollCalibrationSelection();
       $('in-board-x').value = b.squares_x;
       $('in-board-y').value = b.squares_y;
       $('in-board-mm').value = b.square_size_mm;
@@ -1744,6 +1847,7 @@ function bindActions() {
       }
       log('导入完成。', 'ok');
       const st = await refreshStatus();
+      await pollCalibrationSelection();
 
       // 导入完自动先标一次（不剔除），把全体误差分布先算出来。
       // 否则用户要"盲标一次 → 看误差挑阈值 → 再标一次"，白跑一遍。
@@ -1774,6 +1878,26 @@ function bindActions() {
       log('标定完成。', 'ok');
     } catch (e) { log('标定失败: ' + e.message, 'err'); }
   });
+
+  $('btn-selection-start').onclick = startCalibrationSelection;
+  $('btn-selection-cancel').onclick = cancelCalibrationSelection;
+  $('btn-selection-use').onclick = () => {
+    const assessment = state.calibrationSelection && state.calibrationSelection.result;
+    if (!assessment) return;
+    if (assessment.status === 'no_filter') {
+      $('in-reproj').value = '';
+    } else if (assessment.status === 'recommended'
+        && Number.isFinite(assessment.recommended_threshold)) {
+      $('in-reproj').value = String(assessment.recommended_threshold);
+    } else {
+      return;
+    }
+    drawErrorChart(state.fit, currentThreshold());
+    $('calib-selection-status').textContent = assessment.status === 'no_filter'
+      ? '已按建议将阈值留空；尚未开始标定。'
+      : '建议阈值已填入输入框；尚未开始标定。';
+    $('in-reproj').focus();
+  };
 
   $('btn-commit').onclick = () => withBusy($('btn-commit'), async () => {
     if (!state.quad) { log('请先选择一张原图并调整四点。', 'err'); return; }
@@ -1848,6 +1972,7 @@ function bindActions() {
         state.committedQuad = null;
         drawErrorChart(null, null);
         await refreshStatus();
+        await pollCalibrationSelection();
         await refreshBackups();
       } catch (e) {
         log('备份并清空失败（原目录未改动）: ' + e.message, 'err');
@@ -1881,6 +2006,7 @@ function bindActions() {
         state.committedQuad = null;
         drawErrorChart(null, null);
         await refreshStatus();
+        await pollCalibrationSelection();
       } catch (e) {
         log('清空失败（原目录未改动）: ' + e.message, 'err');
       }
@@ -1898,6 +2024,7 @@ function bindActions() {
   bindActions();
   bindGallery();
   refreshBackups();
+  pollCalibrationSelection();
   try {
     const st = await refreshStatus();
     // 旧 ipm_state 只有在它属于当前标定时才可以恢复。K/D/Knew 或标定分辨率

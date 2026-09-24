@@ -98,6 +98,18 @@
       <div class="reproj-recommendation">
         <span id="calib-recommendation" class="hint">尚无首轮统计离群帧检查结果。</span>
       </div>
+      <section class="filter-assessment" aria-labelledby="calib-selection-title">
+        <h4 id="calib-selection-title">自动筛选评估（LOOCV）</h4>
+        <p class="hint">逐个比较不同照片保留数量策略；每折只用训练照片独立生成阈值并重放筛选流程，留出照片仅用于验证。接近最佳泛化表现时优先保留更多照片。该建议与上方 MAD 统计离群检查相互独立。</p>
+        <div class="diagnostic-actions">
+          <button id="btn-selection-start" class="ghost sm" type="button">评估筛选建议</button>
+          <button id="btn-selection-cancel" class="ghost sm" type="button" disabled>取消评估</button>
+          <button id="btn-selection-use" class="primary sm" type="button" disabled>使用建议值</button>
+        </div>
+        <progress id="calib-selection-progress" max="1" value="0" hidden></progress>
+        <p id="calib-selection-status" class="hint" aria-live="polite">尚未运行自动筛选评估。</p>
+        <div id="calib-selection-result" class="filter-assessment-result" hidden></div>
+      </section>
       <div id="calib-final-result" class="hint"></div>
       <section id="calib-diagnostics" class="calib-diagnostics" hidden>
         <h4>标定数据诊断</h4>
