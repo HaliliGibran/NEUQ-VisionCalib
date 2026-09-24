@@ -118,7 +118,7 @@ class CheckerboardSpec:
                 f'内角点至少 3x4（即方格至少 4x5），收到 '
                 f'{self.squares_x}x{self.squares_y}（内角点 {cx}x{cy}）。')
         if not self.square_size_mm > 0:
-            raise ValueError(f'单格边长必须为正数，收到 {self.square_size_mm}。')
+            raise ValueError(f'单格边长要填正数（mm），现在是 {self.square_size_mm}。')
 
     @property
     def corners(self) -> Tuple[int, int]:

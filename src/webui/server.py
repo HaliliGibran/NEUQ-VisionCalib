@@ -599,7 +599,8 @@ def api_upload_import(fields: dict, files: list) -> dict:
     folder = (fields.get('name') or '').strip() or first_rel.split('/')[0]
     folder = folder.replace('\\', '/').strip('/').split('/')[0]
     if not folder or folder in ('.', '..') or any(c in folder for c in ':*?"<>|'):
-        raise ValueError(f'素材文件夹名不合法: {folder!r}')
+        shown = folder if folder else '（空）'
+        raise ValueError(f'文件夹名不能用 {shown}，换个名字。')
 
     dest = core.DIR_IMPORT / folder
     dest.mkdir(parents=True, exist_ok=True)
@@ -621,7 +622,7 @@ def api_upload_import(fields: dict, files: list) -> dict:
         written += 1
 
     if not written:
-        raise ValueError('没有可写入的图片文件（只支持 jpg/jpeg/png/bmp）。')
+        raise ValueError('这些文件里没有能用的图片，只支持 jpg / jpeg / png / bmp。')
 
     # mode 必须跟着走：之前上传分支固定写死 'add'，于是"覆盖整个素材库"
     # 只在填路径导入时生效，走上传时静默变回增量添加，界面和实际行为不一致。

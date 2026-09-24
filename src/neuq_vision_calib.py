@@ -555,8 +555,8 @@ def collect_calibration_views(board: Optional[CheckerboardSpec] = None,
         others = ', '.join(f'{w}x{h}（{n} 张）' for (w, h), n
                            in sorted(size_votes.items(), key=lambda kv: -kv[1])
                            if (w, h) != img_size)
-        print(f'注意: calib_input/ 存在多种分辨率，按众数取 '
-              f'{img_size[0]}x{img_size[1]}，以下将被剔除: {others}')
+        print(f'注意：{DIR_CALIB_IN} 里的照片尺寸不一致，将按出现最多的 '
+              f'{img_size[0]}×{img_size[1]} 处理；其他尺寸不会参与标定：{others}')
 
     obj_points: List[np.ndarray] = []
     img_points: List[np.ndarray] = []
@@ -590,7 +590,7 @@ def collect_calibration_views(board: Optional[CheckerboardSpec] = None,
         if len(failed) > len(files) // 2:
             px_per_square = min(img_size[0] / (spec.corners[0] + 1),
                                 img_size[1] / (spec.corners[1] + 1))
-            print(f'  过半图片检出失败。当前 {img_size[0]}x{img_size[1]} 下 '
+            print(f'  一半以上的照片都没找到完整棋盘。当前 {img_size[0]}x{img_size[1]} 下 '
                   f'{spec.corners[0]}x{spec.corners[1]} 内角点，'
                   f'每格满屏时也只有约 {px_per_square:.0f} px；'
                   '低于 20 px 就很难稳定检出，建议换更粗的棋盘（更少角点、更大方格）重拍。')
@@ -1875,13 +1875,16 @@ class IpmCalibrator:
             cv2.resizeWindow(self.raw_win, int(self.w * self.display_scale),
                              int(self.h * self.display_scale))
 
-            print(f'\n交互标定：地面标定矩形 {self.phys_w:g} x {self.phys_h:g} cm，'
-                  f'目标地面范围 {self.target_width_cm:g} x {self.target_forward_cm:g} cm')
-            print('  逆透视坐标参考原点 = 去畸变图底边中点对应的地面点；'
-                  '它只用于定义逆透视坐标，不代表摄像头或车辆实际位置')
-            print('  拖动红色端点调整四条线 -> 交点即地平面几何约束')
-            print('  滑杆: 横向锚点 / 纵向锚点（位置）, 朝向偏移（转角）, 比例尺（cm -> 像素）')
-            print('  f = 回到目标地面范围自动布局, r = 复位四条线, q = 保存退出')
+            print(f'\n交互标定：地面标定矩形 {self.phys_w:g} × {self.phys_h:g} cm')
+            print(f'目标地面范围 {self.target_width_cm:g} × {self.target_forward_cm:g} cm')
+            print('怎么操作：')
+            print('  拖红线两端      调整四条边，四个角点由交点自动算出')
+            print('  四个滑杆        横向位置 / 纵向位置 / 朝向 / 比例尺')
+            print('  f               自动布局')
+            print('  r               复位四条线')
+            print('  q / Esc         保存退出')
+            print('橙色十字是逆透视坐标参考点：')
+            print('  去畸变图底边中点所对应的地面点，不是摄像头或车辆位置。')
 
             while True:
                 key = cv2.waitKey(20) & 0xFF
@@ -2955,7 +2958,7 @@ def print_inventory() -> None:
     print(f'工程根目录: {SCRIPT_DIR}\n')
     basis = material_board()
     print(f'  当前标定板           {BOARD.label}')
-    print('  素材库的分类依据     '
+    print('  素材按这块标定板分拣 '
           + (basis.label if basis is not None else '（无记录）') + '\n')
     for name, path, desc, recursive in rows:
         if not path.is_dir():
