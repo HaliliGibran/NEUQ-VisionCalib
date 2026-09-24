@@ -20,7 +20,12 @@ from typing import Any
 
 GITHUB_API = 'https://api.github.com'
 GITEE_API = 'https://gitee.com/api/v5'
-API_TIMEOUT_SECONDS = 300
+API_TIMEOUT_SECONDS = 45
+API_RETRIES = 3
+TRANSFER_TIMEOUT_SECONDS = 300
+UPLOAD_TIMEOUT_SECONDS = 900
+ZIP_UPLOAD_ATTEMPTS = 4
+RETRY_DELAYS_SECONDS = (1, 2, 4)
 ASSET_PATTERN = re.compile(r'^NEUQ-VisionCalib-.+-Windows-x64\.zip$')
 SHA256_PATTERN = re.compile(r'^([0-9a-fA-F]{64})(?:\s+\*?(.+))?$')
 
@@ -64,22 +69,32 @@ def _request(
     label: str,
     destination: Path | None = None,
     allow_not_found: bool = False,
+    timeout: int = TRANSFER_TIMEOUT_SECONDS,
+    retries: int = 0,
 ) -> bytes | None:
-    try:
-        with OPENER.open(request, timeout=API_TIMEOUT_SECONDS) as response:
-            if destination is None:
-                return response.read()
-            with destination.open('wb') as output:
-                shutil.copyfileobj(response, output)
-            return b''
-    except urllib.error.HTTPError as exc:
-        if allow_not_found and exc.code == 404:
-            return None
-        raise SyncError(f'{service} {label} failed (HTTP {exc.code}).') from None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        # Do not print the underlying exception: urllib errors can include the full URL.
-        reason = 'timed out' if isinstance(exc, TimeoutError) else 'network or I/O error'
-        raise SyncError(f'{service} {label} failed ({reason}).') from None
+    for attempt in range(retries + 1):
+        try:
+            with OPENER.open(request, timeout=timeout) as response:
+                if destination is None:
+                    return response.read()
+                with destination.open('wb') as output:
+                    shutil.copyfileobj(response, output)
+                return b''
+        except urllib.error.HTTPError as exc:
+            if allow_not_found and exc.code == 404:
+                return None
+            retryable = exc.code in (408, 429) or 500 <= exc.code <= 599
+            if not retryable or attempt == retries:
+                raise SyncError(f'{service} {label} failed (HTTP {exc.code}).') from None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt == retries:
+                # Do not print the underlying exception: urllib errors can include the full URL.
+                reason = 'timed out' if isinstance(exc, TimeoutError) else 'network or I/O error'
+                raise SyncError(f'{service} {label} failed ({reason}).') from None
+
+        time.sleep(RETRY_DELAYS_SECONDS[min(attempt, len(RETRY_DELAYS_SECONDS) - 1)])
+
+    raise AssertionError('unreachable request retry state')
 
 
 def _json_bytes(response: bytes | None, *, service: str, label: str) -> Any:
@@ -222,6 +237,9 @@ class GiteeApi:
             service='Gitee API',
             label=label,
             allow_not_found=allow_not_found,
+            timeout=UPLOAD_TIMEOUT_SECONDS if file_path is not None and file_path.suffix == '.zip'
+            else API_TIMEOUT_SECONDS,
+            retries=0 if file_path is not None else API_RETRIES,
         )
         return _json_bytes(response, service='Gitee API', label=label)
 
@@ -237,6 +255,7 @@ class GiteeApi:
             service='Gitee attachment download',
             label=f'attachment {attachment_id}',
             destination=destination,
+            timeout=TRANSFER_TIMEOUT_SECONDS,
         )
 
 
@@ -459,6 +478,95 @@ def _download_gitee_attachment(
         raise SyncError(f'Gitee attachment {attachment.get("name")} has an unexpected size.')
 
 
+def _matching_attachment(
+    api: GiteeApi, release_id: int, path: Path
+) -> dict[str, Any] | None:
+    attachments = _list_attachments(api, release_id)
+    matches = [item for item in attachments if item.get('name') == path.name]
+    if len(matches) > 1:
+        raise SyncError(f'Gitee Release has duplicate attachments named {path.name}.')
+    return matches[0] if matches else None
+
+
+def _verify_matching_attachment(
+    api: GiteeApi,
+    release_id: int,
+    path: Path,
+    attachment: dict[str, Any],
+    directory: Path,
+) -> None:
+    local_size = path.stat().st_size
+    existing_path = directory / f'gitee-existing-{path.name}'
+    _download_gitee_attachment(api, release_id, attachment, existing_path)
+    if existing_path.stat().st_size != local_size:
+        raise SyncError(f'Gitee already has {path.name} with a different size.')
+    if _sha256(existing_path) != _sha256(path):
+        raise SyncError(
+            f'Gitee already has {path.name} with different content; refusing to overwrite it.'
+        )
+
+
+def _sync_one_attachment(
+    api: GiteeApi,
+    release_id: int,
+    path: Path,
+    directory: Path,
+    *,
+    expected_attempts: int,
+) -> None:
+    last_error = 'Gitee did not confirm the upload.'
+    for attempt in range(1, expected_attempts + 1):
+        # This read happens before every upload attempt, including every retry. It also
+        # recovers the case where Gitee stored the file but the response was lost.
+        existing = _matching_attachment(api, release_id, path)
+        if existing is not None:
+            _verify_matching_attachment(api, release_id, path, existing, directory)
+            print(f'Skipping identical Gitee attachment {path.name}.')
+            return
+
+        if path.name.endswith('-Windows-x64.zip'):
+            size_mib = path.stat().st_size / (1024 * 1024)
+            print(
+                f'Uploading Windows ZIP ({size_mib:.1f} MiB; '
+                f'attempt {attempt}/{expected_attempts}).',
+                flush=True,
+            )
+        else:
+            print(f'Uploading original GitHub asset {path.name}.', flush=True)
+
+        try:
+            uploaded = api.request_json(
+                'POST',
+                f'/releases/{release_id}/attach_files',
+                label=f'upload Gitee attachment {path.name}',
+                file_path=path,
+            )
+        except SyncError as exc:
+            last_error = str(exc)
+        else:
+            if isinstance(uploaded, dict) and uploaded.get('name') == path.name:
+                return
+            last_error = f'Gitee did not confirm upload of {path.name}.'
+
+        if attempt < expected_attempts:
+            print(
+                f'Upload response for {path.name} was not confirmed; '
+                'checking Gitee before retrying.',
+                flush=True,
+            )
+
+    # Reconcile after the last ambiguous result too, without making another upload.
+    existing = _matching_attachment(api, release_id, path)
+    if existing is not None:
+        _verify_matching_attachment(api, release_id, path, existing, directory)
+        print(f'Upload of {path.name} completed; Gitee response was not confirmed.')
+        return
+    raise SyncError(
+        f'Gitee upload of {path.name} failed after {expected_attempts} attempts; '
+        f'the attachment is absent. {last_error}'
+    )
+
+
 def _sync_attachments(
     api: GiteeApi,
     release_id: int,
@@ -466,31 +574,23 @@ def _sync_attachments(
     expected_zip_sha: str,
     directory: Path,
 ) -> None:
-    attachments = _list_attachments(api, release_id)
     for path in files:
-        matches = [item for item in attachments if item.get('name') == path.name]
-        if len(matches) > 1:
-            raise SyncError(f'Gitee Release has duplicate attachments named {path.name}.')
-        if matches:
-            existing_path = directory / f'gitee-existing-{path.name}'
-            _download_gitee_attachment(api, release_id, matches[0], existing_path)
-            if _sha256(existing_path) != _sha256(path):
-                raise SyncError(
-                    f'Gitee already has {path.name} with different content; refusing to overwrite it.'
-                )
-            print(f'Skipping identical Gitee attachment {path.name}.')
-            continue
-
-        print(f'Uploading original GitHub asset {path.name}.')
-        uploaded = api.request_json(
-            'POST',
-            f'/releases/{release_id}/attach_files',
-            label=f'upload Gitee attachment {path.name}',
-            file_path=path,
+        expected_attempts = (
+            ZIP_UPLOAD_ATTEMPTS if path.name.endswith('-Windows-x64.zip') else API_RETRIES + 1
         )
-        if not isinstance(uploaded, dict) or uploaded.get('name') != path.name:
-            raise SyncError(f'Gitee did not confirm upload of {path.name}.')
-        attachments.append(uploaded)
+        if path.name.endswith('-Windows-x64.zip'):
+            size_mib = path.stat().st_size / (1024 * 1024)
+            print(
+                f'[3/3] Synchronizing release assets; Windows ZIP is {size_mib:.1f} MiB.',
+                flush=True,
+            )
+        _sync_one_attachment(
+            api,
+            release_id,
+            path,
+            directory,
+            expected_attempts=expected_attempts,
+        )
 
     # Read-after-write verification catches incomplete or corrupt uploads. Retry briefly for
     # Gitee's attachment listing to become visible, but never convert persistent failure to success.
@@ -548,9 +648,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix='neuq-gitee-release-') as temporary_directory:
         directory = Path(temporary_directory)
         files, expected_sha, _manifest = _resolve_release_assets(release, github, directory)
+        print('[1/3] GitHub assets downloaded and verified.', flush=True)
         print(f'Mirroring GitHub Release {tag} to Gitee {owner}/{repo}.')
         _ensure_tag(gitee, tag, commit_sha)
         gitee_release = _ensure_release(gitee, release, tag, commit_sha)
+        print('[2/3] Gitee Release is ready.', flush=True)
         _sync_attachments(gitee, gitee_release['id'], files, expected_sha, directory)
 
     print(f'Gitee Release {tag} is synchronized and all three assets passed SHA256 verification.')
