@@ -555,8 +555,9 @@ def collect_calibration_views(board: Optional[CheckerboardSpec] = None,
         others = ', '.join(f'{w}x{h}（{n} 张）' for (w, h), n
                            in sorted(size_votes.items(), key=lambda kv: -kv[1])
                            if (w, h) != img_size)
-        print(f'注意：{DIR_CALIB_IN} 里的照片尺寸不一致，将按出现最多的 '
-              f'{img_size[0]}×{img_size[1]} 处理；其他尺寸不会参与标定：{others}')
+        print(f'注意：{DIR_CALIB_IN} 里有多种照片尺寸，'
+              f'以众数分辨率 {img_size[0]}×{img_size[1]} 为准；'
+              f'其他尺寸不会参与标定：{others}')
 
     obj_points: List[np.ndarray] = []
     img_points: List[np.ndarray] = []
