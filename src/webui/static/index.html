@@ -96,18 +96,18 @@
         <canvas id="c-reproj" width="560" height="180"></canvas>
       </div>
       <div class="reproj-recommendation">
-        <span id="calib-recommendation" class="hint">尚无首轮统计离群帧检查结果。</span>
+        <span id="calib-recommendation" class="hint">尚无离群检查结果。</span>
       </div>
       <section class="filter-assessment" aria-labelledby="calib-selection-title">
-        <h4 id="calib-selection-title">自动筛选评估（LOOCV）</h4>
-        <p class="hint">程序会轮流留出一张照片做验证，用其余照片生成逐张剔除结果，再比较保留不同张数时的效果。几个结果差不多时，优先少删照片。这个评估和上面的 MAD 离群检查是两回事。照片较多时可能需要几分钟。</p>
+        <h4 id="calib-selection-title">照片筛选建议</h4>
+        <p class="hint">程序会轮流留一张照片做验证，比较不同筛选程度下的结果。几个结果差不多时，优先少删照片。这和上面的离群检查是两回事。照片多的时候可能要跑几分钟。</p>
         <div class="diagnostic-actions">
           <button id="btn-selection-start" class="ghost sm" type="button">开始评估</button>
           <button id="btn-selection-cancel" class="ghost sm" type="button" disabled>取消评估</button>
           <button id="btn-selection-use" class="primary sm" type="button" disabled>使用建议</button>
         </div>
         <progress id="calib-selection-progress" max="1" value="0" hidden></progress>
-        <p id="calib-selection-status" class="hint" aria-live="polite">尚未运行自动筛选评估。</p>
+        <p id="calib-selection-status" class="hint" aria-live="polite">尚未运行照片筛选评估。</p>
         <div id="calib-selection-result" class="filter-assessment-result" hidden></div>
       </section>
       <div id="calib-final-result" class="hint"></div>
@@ -147,9 +147,10 @@
           </div>
         </div>
       </section>
-      <label>剔除重投影误差超过（px，留空不剔除）
+      <label>筛选误差上限（px，留空 = 不筛选）
         <input id="in-reproj" type="number" step="any" min="0" placeholder="留空则不筛选">
       </label>
+      <p class="hint">重投影误差就是「程序预测的棋盘角点」和照片里实际角点相差多少像素。越小表示当前模型对这张照片拟合得越好。设了上限后，程序会重新标定 → 删掉当前超限里最差的一张 → 再重新标定，如此迭代。</p>
       <label class="row"><input id="in-force" type="checkbox"> 强制重新标定</label>
       <button id="btn-calib" class="primary">运行标定</button>
       <button id="btn-gallery" class="ghost">查看去畸变成果图 <span id="gallery-badge">—</span></button>
@@ -167,7 +168,7 @@
 
     <article class="card" id="step-export">
       <div class="card-head"><span class="num">4</span><h3>导出</h3></div>
-      <p class="hint">落盘六个矩阵和两类查找表（去畸变、去畸变+逆透视），每类各含正向/反向，共 4 组 LUT；随后运行批量测试。</p>
+      <p class="hint">导出六个矩阵和四组查找表（去畸变、去畸变+逆透视，各含正向和反向）；随后运行批量测试。</p>
       <div class="pair">
         <label>表格式
           <select id="in-table-format">
@@ -258,7 +259,7 @@
     </article>
 
     <article class="card compact">
-      <div class="card-head"><h3>四个自由度</h3></div>
+      <div class="card-head"><h3>四个可调参数</h3></div>
       <div class="slider-row">
         <label class="slider" for="in-ax">横向锚点 <output id="out-ax">0.500</output></label>
         <div class="slider-line">

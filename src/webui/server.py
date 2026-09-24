@@ -305,7 +305,7 @@ def _set_calibration_selection(task_id: str, **updates) -> None:
 
 def _selection_progress(task_id: str, event: threading.Event, progress: dict) -> None:
     if event.is_set():
-        raise core.CalibrationCancelled('用户已取消自动筛选评估。')
+        raise core.CalibrationCancelled('用户已取消照片筛选评估。')
     _set_calibration_selection(task_id, progress=dict(progress))
 
 
@@ -331,11 +331,11 @@ def _run_calibration_selection(task_id: str, event: threading.Event) -> None:
                 task_id, event, progress),
         )
         if event.is_set():
-            raise core.CalibrationCancelled('用户已取消自动筛选评估。')
+            raise core.CalibrationCancelled('用户已取消照片筛选评估。')
         _set_calibration_selection(task_id, status='complete', result=result, error=None,
                                    progress={
                                        'stage': 'complete', 'completed': 1, 'total': 1,
-                                       'detail': '自动筛选评估完成。',
+                                       'detail': '照片筛选评估完成。',
                                    })
     except core.CalibrationCancelled as exc:
         _set_calibration_selection(task_id, status='cancelled', result=None,
@@ -347,7 +347,7 @@ def _run_calibration_selection(task_id: str, event: threading.Event) -> None:
         _set_calibration_selection(task_id, status='failed', result=None,
                                    error=str(exc), progress={
                                        'stage': 'failed', 'completed': 0, 'total': 0,
-                                       'detail': '自动筛选评估未能完成。',
+                                       'detail': '照片筛选评估未能完成。',
                                    })
 
 
@@ -366,7 +366,7 @@ def api_calibration_selection_start(_body: dict) -> dict:
         CALIBRATION_SELECTION.update(
             task_id=task_id, status='running', result=None, error=None,
             progress={'stage': 'starting', 'completed': 0, 'total': 0,
-                      'detail': '正在启动自动筛选评估…'},
+                      'detail': '正在启动照片筛选评估…'},
         )
         thread = threading.Thread(target=_run_calibration_selection,
                                   args=(task_id, event), daemon=True,

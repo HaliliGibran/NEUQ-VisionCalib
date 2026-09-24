@@ -81,7 +81,7 @@ function renderCalibrationSummary(fit) {
   const recommendation = $('calib-recommendation');
   const result = $('calib-final-result');
   if (!fit) {
-    recommendation.textContent = '尚无首轮统计离群帧检查结果。';
+    recommendation.textContent = '尚无离群检查结果。';
     result.textContent = '';
     return;
   }
@@ -93,23 +93,25 @@ function renderCalibrationSummary(fit) {
   if (status === 'recommended' && Number.isFinite(threshold)) {
     const outliers = fit.recommended_outlier_count || 0;
     const samples = fit.recommendation_sample_count || total;
-    recommendation.textContent = `统计离群帧检查：发现 ${outliers} / ${samples} 张候选；分界值 ${formatOutlierBoundary(threshold)} px。它只识别误差分布中的离群候选，不代表按此筛选能提高标定质量。`;
+    recommendation.textContent = `${samples} 张里有 ${outliers} 张误差明显偏大，统计分界约 ${formatOutlierBoundary(threshold)} px。`
+      + '这里只是离群提醒，不会自动删照片；要不要筛可以看下面的「照片筛选建议」。';
   } else if (status === 'too_few_samples') {
-    recommendation.textContent = '首轮有效视图不足 5 张，暂不判断统计离群帧；这不妨碍你按实际用途手动设置误差上限。';
+    recommendation.textContent = '有效照片不到 5 张，暂时不做离群判断。建议先多拍几张。';
   } else if (status === 'mad_degenerate') {
-    recommendation.textContent = '首轮误差分布的 MAD 为 0（或接近 0），无法可靠判断统计离群帧；这不等同于没有高误差照片。如有需要，可手动设置误差上限。';
+    recommendation.textContent = '这批照片的误差分布太集中，程序分不出明显的离群项。'
+      + '需要的话可以手动设置筛选阈值。';
   } else if (status === 'no_outliers') {
-    recommendation.textContent = '未发现明显统计离群帧。这不代表所有照片误差都低，也不代表模型比较后建议全部保留；如有需要，可手动设置更严格的误差上限。';
+    recommendation.textContent = '没发现明显的离群照片。'
+      + '如果你有明确的误差上限，也可以手动填阈值。';
   } else {
-    recommendation.textContent = '当前无法判断统计离群帧；如有需要，可手动设置误差上限。';
+    recommendation.textContent = '当前无法判断离群照片；如有需要，可手动设置筛选阈值。';
   }
 
   const used = (fit.used_names || []).length;
   const dropped = (fit.dropped || []).length;
   const rms = Number.isFinite(fit.rms) ? `${fit.rms.toFixed(3)} px` : '不可用';
-  result.textContent = `最近一次标定：最终使用 ${used} 张（首轮 ${total} 张）；最终剔除 ${dropped} 张；最终 RMS ${rms}。`
-    + (fit.threshold_stop_reason ? ` ${fit.threshold_stop_reason}` : '')
-    + ' 统计离群帧检查不评估筛选后模型的泛化表现，也不是标定质量合格标准。';
+  result.textContent = `最近一次标定：最后用了 ${used} 张（一开始 ${total} 张）；剔除 ${dropped} 张；最终 RMS ${rms}。`
+    + (fit.threshold_stop_reason ? ` ${fit.threshold_stop_reason}` : '');
 }
 
 /** 展示独立 LOOCV 自动筛选评估；“使用建议”只填写阈值，不启动标定。 */
@@ -129,7 +131,7 @@ function renderCalibrationSelection(snapshot) {
   progress.max = Math.max(1, Number(p.total) || 1);
   progress.value = Math.min(progress.max, Number(p.completed) || 0);
   status.textContent = (p.detail || '')
-    || (snapshot && snapshot.status === 'idle' ? '尚未运行自动筛选评估。' : '');
+    || (snapshot && snapshot.status === 'idle' ? '尚未运行照片筛选评估。' : '');
   result.replaceChildren();
   result.hidden = true;
   const selectionReady = snapshot && snapshot.status === 'complete' && snapshot.result;
@@ -141,7 +143,7 @@ function renderCalibrationSelection(snapshot) {
 
   if (!snapshot) return;
   if (snapshot.status === 'failed') {
-    status.textContent = snapshot.error || p.detail || '自动筛选评估未能完成。';
+    status.textContent = snapshot.error || p.detail || '照片筛选评估未能完成。';
     return;
   }
   if (snapshot.status !== 'complete' || !snapshot.result) return;
@@ -156,7 +158,7 @@ function renderCalibrationSelection(snapshot) {
   result.appendChild(recommendation);
 
   const comparisonTitle = document.createElement('p');
-  comparisonTitle.textContent = `留一验证误差（LOOCV，${assessment.fold_count} 折）：`;
+  comparisonTitle.textContent = `逐张验证误差（留一验证 / LOOCV，${assessment.fold_count} 折）：`;
   result.appendChild(comparisonTitle);
   const comparison = document.createElement('ul');
   const bestCount = Number.isInteger(assessment.best_retained_count)
@@ -196,7 +198,7 @@ function renderCalibrationSelection(snapshot) {
   result.appendChild(geometry);
   const note = document.createElement('p');
   note.className = 'hint';
-  note.textContent = '评估使用留一验证（LOOCV）；结果只针对当前这批照片，不代表绝对标定精度。';
+  note.textContent = '结果是拿你这一批照片轮流互验出来的，只说明这批照片，不等于绝对标定精度。';
   result.appendChild(note);
 }
 
@@ -256,7 +258,7 @@ function renderCalibrationDiagnostics(diagnostics) {
   }
 
   section.hidden = false;
-  count.textContent = `本次诊断使用 ${diagnostics.view_count || 0} 张最终参与标定的照片。`;
+  count.textContent = `这一轮用了 ${diagnostics.view_count || 0} 张照片做诊断。`;
   heatmapPanel.hidden = true;
   detailPanel.hidden = true;
   heatmapButton.textContent = '查看覆盖热力图';
@@ -419,7 +421,7 @@ function drawErrorChart(fit, threshold) {
   if (!bars.length) {
     const cnt = $('calib-count');
     if (cnt) {
-      cnt.textContent = '当前 OpenCV 未提供逐视图 RMS，无法显示误差图或筛选预览。';
+      cnt.textContent = '这个 OpenCV 版本读不出每张照片的误差，无法显示误差图或筛选预览。';
       cnt.className = 'hint mono';
     }
     return;
@@ -436,11 +438,11 @@ function drawErrorChart(fit, threshold) {
     const pending = hasThr && (applied == null || Math.abs(applied - threshold) > 1e-9);
     cnt.textContent = hasThr
       ? (hasFirstPass
-        ? `第一轮有 ${cut} / ${bars.length} 张超过该阈值；迭代重标后最终数量可能变化。`
-        : '缺少第一轮逐视图误差数据，无法预览该阈值。')
+        ? `按这个上限会先筛掉 ${cut} / ${bars.length} 张；重新标定后实际数量可能变。`
+        : '缺少第一轮误差数据，无法预览这个上限。')
       : (hasFirstPass
-        ? `第一轮共 ${bars.length} 张视图；当前未设置筛选阈值。`
-        : '当前结果没有首轮误差数据，无法预览；尚未设置筛选阈值。');
+        ? `第一轮共 ${bars.length} 张照片；当前未设置筛选上限。`
+        : '当前结果没有第一轮误差数据，无法预览；尚未设置筛选上限。');
     if (hasThr && pending) cnt.textContent += ' · 预览，点「运行标定」生效';
     cnt.className = 'hint mono' + (cut ? ' bad' : '');
   }
