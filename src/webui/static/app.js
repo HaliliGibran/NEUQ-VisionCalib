@@ -112,7 +112,7 @@ function renderCalibrationSummary(fit) {
     + ' 统计离群帧检查不评估筛选后模型的泛化表现，也不是标定质量合格标准。';
 }
 
-/** 展示独立 LOOCV 自动筛选评估；“使用建议值”只填写阈值，不启动标定。 */
+/** 展示独立 LOOCV 自动筛选评估；“使用建议”只填写阈值，不启动标定。 */
 function renderCalibrationSelection(snapshot) {
   state.calibrationSelection = snapshot;
   const start = $('btn-selection-start');
@@ -133,8 +133,7 @@ function renderCalibrationSelection(snapshot) {
   result.replaceChildren();
   result.hidden = true;
   const selectionReady = snapshot && snapshot.status === 'complete' && snapshot.result;
-  use.textContent = (selectionReady && snapshot.result.status === 'no_filter')
-    ? '使用建议（不剔除）' : '使用建议值';
+  use.textContent = '使用建议';
   use.disabled = !(selectionReady && (
     snapshot.result.status === 'no_filter'
     || (snapshot.result.status === 'recommended'
@@ -151,7 +150,7 @@ function renderCalibrationSelection(snapshot) {
   result.hidden = false;
   const recommendation = document.createElement('p');
   recommendation.textContent = assessment.status === 'no_filter'
-    ? `建议不剔除：保留全部 ${assessment.retained_count} / ${assessment.total_count} 张。`
+    ? `建议：不剔除，保留 ${assessment.retained_count} / ${assessment.total_count} 张。`
     : `建议阈值：${formatOutlierBoundary(Number(assessment.recommended_threshold))} px · `
       + `预计保留 ${assessment.retained_count} / ${assessment.total_count} 张。`;
   result.appendChild(recommendation);
@@ -163,9 +162,9 @@ function renderCalibrationSelection(snapshot) {
   const bestCount = Number.isInteger(assessment.best_retained_count)
     ? assessment.best_retained_count : null;
   [
-    `不剔除：${assessment.baseline_cv_rms.toFixed(3)} px（${assessment.total_count} 张）`,
+    `全部保留：${assessment.baseline_cv_rms.toFixed(3)} px（${assessment.total_count} 张）`,
     `推荐方案：${assessment.selected_cv_rms.toFixed(3)} px（${assessment.retained_count} 张）`,
-    `最低验证误差方案：${assessment.best_cv_rms.toFixed(3)} px（${bestCount ?? '未知'} 张）`,
+    `误差最低：${assessment.best_cv_rms.toFixed(3)} px（${bestCount ?? '未知'} 张）`,
   ].forEach((text) => {
     const item = document.createElement('li');
     item.textContent = text;
@@ -175,16 +174,16 @@ function renderCalibrationSelection(snapshot) {
 
   const improvement = Math.max(0, assessment.baseline_cv_rms - assessment.best_cv_rms);
   const change = document.createElement('p');
-  change.textContent = `最低验证误差比不剔除低 ${improvement.toFixed(3)} px；`
-    + `共比较 ${assessment.candidate_count} 种保留数量策略。`;
+  change.textContent = `误差最低的方案只低了 ${improvement.toFixed(3)} px，`
+    + `共比较 ${assessment.candidate_count} 种保留张数。`;
   result.appendChild(change);
 
   if (assessment.status === 'no_filter') {
     const reason = document.createElement('p');
     reason.className = 'hint';
     reason.textContent = (bestCount !== null && bestCount < assessment.total_count)
-      ? '两者验证表现足够接近；按一标准误（one-SE）规则，此时优先选择保留更多照片的方案。'
-      : '不剔除方案本身就是最低验证误差方案；当前评估没有给出支持删帧的证据。';
+      ? '两者差别很小。按 one-SE 规则，这种情况下优先少删照片，所以这里建议全部保留。'
+      : '全部保留本身就是误差最低的方案，不需要删。';
     result.appendChild(reason);
   }
 
@@ -197,7 +196,7 @@ function renderCalibrationSelection(snapshot) {
   result.appendChild(geometry);
   const note = document.createElement('p');
   note.className = 'hint';
-  note.textContent = assessment.note;
+  note.textContent = '评估使用留一验证（LOOCV）；结果只针对当前这批照片，不代表绝对标定精度。';
   result.appendChild(note);
 }
 
