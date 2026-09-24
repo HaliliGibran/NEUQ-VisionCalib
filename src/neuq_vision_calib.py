@@ -827,7 +827,7 @@ def _evaluate_calibration_fold(task: dict, *, cancel_event=None,
             'error': error,
             'detail': (f'候选保留 {retained_count}/{total_views} 张，阈值 '
                        f'{threshold_label}，留出 {fold_name}：'
-                       + (f'留出 RMS {error:.4f} px。' if error is not None
+                       + (f'留一验证误差 {error:.4f} px。' if error is not None
                           else f'{reason or "该折无法稳定求解"}。')),
         })
 
@@ -1120,8 +1120,8 @@ def assess_calibration_filter(obj_points: Sequence[np.ndarray],
                                  'pose_diversity', 'scale_diversity')
         ],
         'dropped_names': [name for name, _error in replay[10]],
-        'note': ('各折阈值只由对应训练集生成；LOOCV 使用平方重投影误差的一标准误规则，'
-                 '接近最优时优先保留更多照片。'
+        'note': ('每个留一折只用训练照片拟合一次逐张剔除路径，不同保留数量候选复用路径上的模型；'
+                 '留出照片只用于验证。多个方案验证表现足够接近时，按一标准误（one-SE）规则优先保留更多照片。'
                  '推荐值是当前模型与当前数据下的比较建议，不是标定准确度保证。'),
     }
 

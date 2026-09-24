@@ -157,7 +157,7 @@ function renderCalibrationSelection(snapshot) {
   result.appendChild(recommendation);
 
   const comparisonTitle = document.createElement('p');
-  comparisonTitle.textContent = `LOOCV 留出 RMS（${assessment.fold_count} 折）：`;
+  comparisonTitle.textContent = `留一验证误差（LOOCV，${assessment.fold_count} 折）：`;
   result.appendChild(comparisonTitle);
   const comparison = document.createElement('ul');
   const bestCount = Number.isInteger(assessment.best_retained_count)
@@ -165,7 +165,7 @@ function renderCalibrationSelection(snapshot) {
   [
     `不剔除：${assessment.baseline_cv_rms.toFixed(3)} px（${assessment.total_count} 张）`,
     `推荐方案：${assessment.selected_cv_rms.toFixed(3)} px（${assessment.retained_count} 张）`,
-    `数值最优可行方案：${assessment.best_cv_rms.toFixed(3)} px（${bestCount ?? '未知'} 张）`,
+    `最低验证误差方案：${assessment.best_cv_rms.toFixed(3)} px（${bestCount ?? '未知'} 张）`,
   ].forEach((text) => {
     const item = document.createElement('li');
     item.textContent = text;
@@ -175,7 +175,7 @@ function renderCalibrationSelection(snapshot) {
 
   const improvement = Math.max(0, assessment.baseline_cv_rms - assessment.best_cv_rms);
   const change = document.createElement('p');
-  change.textContent = `数值最优较不剔除改善 ${improvement.toFixed(3)} px；`
+  change.textContent = `最低验证误差比不剔除低 ${improvement.toFixed(3)} px；`
     + `共比较 ${assessment.candidate_count} 种保留数量策略。`;
   result.appendChild(change);
 
@@ -183,8 +183,8 @@ function renderCalibrationSelection(snapshot) {
     const reason = document.createElement('p');
     reason.className = 'hint';
     reason.textContent = (bestCount !== null && bestCount < assessment.total_count)
-      ? '数值最优可行方案的改善仍在 one-SE 统计范围内；按规则优先保留更多照片，因此推荐不剔除。'
-      : '不剔除也是数值最优可行方案；当前评估没有给出支持删帧的证据。';
+      ? '两者验证表现足够接近；按一标准误（one-SE）规则，此时优先选择保留更多照片的方案。'
+      : '不剔除方案本身就是最低验证误差方案；当前评估没有给出支持删帧的证据。';
     result.appendChild(reason);
   }
 

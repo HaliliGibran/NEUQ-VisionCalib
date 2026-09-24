@@ -100,7 +100,7 @@
       </div>
       <section class="filter-assessment" aria-labelledby="calib-selection-title">
         <h4 id="calib-selection-title">自动筛选评估（LOOCV）</h4>
-        <p class="hint">逐个比较不同照片保留数量策略；每折只用训练照片独立生成阈值并重放筛选流程，留出照片仅用于验证。接近最佳泛化表现时优先保留更多照片。该建议与上方 MAD 统计离群检查相互独立。</p>
+        <p class="hint">比较不剔除与不同照片保留数量的方案。每个留一折只用训练照片拟合一次逐张剔除路径，不同保留数量候选复用路径上的模型；留出照片不参与拟合或删帧决策，仅用于验证。验证表现接近时优先保留更多照片。该建议与上方 MAD 统计离群检查相互独立。根据照片数量和电脑性能，完整评估可能需要数分钟。</p>
         <div class="diagnostic-actions">
           <button id="btn-selection-start" class="ghost sm" type="button">评估筛选建议</button>
           <button id="btn-selection-cancel" class="ghost sm" type="button" disabled>取消评估</button>
