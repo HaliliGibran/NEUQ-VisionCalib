@@ -51,8 +51,9 @@ def test_one_standard_error_prefers_more_views():
          'fold_errors': [0.1] * 5},
     ]
     chosen = select_calibration_filter_candidate(candidates, 5)
-    check(chosen['near_best'][0]['retained_count'] == 8,
-          '一标准误范围内优先保留更多照片，且排除几何退化候选')
+    check(chosen['near_best'][0]['retained_count'] == 8
+          and chosen['best_retained_count'] == 8,
+          '返回数值最优候选的保留张数，并按一标准误优先保留更多照片')
 
     keep_all = select_calibration_filter_candidate([
         {'threshold': None, 'retained_count': 5, 'geometry_safe': True,
@@ -60,8 +61,9 @@ def test_one_standard_error_prefers_more_views():
         {'threshold': 1.0, 'retained_count': 3, 'geometry_safe': True,
          'fold_errors': [0.89, 0.91, 0.9, 0.9, 0.9]},
     ], 5)
-    check(keep_all['near_best'][0]['threshold'] is None,
-          '不剔除基线处于一标准误范围内时优先不剔除')
+    check(keep_all['near_best'][0]['threshold'] is None
+          and keep_all['best_retained_count'] == 5,
+          '不剔除基线处于一标准误范围内时优先不剔除，仍报告数值最优张数')
 
 
 def test_geometry_gate():
@@ -156,6 +158,7 @@ def test_loocv_reuses_each_fold_path_without_heldout_view():
         one_at_a_time &= all(a - b == 1 for a, b in pairwise(counts))
     check(one_at_a_time, '训练折每轮至多剔除一张，并在下一轮重新完整拟合')
     check(result['status'] == 'recommended' and result['retained_count'] == 4
+          and result['best_retained_count'] == 4
           and result['dropped_names'] == ['view_4.jpg']
           and abs(result['recommended_threshold'] - 3.5) < 1e-9,
           'LOOCV 改善且正式全数据路径复核成功后才返回阈值')

@@ -259,7 +259,8 @@ def select_calibration_filter_candidate(candidates: Sequence[dict], fold_count: 
                       'mean_squared_error': mean_loss,
                       'cv_rms': sqrt(mean_loss)})
     if not valid:
-        return {'best_cv_rms': None, 'one_se_limit_mse': None, 'near_best': []}
+        return {'best_cv_rms': None, 'best_retained_count': None,
+                'one_se_limit_mse': None, 'near_best': []}
 
     best = min(valid, key=lambda item: item['mean_squared_error'])
     best_losses = best['fold_losses']
@@ -271,6 +272,7 @@ def select_calibration_filter_candidate(candidates: Sequence[dict], fold_count: 
                                      item['mean_squared_error']))
     return {
         'best_cv_rms': float(best['cv_rms']),
+        'best_retained_count': int(best['retained_count']),
         'one_se_limit_mse': float(one_se_limit),
         'near_best': near_best,
     }
