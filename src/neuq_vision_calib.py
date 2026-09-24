@@ -54,10 +54,14 @@ import contextlib
 import hashlib
 import json
 import math
+import multiprocessing
+import os
+import queue
 import re
 import shutil
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -681,6 +685,229 @@ def _threshold_inside(lower: float, upper: float) -> Optional[float]:
     return midpoint if lower < midpoint < upper else None
 
 
+_CALIBRATION_WORKER_CANCEL_EVENT = None
+_CALIBRATION_WORKER_PROGRESS_QUEUE = None
+
+
+def _calibration_worker_init(cancel_event, progress_queue) -> None:
+    """初始化 LOOCV 子进程，并避免 OpenCV 在线程池里再次超额并行。"""
+    global _CALIBRATION_WORKER_CANCEL_EVENT, _CALIBRATION_WORKER_PROGRESS_QUEUE
+    _CALIBRATION_WORKER_CANCEL_EVENT = cancel_event
+    _CALIBRATION_WORKER_PROGRESS_QUEUE = progress_queue
+    cv2.setNumThreads(1)
+
+
+def _calibration_fold_process_entry(task: dict) -> dict:
+    """进程池入口；任务和回调都保持模块顶层可 pickle。"""
+    return _evaluate_calibration_fold(
+        task,
+        cancel_event=_CALIBRATION_WORKER_CANCEL_EVENT,
+        progress_callback=_CALIBRATION_WORKER_PROGRESS_QUEUE.put,
+    )
+
+
+def _evaluate_calibration_fold(task: dict, *, cancel_event=None,
+                               progress_callback=None) -> dict:
+    """为一个留出视图只拟合一次逐张删除路径，再从路径读取所有候选模型。"""
+    fold_index = task['fold_index']
+    fold_name = task['fold_name']
+    total_views = task['total_views']
+    candidate_counts = task['candidate_counts']
+    train_obj = task['train_obj']
+    train_img = task['train_img']
+    train_used = task['train_used']
+    img_size = task['img_size']
+    heldout_obj = task['heldout_obj']
+    heldout_img = task['heldout_img']
+
+    def report(event: dict) -> None:
+        if progress_callback:
+            progress_callback(event)
+
+    fold_path = []
+    report({
+        'kind': 'fold_start', 'fold_index': fold_index, 'fold_name': fold_name,
+        'fit_round': 0,
+    })
+
+    def record_model(model: dict) -> None:
+        _check_cancel(cancel_event)
+        fold_path.append(model)
+        report({
+            'kind': 'fold_path', 'fold_index': fold_index, 'fold_name': fold_name,
+            'fit_round': len(fold_path), 'retained_count': len(model['used']),
+        })
+
+    # 只从 N-1 张训练图拟合一条完整的逐张路径。每一步的模型都作为候选缓存，
+    # 后面不用为每个保留数量再次从头运行同一串 calibrateCamera。
+    fit_camera(train_obj, train_img, train_used, img_size,
+               threshold=-math.inf, iteration_callback=record_model,
+               cancel_event=cancel_event, verbose=False)
+    if len(fold_path) != total_views - 3:
+        raise ValueError('OpenCV 未提供完整训练折逐视图 RMS，无法进行 LOOCV。')
+    if any(len(model['per_view']) != len(model['used']) for model in fold_path):
+        raise ValueError('当前 OpenCV 未提供与视图一一对应的 RMS，无法进行 LOOCV。')
+
+    path_by_count = {len(model['used']): model for model in fold_path}
+    baseline_model = path_by_count.get(total_views - 1)
+    if baseline_model is None:
+        raise ValueError('训练折缺少不剔除模型，无法进行 LOOCV。')
+    baseline_diagnostics = diagnose_calibration_views(
+        baseline_model['img_points'], baseline_model['obj_points'],
+        baseline_model['rvecs'], baseline_model['tvecs'], baseline_model['K'],
+        baseline_model['std_int'], img_size,
+        [path.name for path in baseline_model['used']], baseline_model['per_view'])
+
+    candidate_results = []
+    for candidate_index, retained_count in enumerate(candidate_counts, start=1):
+        _check_cancel(cancel_event)
+        if retained_count == total_views:
+            model = baseline_model
+            threshold_value = None
+            reason = None
+        else:
+            # 外层留出一张，所以目标训练模型比完整数据目标少保留一张。
+            model = path_by_count.get(retained_count - 1)
+            if model is None or not model['per_view'].size:
+                threshold_value = None
+                reason = '无法生成训练折候选模型'
+            else:
+                lower = float(np.max(model['per_view']))
+                upper = min((error for _name, error in model['dropped']),
+                            default=math.inf)
+                threshold_value = _threshold_inside(lower, upper)
+                reason = (None if threshold_value is not None
+                          else '训练折中不存在严格阈值区间')
+
+        geometry_regressions = []
+        error = None
+        if reason is None and model is not None:
+            try:
+                if retained_count != total_views:
+                    candidate_diagnostics = diagnose_calibration_views(
+                        model['img_points'], model['obj_points'], model['rvecs'],
+                        model['tvecs'], model['K'], model['std_int'], img_size,
+                        [path.name for path in model['used']], model['per_view'])
+                    geometry_regressions = calibration_filter_geometry_regressions(
+                        baseline_diagnostics, candidate_diagnostics)
+                _check_cancel(cancel_event)
+                success, rvec, tvec = cv2.solvePnP(
+                    np.asarray(heldout_obj, dtype=np.float32),
+                    np.asarray(heldout_img, dtype=np.float32),
+                    model['K'], model['D'], flags=cv2.SOLVEPNP_ITERATIVE)
+                if success:
+                    projected, _jacobian = cv2.projectPoints(
+                        heldout_obj, rvec, tvec, model['K'], model['D'])
+                    delta = (projected.reshape(-1, 2)
+                             - np.asarray(heldout_img).reshape(-1, 2))
+                    error = float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
+                    if not math.isfinite(error):
+                        error = None
+            except CalibrationCancelled:
+                raise
+            except (cv2.error, ValueError, RuntimeError, np.linalg.LinAlgError):
+                error = None
+
+        candidate_results.append({
+            'target_count': retained_count,
+            'threshold': threshold_value,
+            'error': error,
+            'geometry_regressions': geometry_regressions,
+            'invalid_reason': reason,
+        })
+        threshold_label = (
+            '不剔除' if retained_count == total_views
+            else f'{threshold_value:.8g} px（本折训练集）'
+            if threshold_value is not None else '无可用阈值'
+        )
+        report({
+            'kind': 'candidate', 'candidate_index': candidate_index,
+            'fold_index': fold_index, 'fold_name': fold_name,
+            'retained_count': retained_count, 'threshold': threshold_value,
+            'error': error,
+            'detail': (f'候选保留 {retained_count}/{total_views} 张，阈值 '
+                       f'{threshold_label}，留出 {fold_name}：'
+                       + (f'留出 RMS {error:.4f} px。' if error is not None
+                          else f'{reason or "该折无法稳定求解"}。')),
+        })
+
+    return {
+        'fold_index': fold_index,
+        'candidate_results': candidate_results,
+    }
+
+
+def _calibration_worker_count(total_folds: int) -> int:
+    """限制 LOOCV 并发，给 Web UI 与 OpenCV 外的工作留出 CPU 余量。"""
+    logical_cpus = os.cpu_count() or 1
+    return min(total_folds, 4, max(1, logical_cpus - 2))
+
+
+def _run_calibration_folds(tasks: Sequence[dict], worker_count: int, *,
+                           cancel_event: Optional[Event], progress_callback=None) -> list[dict]:
+    """串行或以有界 spawn 进程池执行独立的 LOOCV folds。"""
+    if worker_count <= 1:
+        results = []
+        for task in tasks:
+            _check_cancel(cancel_event)
+            results.append(_evaluate_calibration_fold(
+                task, cancel_event=cancel_event, progress_callback=progress_callback))
+        return results
+
+    context = multiprocessing.get_context('spawn')
+    worker_cancel_event = context.Event()
+    progress_queue = context.Queue()
+    executor = None
+    futures = []
+    completed_normally = False
+    try:
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count, mp_context=context,
+            initializer=_calibration_worker_init,
+            initargs=(worker_cancel_event, progress_queue),
+        )
+        futures = [executor.submit(_calibration_fold_process_entry, task) for task in tasks]
+        pending = set(futures)
+        results = []
+        while pending:
+            _check_cancel(cancel_event)
+            try:
+                event = progress_queue.get(timeout=0.1)
+            except queue.Empty:
+                pass
+            else:
+                if progress_callback:
+                    progress_callback(event)
+
+            ready = [future for future in pending if future.done()]
+            for future in ready:
+                pending.remove(future)
+                results.append(future.result())
+
+        # 先让 worker 正常退出并 flush Queue feeder，再消费尾部进度事件。
+        executor.shutdown(wait=True, cancel_futures=True)
+        executor = None
+        while True:
+            try:
+                event = progress_queue.get_nowait()
+            except queue.Empty:
+                break
+            if progress_callback:
+                progress_callback(event)
+        _check_cancel(cancel_event)
+        completed_normally = True
+        return sorted(results, key=lambda item: item['fold_index'])
+    finally:
+        if executor is not None:
+            if not completed_normally:
+                worker_cancel_event.set()
+                for future in futures:
+                    future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+        progress_queue.close()
+        progress_queue.join_thread()
+
+
 def assess_calibration_filter(obj_points: Sequence[np.ndarray],
                               img_points: Sequence[np.ndarray], used: Sequence[Path],
                               img_size: Tuple[int, int], *,
@@ -688,10 +915,14 @@ def assess_calibration_filter(obj_points: Sequence[np.ndarray],
                               cancel_event: Optional[Event] = None) -> dict:
     """用逐折 LOOCV 比较保留数量策略，并验证全数据可执行阈值。
 
-    候选由“保留 N、N-1、……、4 张”定义。每个 fold 只用 N-1 张训练照片生成
-    自己的阈值边界；之后每个候选都从完整训练折重新调用正式逐张筛选路径。这样
-    留出视图不会影响候选阈值的产生、标定或删帧决策，只用于固定 K/D 后的姿态求解
-    和重投影误差。MAD 首轮统计检查不参与此评估。
+    候选由“保留 N、N-1、……、4 张”定义。每个 fold 只用 N-1 张训练照片，从头
+    拟合一条正式的逐张删除路径，并复用路径上对应保留数的 K/D；候选阈值仍只由该折
+    训练模型的逐视图 RMS 生成。留出视图不参与标定或删帧决策，只用于固定 K/D 后的
+    姿态求解和重投影误差。选定候选仍须在完整数据上通过正式阈值路径重放。MAD 首轮
+    统计检查不参与此评估。
+
+    独立 folds 由有界 spawn 进程池运行；每折只计算一次逐张拟合路径，避免候选之间
+    重复标定。每个 OpenCV 标定完成后检查取消信号。
     """
     total_views = len(used)
     if total_views < 4:
@@ -713,163 +944,70 @@ def assess_calibration_filter(obj_points: Sequence[np.ndarray],
         'fold_errors': [],
     } for retained_count in candidate_counts]
 
-    # 每个外层 fold 只用其训练集建立阈值区间；留出照片完全不参与这一步。
-    folds = []
+    # 每个外层 fold 只传训练图供标定；留出点单独传入，只在模型固定后求解外参。
+    fold_tasks = []
     for heldout_index, heldout_path in enumerate(used):
         _check_cancel(cancel_event)
         train_indices = [i for i in range(total_views) if i != heldout_index]
-        train_obj = [obj_points[i] for i in train_indices]
-        train_img = [img_points[i] for i in train_indices]
-        train_used = [used[i] for i in train_indices]
-        fold_path = []
-        report('fold_paths', heldout_index, total_views,
-               f'为留出 {heldout_index + 1}/{total_views}（{heldout_path.name}）'
-               '仅用训练照片生成候选阈值区间。',
-               fold_index=heldout_index, fold_name=heldout_path.name, fit_round=0)
-
-        def record_fold_model(model: dict, *, fold_index=heldout_index,
-                              fold_name=heldout_path.name, path=fold_path):
-            path.append(model)
-            report('fold_paths', fold_index, total_views,
-                   f'留出 {fold_index + 1}/{total_views}：训练路径重标至 '
-                   f'{len(model["used"])} 张。',
-                   fold_index=fold_index, fold_name=fold_name,
-                   fit_round=len(path))
-
-        fit_camera(train_obj, train_img, train_used, img_size,
-                   threshold=-math.inf, iteration_callback=record_fold_model,
-                   cancel_event=cancel_event, verbose=False)
-        if len(fold_path) != total_views - 3:
-            raise ValueError('OpenCV 未提供完整训练折逐视图 RMS，无法进行 LOOCV。')
-        if any(len(model['per_view']) != len(model['used']) for model in fold_path):
-            raise ValueError('当前 OpenCV 未提供与视图一一对应的 RMS，无法进行 LOOCV。')
-        folds.append({
-            'heldout_index': heldout_index,
-            'heldout_path': heldout_path,
-            'train_obj': train_obj,
-            'train_img': train_img,
-            'train_used': train_used,
-            'path_by_count': {len(model['used']): model for model in fold_path},
-            'baseline_diagnostics': None,
+        fold_tasks.append({
+            'fold_index': heldout_index,
+            'fold_name': heldout_path.name,
+            'total_views': total_views,
+            'candidate_counts': candidate_counts,
+            'train_obj': [obj_points[i] for i in train_indices],
+            'train_img': [img_points[i] for i in train_indices],
+            'train_used': [used[i] for i in train_indices],
+            'img_size': img_size,
+            'heldout_obj': obj_points[heldout_index],
+            'heldout_img': img_points[heldout_index],
         })
 
     cv_total = len(candidates) * total_views
-    completed = 0
-    for candidate_index, candidate in enumerate(candidates, start=1):
-        retained_count = candidate['target_count']
-        for fold in folds:
-            _check_cancel(cancel_event)
-            heldout_index = fold['heldout_index']
-            heldout_path = fold['heldout_path']
-            if retained_count == total_views:
-                threshold_value = None
-                expected_names = [path.name for path in fold['train_used']]
-            else:
-                fold_model = fold['path_by_count'].get(retained_count - 1)
-                if fold_model is None or not fold_model['per_view'].size:
-                    candidate['geometry_safe'] = False
-                    candidate['geometry_regressions'].add('无法生成训练折候选阈值')
-                    candidate['fold_errors'].append(None)
-                    completed += 1
-                    report('cross_validation', completed, cv_total,
-                           f'候选保留 {retained_count}/{total_views} 张；'
-                           f'留出 {heldout_path.name}：该训练折无法生成严格阈值。',
-                           candidate_index=candidate_index, fold_index=heldout_index,
-                           fold_name=heldout_path.name, fit_round=0)
-                    continue
-                lower = float(np.max(fold_model['per_view']))
-                upper = min((error for _name, error in fold_model['dropped']),
-                            default=math.inf)
-                threshold_value = _threshold_inside(lower, upper)
-                expected_names = [path.name for path in fold_model['used']]
-                if threshold_value is None:
-                    candidate['geometry_safe'] = False
-                    candidate['geometry_regressions'].add('训练折中不存在严格阈值区间')
-                    candidate['fold_errors'].append(None)
-                    completed += 1
-                    report('cross_validation', completed, cv_total,
-                           f'候选保留 {retained_count}/{total_views} 张；'
-                           f'留出 {heldout_path.name}：无法用单一阈值精确到达该保留数。',
-                           candidate_index=candidate_index, fold_index=heldout_index,
-                           fold_name=heldout_path.name, fit_round=0)
-                    continue
+    worker_count = _calibration_worker_count(total_views)
+    fold_path_total = total_views * (total_views - 3)
+    report('fold_paths', 0, fold_path_total,
+           f'为 {total_views} 个留出折建立逐张重标路径（最多 {worker_count} 个进程）。',
+           worker_count=worker_count)
+    fold_path_completed = 0
+    cv_completed = 0
 
-            threshold_label = ('不剔除' if threshold_value is None
-                               else f'{threshold_value:.8g} px（本折训练集）')
-            detail_prefix = (f'候选保留 {retained_count}/{total_views} 张，'
-                             f'阈值 {threshold_label}，留出 {heldout_path.name}')
-            fit_round = 0
-            report('cross_validation', completed, cv_total,
-                   f'{detail_prefix}：从完整训练折开始。',
-                   candidate_index=candidate_index, fold_index=heldout_index,
-                   fold_name=heldout_path.name, fit_round=0,
-                   retained_count=retained_count, threshold=threshold_value)
+    def fold_progress(event: dict) -> None:
+        nonlocal fold_path_completed, cv_completed
+        if event['kind'] == 'fold_start':
+            report('fold_paths', fold_path_completed, fold_path_total,
+                   f'开始留出 {event["fold_index"] + 1}/{total_views} '
+                   f'（{event["fold_name"]}）的训练路径。',
+                   fold_index=event['fold_index'], fold_name=event['fold_name'],
+                   fit_round=0)
+        elif event['kind'] == 'fold_path':
+            fold_path_completed += 1
+            index = event['fold_index'] + 1
+            report('fold_paths', fold_path_completed, fold_path_total,
+                   f'留出 {index}/{total_views}（{event["fold_name"]}）：路径重标至 '
+                   f'{event["retained_count"]} 张。',
+                   fold_index=event['fold_index'], fold_name=event['fold_name'],
+                   fit_round=event['fit_round'])
+        else:
+            cv_completed += 1
+            report('cross_validation', cv_completed, cv_total, event['detail'],
+                   candidate_index=event['candidate_index'],
+                   fold_index=event['fold_index'], fold_name=event['fold_name'],
+                   fit_round=0, retained_count=event['retained_count'],
+                   threshold=event['threshold'])
 
-            def fitted(_model, *, done=completed, prefix=detail_prefix,
-                       cand_index=candidate_index, fold_index=heldout_index,
-                       fold_name=heldout_path.name):
-                nonlocal fit_round
-                fit_round += 1
-                _check_cancel(cancel_event)
-                report('cross_validation', done, cv_total,
-                       f'{prefix}，正式路径重标第 {fit_round} 轮（'
-                       f'{len(_model["used"])} 张训练视图）。',
-                       candidate_index=cand_index, fold_index=fold_index,
-                       fold_name=fold_name, fit_round=fit_round)
-
-            error = None
-            try:
-                model_result = fit_camera(
-                    fold['train_obj'], fold['train_img'], fold['train_used'], img_size,
-                    threshold=threshold_value, iteration_callback=fitted,
-                    cancel_event=cancel_event, verbose=False)
-                fold_names = [path.name for path in model_result[9]]
-                if fold_names != expected_names or model_result[12] is not None:
-                    candidate['geometry_safe'] = False
-                    candidate['geometry_regressions'].add('训练折正式筛选未到达候选保留集合')
-                else:
-                    diagnostics = diagnose_calibration_views(
-                        model_result[8], model_result[7], model_result[3], model_result[4],
-                        model_result[1], model_result[6], img_size, fold_names,
-                        model_result[5])
-                    if retained_count == total_views:
-                        fold['baseline_diagnostics'] = diagnostics
-                    elif fold['baseline_diagnostics'] is None:
-                        candidate['geometry_safe'] = False
-                        candidate['geometry_regressions'].add('不剔除训练折基线不可用')
-                    else:
-                        regressions = calibration_filter_geometry_regressions(
-                            fold['baseline_diagnostics'], diagnostics)
-                        if regressions:
-                            candidate['geometry_safe'] = False
-                            candidate['geometry_regressions'].update(regressions)
-
-                    _check_cancel(cancel_event)
-                    success, rvec, tvec = cv2.solvePnP(
-                        np.asarray(obj_points[heldout_index], dtype=np.float32),
-                        np.asarray(img_points[heldout_index], dtype=np.float32),
-                        model_result[1], model_result[2], flags=cv2.SOLVEPNP_ITERATIVE)
-                    if success:
-                        projected, _jacobian = cv2.projectPoints(
-                            obj_points[heldout_index], rvec, tvec,
-                            model_result[1], model_result[2])
-                        delta = (projected.reshape(-1, 2)
-                                 - np.asarray(img_points[heldout_index]).reshape(-1, 2))
-                        error = float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
-                        if not math.isfinite(error):
-                            error = None
-            except CalibrationCancelled:
-                raise
-            except (cv2.error, ValueError, RuntimeError, np.linalg.LinAlgError):
-                error = None
-
-            candidate['fold_errors'].append(error)
-            completed += 1
-            report('cross_validation', completed, cv_total,
-                   f'{detail_prefix}：留出 RMS {error:.4f} px。' if error is not None
-                   else f'{detail_prefix}：该折无法稳定求解。',
-                   candidate_index=candidate_index, fold_index=heldout_index,
-                   fold_name=heldout_path.name, fit_round=fit_round)
+    fold_results = _run_calibration_folds(
+        fold_tasks, worker_count, cancel_event=cancel_event,
+        progress_callback=fold_progress)
+    for candidate_index, candidate in enumerate(candidates):
+        for fold in fold_results:
+            record = fold['candidate_results'][candidate_index]
+            candidate['fold_errors'].append(record['error'])
+            if record['invalid_reason']:
+                candidate['geometry_safe'] = False
+                candidate['geometry_regressions'].add(record['invalid_reason'])
+            if record['geometry_regressions']:
+                candidate['geometry_safe'] = False
+                candidate['geometry_regressions'].update(record['geometry_regressions'])
 
     baseline_candidate = candidates[0]
     baseline_errors = baseline_candidate['fold_errors']

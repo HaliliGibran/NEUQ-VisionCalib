@@ -72,7 +72,7 @@ def test_geometry_gate():
           '画面覆盖、边缘、姿态、尺度按现有诊断等级阻止退化')
 
 
-def test_loocv_replays_each_candidate_without_heldout_view():
+def test_loocv_reuses_each_fold_path_without_heldout_view():
     count = 5
     object_points = [np.array([[[i, 0, 0]], [[i, 1, 0]], [[i, 0, 1]]], dtype=np.float32)
                      for i in range(count)]
@@ -104,12 +104,15 @@ def test_loocv_replays_each_candidate_without_heldout_view():
     def on_progress(item):
         nonlocal active_fold, formal_replay_active
         if item['stage'] == 'fold_paths':
-            active_fold = None
+            if 'fold_index' in item:
+                active_fold = (0, item['fold_index'])
+                if item.get('fit_round') == 0:
+                    fold_starts.add(active_fold)
+            else:
+                active_fold = None
             formal_replay_active = False
         elif item['stage'] == 'cross_validation' and item.get('fit_round') == 0:
-            active_fold = (item['candidate_index'], item['fold_index'])
-            fold_starts.add(active_fold)
-            fold_thresholds[active_fold] = item.get('threshold')
+            fold_thresholds[(item['candidate_index'], item['fold_index'])] = item.get('threshold')
         elif item['stage'] == 'full_path':
             active_fold = None
             formal_replay_active = False
@@ -131,6 +134,7 @@ def test_loocv_replays_each_candidate_without_heldout_view():
 
     with (patch.object(core, '_calibrate_once', side_effect=fake_calibrate),
           patch.object(core, 'diagnose_calibration_views', side_effect=lambda *a: _diagnostics()),
+          patch.object(core, '_calibration_worker_count', return_value=1),
           patch.object(core.cv2, 'solvePnP', side_effect=fake_solve_pnp),
           patch.object(core.cv2, 'projectPoints', side_effect=fake_project_points)):
         progress = []
@@ -138,9 +142,10 @@ def test_loocv_replays_each_candidate_without_heldout_view():
             object_points, image_points, used, (640, 480),
             progress_callback=track_progress)
 
-    expected_fold_count = result['candidate_count'] * count
-    check(len(fold_starts) == expected_fold_count,
-          '每个候选阈值都在每张留出视图上启动独立训练折')
+    expected_fold_count = count
+    check(len(fold_starts) == expected_fold_count
+          and sum(map(len, fold_training_calls.values())) == count * (count - 3),
+          '每折只完整标定一次逐张删除路径，候选复用对应模型')
     excluded = all(all(key[1] not in ids for ids in calls)
                    for key, calls in fold_training_calls.items())
     check(excluded and len(fold_training_calls) == expected_fold_count,
@@ -171,6 +176,7 @@ def test_loocv_replays_each_candidate_without_heldout_view():
     force_formal_replay_failure = True
     with (patch.object(core, '_calibrate_once', side_effect=fake_calibrate),
           patch.object(core, 'diagnose_calibration_views', side_effect=lambda *a: _diagnostics()),
+          patch.object(core, '_calibration_worker_count', return_value=1),
           patch.object(core.cv2, 'solvePnP', side_effect=fake_solve_pnp),
           patch.object(core.cv2, 'projectPoints', side_effect=fake_project_points)):
         try:
@@ -235,13 +241,118 @@ def test_webui_progress_and_cancel_bypass_compute_lock():
           '取消接口不等待计算锁，并在任务安全检查点停止后台评估')
 
 
+def test_webui_releases_compute_lock_during_assessment():
+    from types import SimpleNamespace
+
+    import webui.server as server
+
+    views = SimpleNamespace(obj_points=[], img_points=[], used=[], img_size=(640, 480))
+    assessment_started = Event()
+    lock_was_available = []
+
+    def fake_assess(*_args, cancel_event=None, progress_callback=None):
+        acquired = server.LOCK.acquire(blocking=False)
+        lock_was_available.append(acquired)
+        if acquired:
+            server.LOCK.release()
+        assessment_started.set()
+        while cancel_event is not None and not cancel_event.is_set():
+            sleep(0.01)
+        raise server.core.CalibrationCancelled('测试取消。')
+
+    with (patch.object(server.core, 'collect_calibration_views', return_value=views),
+          patch.object(server.core, 'assess_calibration_filter', side_effect=fake_assess)):
+        started = server.api_calibration_selection_start({})
+        entered = assessment_started.wait(2)
+        if entered:
+            acquired_by_request = server.LOCK.acquire(blocking=False)
+            if acquired_by_request:
+                server.LOCK.release()
+            cancelled = server.api_calibration_selection_cancel({})
+        else:
+            acquired_by_request = False
+            cancelled = {'status': 'failed'}
+
+        deadline = monotonic() + 2.0
+        while monotonic() < deadline:
+            final = server.calibration_selection_status()
+            if final['status'] == 'cancelled':
+                break
+            sleep(0.01)
+        server.invalidate_calibration_selection()
+
+    check(started['status'] == 'running' and entered and lock_was_available == [True],
+          '角点快照完成后，LOOCV 评估期间释放 Web 全局计算锁')
+    check(acquired_by_request and cancelled['status'] == 'cancelling'
+          and final['status'] == 'cancelled',
+          'LOOCV 计算期间其它需要全局锁的请求仍可进入，取消也能正常收敛')
+
+
+def test_spawn_process_folds():
+    grid = np.zeros((48, 3), dtype=np.float32)
+    grid[:, :2] = (np.mgrid[-4:4, -3:3].T.reshape(-1, 2) * 24).astype(np.float32)
+    matrix = np.array([[820.0, 0.0, 320.0],
+                       [0.0, 815.0, 240.0],
+                       [0.0, 0.0, 1.0]])
+    rotations = ((0.08, -0.15, 0.02), (-0.18, 0.1, -0.08),
+                 (0.2, 0.22, 0.04), (-0.12, -0.2, 0.1))
+    translations = ((-45.0, -25.0, 520.0), (-25.0, 20.0, 560.0),
+                    (30.0, -15.0, 590.0), (45.0, 20.0, 630.0))
+    object_points = []
+    image_points = []
+    rng = np.random.default_rng(42)
+    for rotation, translation in zip(rotations, translations, strict=True):
+        rvec = np.asarray(rotation, dtype=np.float64).reshape(3, 1)
+        tvec = np.asarray(translation, dtype=np.float64).reshape(3, 1)
+        projected, _jacobian = core.cv2.projectPoints(
+            grid, rvec, tvec, matrix, np.zeros(5))
+        object_points.append(grid.copy())
+        image_points.append((projected + rng.normal(0, 0.03, projected.shape))
+                            .astype(np.float32))
+
+    progress = []
+    with patch.object(core, '_calibration_worker_count', return_value=2):
+        result = core.assess_calibration_filter(
+            object_points, image_points,
+            [Path(f'process_view_{i}.jpg') for i in range(4)], (640, 480),
+            progress_callback=progress.append)
+
+    check(result['status'] == 'no_filter' and result['fold_count'] == 4
+          and result['retained_count'] == 4
+          and any(item['stage'] == 'fold_paths' for item in progress)
+          and any(item['stage'] == 'cross_validation' for item in progress),
+          'Windows spawn 进程池能完成 LOOCV 并回传进度，保留不剔除基线')
+
+    cancel_event = Event()
+
+    def cancel_from_progress(progress):
+        if (progress.get('stage') == 'fold_paths'
+                and progress.get('fit_round') == 0
+                and 'fold_index' in progress):
+            cancel_event.set()
+
+    try:
+        with patch.object(core, '_calibration_worker_count', return_value=2):
+            core.assess_calibration_filter(
+                object_points, image_points,
+                [Path(f'cancel_view_{i}.jpg') for i in range(4)], (640, 480),
+                progress_callback=cancel_from_progress, cancel_event=cancel_event)
+    except core.CalibrationCancelled:
+        cancelled = True
+    else:
+        cancelled = False
+    check(cancelled, 'LOOCV 进程池收到取消后会停止未开始折并等待当前标定安全退出')
+
+
 if __name__ == '__main__':
     print('LOOCV 筛选选择规则')
     test_one_standard_error_prefers_more_views()
     test_geometry_gate()
-    print('留一视图训练隔离与逐张重放')
-    test_loocv_replays_each_candidate_without_heldout_view()
+    print('留一视图训练隔离与拟合路径复用')
+    test_loocv_reuses_each_fold_path_without_heldout_view()
     print('进度与取消')
     test_cancellation()
     test_webui_progress_and_cancel_bypass_compute_lock()
+    test_webui_releases_compute_lock_during_assessment()
+    test_spawn_process_folds()
     sys.exit(1 if FAILED else 0)

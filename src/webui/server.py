@@ -99,7 +99,7 @@ STATE: dict = {
 # 当前 HTTP 服务实例，供"退出"接口调用 shutdown()（见 api_shutdown）
 HTTPD = None
 
-# LOOCV 是串行的长任务。状态与取消接口不获取 LOCK，确保计算期间仍可查询进度或取消。
+# LOOCV 是有界多进程的长任务。状态、进度和取消接口不获取 LOCK。
 CALIBRATION_SELECTION_GUARD = threading.Lock()
 CALIBRATION_SELECTION_EVENT = None
 CALIBRATION_SELECTION = {
@@ -323,12 +323,13 @@ def _run_calibration_selection(task_id: str, event: threading.Event) -> None:
                     task_id, event, {'stage': stage, 'completed': completed,
                                      'total': total, 'detail': detail}),
             )
-            result = core.assess_calibration_filter(
-                views.obj_points, views.img_points, views.used, views.img_size,
-                cancel_event=event,
-                progress_callback=lambda progress: _selection_progress(
-                    task_id, event, progress),
-            )
+        # 角点已复制到内存快照；LOOCV 不再读写工程状态，不能长期占用 Web 全局锁。
+        result = core.assess_calibration_filter(
+            views.obj_points, views.img_points, views.used, views.img_size,
+            cancel_event=event,
+            progress_callback=lambda progress: _selection_progress(
+                task_id, event, progress),
+        )
         if event.is_set():
             raise core.CalibrationCancelled('用户已取消自动筛选评估。')
         _set_calibration_selection(task_id, status='complete', result=result, error=None,
@@ -351,7 +352,7 @@ def _run_calibration_selection(task_id: str, event: threading.Event) -> None:
 
 
 def api_calibration_selection_start(_body: dict) -> dict:
-    """开始一次串行 LOOCV 评估，不改写正式标定结果。"""
+    """开始一次有界多进程 LOOCV 评估，不改写正式标定结果。"""
     global CALIBRATION_SELECTION_EVENT
     with CALIBRATION_SELECTION_GUARD:
         if CALIBRATION_SELECTION['status'] in ('running', 'cancelling'):
@@ -386,7 +387,7 @@ def api_calibration_selection_cancel(_body: dict) -> dict:
             CALIBRATION_SELECTION.update(
                 status='cancelling',
                 progress={**CALIBRATION_SELECTION['progress'],
-                          'detail': '正在取消；当前单次 OpenCV 运算结束后会停止。'},
+                          'detail': '正在取消；尚未开始的留出折会停止，各进程当前单次 OpenCV 标定结束后退出。'},
             )
         return {
             **CALIBRATION_SELECTION,
@@ -409,7 +410,7 @@ def invalidate_calibration_selection() -> None:
 
 
 def request_calibration_selection_cancel() -> None:
-    """让占用计算锁的 LOOCV 在当前标定步骤后退出。"""
+    """请求当前 LOOCV 在当前标定步骤后退出。"""
     with CALIBRATION_SELECTION_GUARD:
         if CALIBRATION_SELECTION['status'] == 'running':
             if CALIBRATION_SELECTION_EVENT is not None:

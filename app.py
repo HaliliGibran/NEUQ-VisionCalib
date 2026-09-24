@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import sys
+from multiprocessing import freeze_support
 from pathlib import Path
 
 
@@ -28,6 +29,7 @@ def main() -> None:
 
 
 if __name__ == '__main__':
+    freeze_support()
     try:
         main()
     except KeyboardInterrupt:
