@@ -328,7 +328,7 @@ _USE_GLOBAL_THRESHOLD = object()
 
 def _check_cancel(cancel_event: Optional[Event]) -> None:
     if cancel_event is not None and cancel_event.is_set():
-        raise CalibrationCancelled('用户已取消自动筛选评估。')
+        raise CalibrationCancelled('用户已取消照片筛选评估。')
 
 # 查找表导出。默认值保证与历史产物完全一致（1280x720 的逗号分隔文本）。
 # 全尺寸文本表在 720p 下约 55 MB，单片机放不下，所以另给了定点二进制与 C 头文件两条路。
@@ -523,8 +523,8 @@ def collect_calibration_views(board: Optional[CheckerboardSpec] = None,
     require_material_basis('相机标定', block_unknown=False)
     files = list_images(DIR_CALIB_IN)
     if len(files) < 3:
-        raise SystemExit(f'{DIR_CALIB_IN} 中标定图不足（当前 {len(files)} 张），'
-                         '至少需要 3 张，建议 15 张以上。')
+        raise SystemExit(f'{DIR_CALIB_IN} 里只有 {len(files)} 张标定图，至少要 3 张。'
+                         '多拍几张棋盘照，用第 1 步导入。')
 
     cols, rows = spec.corners
     objp = np.zeros((rows * cols, 3), dtype=np.float32)
@@ -1098,7 +1098,7 @@ def assess_calibration_filter(obj_points: Sequence[np.ndarray],
     candidate, replay, diagnostics, final_threshold = chosen
     _check_cancel(cancel_event)
     report('complete', cv_total, cv_total,
-           '自动筛选评估完成；建议已通过完整数据正式路径复核。')
+           '照片筛选评估完成；建议已通过完整数据正式路径复核。')
     return {
         'status': 'no_filter' if final_threshold is None else 'recommended',
         'recommended_threshold': (None if final_threshold is None
@@ -1176,10 +1176,10 @@ def calibrate_camera(board: Optional[CheckerboardSpec] = None
         'all_errors': np.asarray(first_errors, dtype=np.float64).tolist(),
     }
 
-    print(f'\n标定完成：{len(used)}/{file_count} 张有效，分辨率 {img_size[0]}x{img_size[1]}')
-    print(f'整体重投影误差 RMS = {rms:.4f} px')
-    print('（注意：OpenCV 报的是 RMS，MATLAB cameraCalibrator 报的是平均欧氏距离，前者数值偏大）')
-    print(f'平均欧氏重投影误差 = {mean_err:.4f} px（这个才和 MATLAB 的口径一致）')
+    print(f'\n标定完成：最终使用 {len(used)} / {file_count} 张，分辨率 {img_size[0]}×{img_size[1]}')
+    print()
+    print(f'重投影 RMS（OpenCV）             {rms:.4f} px')
+    print(f'平均重投影误差（MATLAB 同口径）  {mean_err:.4f} px')
 
     if per_view.size:
         order = np.argsort(-per_view)

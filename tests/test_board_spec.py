@@ -1218,7 +1218,7 @@ def main() -> int:
             got = core.horizon_sign(Hbad, quad)
             check(False, f'单应含 {why} 必须拒绝', f'却返回了 {got}')
         except ValueError as exc:
-            check('单应矩阵' in str(exc), f'单应含 {why} -> ValueError', str(exc))
+            check('映射矩阵' in str(exc), f'单应含 {why} -> ValueError', str(exc))
 
     # 证明这确实是旧 bug：按旧实现（直接过 homography_denominator）算同一组坏输入，
     # 会得到一个合法的 ±1，而不是报错。

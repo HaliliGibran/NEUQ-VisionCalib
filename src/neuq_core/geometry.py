@@ -37,7 +37,7 @@ def normalize_points_for_dlt(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     centered = points - center
     mean_distance = float(np.mean(np.linalg.norm(centered, axis=1)))
     if mean_distance < DEGENERATE_EPS:
-        raise ValueError('点集退化。')
+        raise ValueError('这些点挤得太近，算不出稳定的映射。请把四个角点重新拉开。')
 
     scale = np.sqrt(2.0) / mean_distance
     T = np.array([
@@ -82,9 +82,9 @@ def compute_homography(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
     H = np.linalg.inv(T_dst) @ vh[-1].reshape(3, 3) @ T_src
 
     if not np.isfinite(H).all():
-        raise ValueError('单应矩阵含非有限值。')
+        raise ValueError('当前四点算不出有效的逆透视映射。请检查四点是否重合、过近或位置异常。')
     if abs(float(H[2, 2])) <= np.finfo(np.float64).eps * float(np.linalg.norm(H)):
-        raise ValueError('单应矩阵退化（H[2,2] 接近 0）。')
+        raise ValueError('这四个点让画面无限拉伸，无法生成俯视图。请把四点收拢一些。')
     return H / H[2, 2]
 
 
@@ -176,9 +176,9 @@ def horizon_sign(H0: np.ndarray, ground_pts: np.ndarray) -> float:
     pts = np.asarray(ground_pts, dtype=np.float64).reshape(-1, 2)
 
     if not np.isfinite(H).all():
-        raise ValueError('单应矩阵含非有限值，无法判断地平线有限侧。')
+        raise ValueError('算出的映射矩阵数值异常，无法判断地平线有限侧。')
     if not np.isfinite(pts).all():
-        raise ValueError('地面参考点含非有限值，无法判断地平线有限侧。')
+        raise ValueError('地面参考点坐标异常，无法判断地平线有限侧。')
 
     den = homography_denominator(H, pts)
     # 即便 H 与 pts 都有限，极端数值下乘法仍可能溢出。这道检查成本几乎为零，
